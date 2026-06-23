@@ -1,0 +1,14 @@
+{
+  "program_name": "Example Program",
+  "allowed_domains": [
+    "example.com",
+    "*.example.com"
+  ],
+  "excluded_domains": [
+    "admin.example.com"
+  ],
+  "allowed_urls": [
+    "https://example.com"
+  ],
+  "notes": "Replace this file with the real Bugcrowd/HackerOne scope. Do not test excluded assets."
+}

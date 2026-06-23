@@ -1,0 +1,46 @@
+FROM kalilinux/kali-rolling
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV GOPROXY=https://proxy.golang.org,direct
+ENV GOPATH=/root/go
+ENV GOBIN=/usr/local/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    dnsutils \
+    git \
+    jq \
+    netcat-traditional \
+    nmap \
+    pkg-config \
+    python3 \
+    python3-pip \
+    python3-requests \
+    golang-go \
+    sed \
+    wget \
+    whois \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+    && for pkg in gobuster dirsearch nikto sqlmap wafw00f xsstrike; do \
+        apt-get install -y --no-install-recommends "$pkg" || true; \
+    done \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest \
+    && go install -v github.com/projectdiscovery/katana/cmd/katana@latest \
+    && go install -v github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest \
+    && go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest \
+    && go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest \
+    && go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest \
+    && go install -v github.com/ffuf/ffuf@latest \
+    && go install -v github.com/tomnomnom/waybackurls@latest \
+    && go install -v github.com/tomnomnom/unfurl@latest \
+    && (go install -v github.com/liamg/gitjacker/cmd/gitjacker@latest || true)
+
+WORKDIR /workspace
+
+CMD ["sleep", "infinity"]

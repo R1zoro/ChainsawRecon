@@ -1,0 +1,19 @@
+{
+  "program_name": "Replace Me",
+  "allowed_domains": [
+    "example.com",
+    "*.example.com"
+  ],
+  "excluded_domains": [
+    "admin.example.com"
+  ],
+  "allowed_urls": [
+    "https://example.com"
+  ],
+  "notes": "Paste the exact bounty program rules, testing limits, and exclusions here.",
+  "rate_limits": {
+    "delay_seconds": 2,
+    "max_commands_per_minute": 20,
+    "notes": "Lower these values if the program asks for stricter limits. Keep scanner concurrency low."
+  }
+}

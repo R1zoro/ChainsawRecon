@@ -1,0 +1,4 @@
+{"ts": "2026-06-13T19:46:16.643777+00:00", "event": "start", "target": "https://example.com", "scope_allowed": true, "reason": "All referenced hosts are in scope.", "runner": "local"}
+{"ts": "2026-06-13T19:46:16.644311+00:00", "event": "dry_run_action", "action": {"action": "bash", "command": "printf '%s\\n' https://example.com", "timeout_seconds": 5}}
+{"ts": "2026-06-13T19:46:16.644753+00:00", "event": "dry_run_action", "action": {"action": "bash", "command": "curl -I -L --max-time 20 https://example.com", "timeout_seconds": 30}}
+{"ts": "2026-06-13T19:46:16.645964+00:00", "event": "finish", "report": "engagements\\_template\\agent\\runs\\20260614-011616-https-example.com\\report.md"}

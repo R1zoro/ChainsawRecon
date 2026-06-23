@@ -1,0 +1,9 @@
+# Out-of-Scope Assets
+
+Paste excluded assets and banned testing categories here.
+
+Example:
+
+- admin.example.com
+- Do not test third-party payment provider flows
+- No denial-of-service testing
