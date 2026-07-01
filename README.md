@@ -12,6 +12,43 @@ The goal is not to blindly exploit programs. The first version helps you reduce 
 
 ## Quick Start
 
+Use a conservative local run for an engagement like this:
+
+```powershell
+uv run bounty-agent `
+  --engagement engagements\acme `
+  --mode auto `
+  --target https://example.com `
+  --provider groq `
+  --model groq/llama-3.3-70b-versatile `
+  --max-steps 12 `
+  --max-repeated-commands 2 `
+  --command-delay-seconds 2 `
+  --max-commands-per-minute 20 `
+  --dry-run
+```
+
+If you want the agent to stay strictly in a safe dry-run loop first, keep `--dry-run` in place and remove it only after you are happy with the planned actions.
+
+## Workflow modes
+
+The CLI now supports three explicit workflow modes plus an automatic default:
+
+- mapping: build a lightweight target map, save it to target-map.md, and stop once the map is complete.
+- recon: use the target map and prior evidence to enumerate one target at a time with low-rate checks.
+- attack: run mapping first when needed, then continue into deeper validation and exploitation-style follow-up.
+- auto: choose the safest next phase based on existing evidence.
+
+Example usage:
+
+```powershell
+uv run bounty-agent --engagement engagements\acme --mode mapping
+uv run bounty-agent --engagement engagements\acme --mode recon
+uv run bounty-agent --engagement engagements\acme --mode attack
+```
+
+When you provide an engagement folder without a specific `--target`, the agent will infer targets from the engagement's in-scope asset list and use them as the initial run queue.
+
 ## Engagement Folders
 
 For real programs, use one folder per engagement:

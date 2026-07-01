@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 from pathlib import Path
 
 from .agent import BountyAgent
@@ -28,7 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Scope-aware bug bounty triage agent.")
     parser.add_argument("--program", type=Path, help="Path to program scope JSON.")
     parser.add_argument("--engagement", type=Path, help="Engagement folder containing program/scope.json.")
-    parser.add_argument("--target", required=True, help="Target URL, domain, or IP to test.")
+    parser.add_argument("--target", help="Target URL, domain, or IP to test. Optional when --engagement is supplied.")
+    parser.add_argument("--mode", choices=["mapping", "recon", "attack", "auto"], default="auto")
     parser.add_argument("--provider", choices=sorted(PROVIDER_DEFAULTS), default="ollama")
     parser.add_argument("--model", help="OpenAI-compatible model spec, e.g. ollama/qwen2.5-coder:7b.")
     parser.add_argument("--no-llm", action="store_true", help="Do not call an LLM, even if an API key is configured.")
@@ -42,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-timeout-seconds", type=int, help="Timeout seconds for LLM HTTP calls.")
     parser.add_argument("--allow-all-hosts", action="store_true", help="Allow all hosts and skip scope blocking.")
     parser.add_argument("--runs-dir", type=Path, help="Output directory for run artifacts.")
+    parser.add_argument("--engagement-db", type=Path, help="Curated engagement recon database. Defaults beside engagement runs.")
     parser.add_argument("--runner", choices=["local", "docker"], default="local")
     parser.add_argument("--docker-image", default="bounty-sandbox")
     parser.add_argument("--docker-env-file", type=Path, help="Optional env file passed into the Docker sandbox.")
@@ -57,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     prompt_path = resolve_prompt_path(args.prompt, args.engagement)
     runs_dir = resolve_runs_dir(args.runs_dir, args.engagement)
     docker_env_file = resolve_docker_env_file(args.docker_env_file, args.engagement)
-    scope = ProgramScope.from_file(program_path)
+    scope = resolve_program_scope(program_path, args.engagement)
     provider = PROVIDER_DEFAULTS[args.provider]
     llm_base_url = args.llm_base_url or provider["base_url"]
     llm_api_key = args.llm_api_key
@@ -72,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         model=model,
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
+        mode=args.mode,
         max_steps=args.max_steps,
         dry_run=not args.execute,
         runner=args.runner,
@@ -96,11 +101,17 @@ def main(argv: list[str] | None = None) -> int:
         rate_limit_notes=scope.rate_limits.notes,
         allow_all_hosts=args.allow_all_hosts,
         max_repeated_commands=args.max_repeated_commands,
+        engagement_db_path=resolve_engagement_db_path(args.engagement_db, runs_dir, args.engagement),
     )
-    agent = BountyAgent(scope, args.target, settings, runs_dir)
-    run_dir = agent.run()
-    print(f"Run complete: {run_dir}")
-    print(f"Report: {run_dir / 'report.md'}")
+    targets = resolve_targets(args.target, args.engagement, scope)
+    if not targets:
+        raise SystemExit("No targets found. Provide --target or an engagement with an in-scope asset list.")
+
+    for target in targets:
+        agent = BountyAgent(scope, target, settings, runs_dir)
+        run_dir = agent.run()
+        print(f"Run complete: {run_dir}")
+        print(f"Report: {run_dir / 'report.md'}")
     return 0
 
 
@@ -137,10 +148,149 @@ def resolve_docker_env_file(docker_env_file: Path | None, engagement: Path | Non
     return None
 
 
+def resolve_engagement_db_path(engagement_db: Path | None, runs_dir: Path, engagement: Path | None) -> Path:
+    if engagement_db:
+        return engagement_db
+    if engagement:
+        return engagement / "agent" / "knowledge.db"
+    return runs_dir / "knowledge.db"
+
+
+def resolve_program_scope(program_path: Path, engagement: Path | None) -> ProgramScope:
+    scope = ProgramScope.from_file(program_path)
+    if engagement is None:
+        return scope
+    in_scope_path = engagement / "program" / "in-scope.txt"
+    if not in_scope_path.exists():
+        return scope
+    parsed_hosts = _collect_scope_hosts(in_scope_path.read_text(encoding="utf-8"))
+    if not parsed_hosts:
+        return scope
+    merged_domains = list(dict.fromkeys([*scope.allowed_domains, *parsed_hosts]))
+    return ProgramScope(
+        program_name=scope.program_name,
+        allowed_domains=merged_domains,
+        excluded_domains=list(scope.excluded_domains),
+        allowed_urls=list(scope.allowed_urls),
+        notes=scope.notes,
+        rate_limits=scope.rate_limits,
+    )
+
+
+def resolve_targets(target: str | None, engagement: Path | None, scope: ProgramScope | None = None) -> list[str]:
+    if engagement is None:
+        return [target] if target else []
+
+    mapping_targets = _collect_mapping_state_targets(engagement)
+    if mapping_targets:
+        if target:
+            return list(dict.fromkeys([target, *mapping_targets]))
+        return mapping_targets
+
+    in_scope_path = engagement / "program" / "in-scope.txt"
+    if not in_scope_path.exists():
+        return [target] if target else []
+
+    parsed_targets = []
+    if target:
+        parsed_targets.append(target)
+    for line in in_scope_path.read_text(encoding="utf-8").splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned.startswith("#"):
+            continue
+        if cleaned.startswith("http://") or cleaned.startswith("https://"):
+            parsed_targets.append(cleaned)
+            continue
+        if _looks_like_target(cleaned):
+            parsed_targets.append(cleaned)
+    return list(dict.fromkeys(parsed_targets))
+
+
+def _collect_mapping_state_targets(engagement: Path) -> list[str]:
+    runs_dir = engagement / "agent" / "runs"
+    if not runs_dir.exists():
+        return []
+
+    candidate_files = sorted(runs_dir.rglob("mapping-state.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for mapping_path in candidate_files:
+        try:
+            data = json.loads(mapping_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        raw_targets = data.get("targets")
+        if isinstance(raw_targets, list):
+            targets = []
+            for item in raw_targets:
+                normalized = _normalize_mapping_target(item)
+                if normalized and normalized not in targets:
+                    targets.append(normalized)
+            if targets:
+                return targets
+
+        raw_hosts = data.get("hosts")
+        if isinstance(raw_hosts, list):
+            targets = []
+            for item in raw_hosts:
+                normalized = _normalize_mapping_target(item)
+                if normalized and normalized not in targets:
+                    targets.append(normalized)
+            if targets:
+                return targets
+    return []
+
+
+def _normalize_mapping_target(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or cleaned.startswith("#"):
+        return None
+    if cleaned.startswith(("http://", "https://")):
+        return cleaned
+    if _looks_like_target(cleaned):
+        return cleaned
+    return None
+
+
 def read_optional_text(path: Path | None) -> str:
     if path is None or not path.exists():
         return ""
     return path.read_text(encoding="utf-8")
+
+
+def _collect_scope_hosts(text: str) -> list[str]:
+    hosts: list[str] = []
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned.startswith("#"):
+            continue
+        if cleaned.startswith("http://") or cleaned.startswith("https://"):
+            hosts.append(_extract_host_from_url(cleaned))
+            continue
+        if _looks_like_target(cleaned):
+            hosts.append(cleaned)
+    return list(dict.fromkeys([host for host in hosts if host]))
+
+
+def _looks_like_target(value: str) -> bool:
+    if not value:
+        return False
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", value):
+        return True
+    if re.match(r"^[A-Za-z0-9.-]+$", value):
+        return True
+    return False
+
+
+def _extract_host_from_url(value: str) -> str:
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return value
+    return parsed.hostname or value
 
 
 if __name__ == "__main__":

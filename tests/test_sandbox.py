@@ -1,10 +1,11 @@
 from pathlib import Path
 import subprocess
+from uuid import uuid4
 
 from bounty_agent.sandbox import LocalWorkspaceRunner
 
 
-def test_local_runner_uses_tolerant_utf8_decoding(monkeypatch, tmp_path: Path) -> None:
+def test_local_runner_uses_tolerant_utf8_decoding(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_run(*args, **kwargs):
@@ -12,7 +13,8 @@ def test_local_runner_uses_tolerant_utf8_decoding(monkeypatch, tmp_path: Path) -
         return subprocess.CompletedProcess(args[0], 0, "ok", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    result = LocalWorkspaceRunner(tmp_path).exec("example", 5)
+    workspace = Path("sandbox") / "test-local-runner" / uuid4().hex
+    result = LocalWorkspaceRunner(workspace).exec("example", 5)
 
     assert result.stdout == "ok"
     assert captured["encoding"] == "utf-8"

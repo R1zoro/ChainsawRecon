@@ -45,6 +45,7 @@ class AgentSettings:
     model: str | None = None
     llm_base_url: str = "http://localhost:11434/v1"
     llm_api_key: str = "ollama"
+    mode: str = "recon"
     max_steps: int = 12
     dry_run: bool = True
     runner: str = "local"
@@ -58,6 +59,7 @@ class AgentSettings:
     rate_limit_notes: str = ""
     allow_all_hosts: bool = False
     max_repeated_commands: int = 2
+    engagement_db_path: Path | None = None
 
 
 def env_or_default(name: str, default: str) -> str:

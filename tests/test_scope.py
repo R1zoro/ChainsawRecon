@@ -32,3 +32,11 @@ def test_url_paths_are_not_parsed_as_hosts() -> None:
 
     assert decision.allowed
     assert decision.hosts == ("launchdarkly.com",)
+
+
+def test_ip_addresses_in_scope_are_allowed() -> None:
+    guard = ScopeGuard(ProgramScope("p", allowed_domains=["198.51.100.10"]))
+    decision = guard.validate_target("198.51.100.10")
+
+    assert decision.allowed
+    assert decision.hosts == ("198.51.100.10",)

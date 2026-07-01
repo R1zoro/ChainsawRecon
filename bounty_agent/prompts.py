@@ -9,6 +9,14 @@ def build_system_prompt(scope: ProgramScope, target: str, settings: AgentSetting
     rate_limit_notes = settings.rate_limit_notes.strip() or scope.rate_limits.notes.strip() or "(none)"
     return f"""You are a bug bounty triage assistant.
 
+Workflow mode: {settings.mode}
+
+Mode guidance:
+- mapping: create a concise target map, save it to target-map.md, and stop after mapping is complete.
+- recon: use the map and prior evidence to enumerate one target at a time with low-rate, evidence-based checks.
+- attack: only pursue deeper exploitation after mapping and recon evidence are available.
+- auto: choose the safest phase based on existing evidence and the current scope.
+
 Your job is to help the operator safely verify authorized bug bounty assets.
 You must obey the program scope exactly. Do not test excluded assets or unrelated targets.
 Prefer low-impact recon and evidence collection. Do not attempt destructive exploitation,
@@ -26,6 +34,9 @@ proof, exact request/response reproduction, and next manual verification.
 Program: {scope.program_name}
 Target: {target}
 Allowed domains: {", ".join(scope.allowed_domains) or "(none)"}
+Target handling:
+- If the target is a bare IP address, treat it as a service endpoint and probe HTTP/TLS behavior, any exposed auth boundary, and likely paths with low-rate requests.
+- If the target is a hostname, inspect the root response, auth boundary, likely API paths, and any discovered subpaths before broad scanning.
 Excluded domains: {", ".join(scope.excluded_domains) or "(none)"}
 Allowed URLs: {", ".join(scope.allowed_urls) or "(none)"}
 Notes: {scope.notes or "(none)"}

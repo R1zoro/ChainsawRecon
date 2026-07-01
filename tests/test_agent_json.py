@@ -21,6 +21,14 @@ def test_parse_json_action_rejects_blank_text() -> None:
     assert parse_json_action("   ") is None
 
 
+def test_parse_json_action_rejects_empty_object() -> None:
+    assert parse_json_action("{}") is None
+
+
+def test_parse_json_action_rejects_non_action_json_object() -> None:
+    assert parse_json_action('{"current_untested_high_value_coverage_targets":["/api/v2/flags"]}') is None
+
+
 def test_summary_detects_unrecorded_finding_claim() -> None:
     assert _summary_claims_findings("Completed recon and identified one finding.")
     assert not _summary_claims_findings("Completed recon with no validated findings.")

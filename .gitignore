@@ -12,3 +12,7 @@ engagements/*
 .env
 **/secrets.env
 .pytest_cache
+.tmp/
+pytest-temp/
+sandbox/test-recon-db/
+sandbox/test-local-runner/

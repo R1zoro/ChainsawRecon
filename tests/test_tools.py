@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from bounty_agent.config import ProgramScope
+from bounty_agent.report import write_report
 from bounty_agent.scope import ScopeGuard
 from bounty_agent.tools import ToolRegistry
 
@@ -84,6 +87,39 @@ def test_tool_inventory_command_is_allowed() -> None:
     assert result.ok
 
 
+def test_httpx_tool_adds_scheme_for_raw_ip_targets() -> None:
+    registry = make_registry()
+    registry.execute({"action": "httpx", "target": "198.51.100.10", "timeout_seconds": 5})
+
+    assert registry.runner.commands[0].startswith("httpx")
+    assert "http://198.51.100.10" in registry.runner.commands[0]
+
+
+def test_report_includes_methodology_and_recommended_next_steps(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.md"
+    write_report(
+        report_path,
+        ProgramScope("Example", allowed_domains=["example.com"]),
+        "198.51.100.10",
+        [],
+        "Observed a public endpoint and a possible auth boundary.",
+        run_coverage={
+            "surface_count": 2,
+            "attack_count": 1,
+            "surface_types": {"api": 1, "web": 1},
+            "next_tasks": [
+                {"surface_type": "api", "surface": "198.51.100.10/api", "attack_type": "auth_check", "reason": "Auth boundary"}
+            ],
+        },
+        engagement_coverage={},
+    )
+
+    content = report_path.read_text(encoding="utf-8")
+    assert "## Methodology" in content
+    assert "## Recommended Next Steps" in content
+    assert "auth boundary" in content.lower()
+
+
 def test_use_skill_returns_structured_playbook() -> None:
     registry = make_registry()
     result = registry.execute(
@@ -97,6 +133,22 @@ def test_use_skill_returns_structured_playbook() -> None:
     assert result.ok
     assert result.meta["skill"] == "public_research"
     assert "At least four distinct searches" in result.content
+
+
+def test_repeated_skill_request_is_blocked_after_threshold() -> None:
+    registry = make_registry()
+    action = {
+        "action": "use_skill",
+        "name": "public_research",
+        "objective": "find public references for endpoint behavior",
+    }
+
+    assert registry.execute(action).ok
+    assert registry.execute(action).ok
+    result = registry.execute(action)
+
+    assert not result.ok
+    assert result.meta["repeat_blocked"] is True
 
 
 def test_unknown_skill_is_rejected() -> None:
@@ -153,6 +205,46 @@ def test_expected_unauthorized_response_is_not_a_finding() -> None:
             "response": "HTTP/1.1 401 Unauthorized\n<html>login required</html>",
             "evidence": "401 Unauthorized HTML",
             "impact": "Endpoint requires authentication.",
+            "next_steps": "Verify manually",
+        }
+    )
+
+    assert not result.ok
+    assert result.meta["finding_rejected"] is True
+
+
+def test_sitemap_discovery_is_not_a_finding() -> None:
+    registry = make_registry()
+    result = registry.execute(
+        {
+            "action": "record_finding",
+            "title": "LaunchDarkly Sitemap Discovery",
+            "severity": "low",
+            "asset": "https://example.com",
+            "request": "GET /sitemap.xml HTTP/1.1",
+            "response": "HTTP/1.1 200 OK\n<sitemapindex>...</sitemapindex>",
+            "evidence": "sitemap.xml present",
+            "impact": "None",
+            "next_steps": "Review sitemap contents",
+        }
+    )
+
+    assert not result.ok
+    assert result.meta["finding_rejected"] is True
+
+
+def test_normal_authenticated_listing_is_not_idor_evidence() -> None:
+    registry = make_registry()
+    result = registry.execute(
+        {
+            "action": "record_finding",
+            "title": "LaunchDarkly IDOR via API",
+            "severity": "high",
+            "asset": "https://example.com/api/v2/flags",
+            "request": "GET /api/v2/flags HTTP/1.1",
+            "response": "HTTP/1.1 200 OK\nlinks to /api/v2/flags/default and /api/v2/flags/idor-test-2",
+            "evidence": "idor-test-2 flag in API response",
+            "impact": "Potential unauthorized access to flags",
             "next_steps": "Verify manually",
         }
     )

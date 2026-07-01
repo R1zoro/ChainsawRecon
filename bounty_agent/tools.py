@@ -9,6 +9,14 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .retrieval import RetrievalStore
+from .recon_db import (
+    NullReconStore,
+    ReconObservation,
+    ReconStore,
+    build_attack_results_from_action_result,
+    build_facts_from_action_result,
+    build_surfaces_from_action_result,
+)
 from .sandbox import SandboxRunner
 from .scope import ScopeGuard
 from .skills import get_skill
@@ -41,6 +49,7 @@ class ToolRegistry:
         scope_guard: ScopeGuard,
         trace: TraceLogger,
         retrieval: RetrievalStore,
+        recon_store: ReconStore | NullReconStore | None = None,
         command_delay_seconds: float = 0.0,
         max_commands_per_minute: int = 0,
         max_repeated_commands: int = 2,
@@ -49,11 +58,13 @@ class ToolRegistry:
         self.scope_guard = scope_guard
         self.trace = trace
         self.retrieval = retrieval
+        self.recon_store = recon_store or NullReconStore()
         self.findings: list[Finding] = []
         self.history: list[tuple[dict[str, Any], ToolResult]] = []
         self.rate_limiter = CommandRateLimiter(command_delay_seconds, max_commands_per_minute, trace)
         self.max_repeated_commands = max(1, max_repeated_commands)
         self.command_counts: dict[str, int] = {}
+        self.skill_counts: dict[str, int] = {}
         self.finding_fingerprints: set[str] = set()
 
     def execute(self, action: dict[str, Any]) -> ToolResult:
@@ -62,6 +73,8 @@ class ToolRegistry:
         try:
             if name == "bash":
                 result = self._bash(action)
+            elif name in _TOOL_ACTIONS:
+                result = self._tool_action(action)
             elif name == "search":
                 result = self._search(action)
             elif name == "read_file":
@@ -82,7 +95,32 @@ class ToolRegistry:
             result = ToolResult(False, f"{type(exc).__name__}: {exc}")
         self.trace.write("tool_result", ok=result.ok, content=_truncate(result.content), meta=result.meta)
         self.history.append((action, result))
+        self._record_recon_state(action, result)
         return result
+
+    def _record_recon_state(self, action: dict[str, Any], result: ToolResult) -> None:
+        source = f"tool:{len(self.history)}"
+        target = _action_target(action)
+        try:
+            self.recon_store.add_observation(
+                ReconObservation(
+                    action=str(action.get("action", "")),
+                    target=target,
+                    summary=_truncate(result.content, 1200),
+                    ok=result.ok,
+                    source=source,
+                    tags=tuple(_action_tags(action, result)),
+                    meta={"action": action, "result_meta": result.meta},
+                )
+            )
+            for surface in build_surfaces_from_action_result(action, result.ok, result.content, source):
+                self.recon_store.upsert_surface(surface)
+            for attack in build_attack_results_from_action_result(action, result.ok, result.content, source):
+                self.recon_store.upsert_attack_result(attack)
+            for fact in build_facts_from_action_result(action, result.ok, result.content, source):
+                self.recon_store.upsert_fact(fact)
+        except Exception as exc:
+            self.trace.write("recon_state_error", error=f"{type(exc).__name__}: {exc}")
 
     def _bash(self, action: dict[str, Any]) -> ToolResult:
         command = str(action.get("command", "")).strip()
@@ -110,6 +148,17 @@ class ToolRegistry:
             f"--- stderr ---\n{_truncate(result.stderr)}"
         )
         return ToolResult(result.exit_code == 0, content)
+
+    def _tool_action(self, action: dict[str, Any]) -> ToolResult:
+        name = str(action.get("action", "")).strip()
+        url = str(action.get("url") or action.get("target") or action.get("path") or "").strip()
+        host = str(action.get("host") or "").strip()
+        if not url and host:
+            url = host
+        if not url:
+            return ToolResult(False, f"Missing target for {name} action.")
+        command = _build_tool_command(name, url, action)
+        return self._bash({**action, "action": "bash", "command": command, "timeout_seconds": action.get("timeout_seconds", 60)})
 
     def _search(self, action: dict[str, Any]) -> ToolResult:
         query = str(action.get("query", "")).strip()
@@ -153,6 +202,9 @@ class ToolRegistry:
 
     def _use_skill(self, action: dict[str, Any]) -> ToolResult:
         name = str(action.get("name", ""))
+        repeat_result = self._check_repeated_skill(action)
+        if repeat_result:
+            return repeat_result
         skill = get_skill(name)
         if not skill:
             return ToolResult(False, f"Unknown skill: {name}")
@@ -195,6 +247,24 @@ class ToolRegistry:
         self.finding_fingerprints.add(fingerprint)
         self.findings.append(finding)
         return ToolResult(True, f"Recorded finding: {finding.title}")
+
+    def _check_repeated_skill(self, action: dict[str, Any]) -> ToolResult | None:
+        name = str(action.get("name", "")).strip().lower()
+        objective = str(action.get("objective", "")).strip().lower()
+        context = str(action.get("context", "")).strip().lower()
+        fingerprint = "|".join([name, objective, context])
+        count = self.skill_counts.get(fingerprint, 0) + 1
+        self.skill_counts[fingerprint] = count
+        if count <= 2:
+            return None
+        return ToolResult(
+            False,
+            (
+                f"Repeated skill request blocked after 2 runs for {name}.\n"
+                "Use the existing playbook output, move to a new phase, or execute a concrete probe instead of asking for the same skill again."
+            ),
+            {"repeat_blocked": True, "repeat_count": count, "skill": name},
+        )
 
     def _check_repeated_command(self, command: str) -> ToolResult | None:
         fingerprint = _command_fingerprint(command)
@@ -268,6 +338,92 @@ class CommandRateLimiter:
         self._last_command_at = time.monotonic()
 
 
+_TOOL_ACTIONS = {
+    "httpx",
+    "subfinder",
+    "nuclei",
+    "waybackurls",
+    "gobuster",
+    "dirsearch",
+    "nikto",
+    "sqlmap",
+    "xsstrike",
+    "wafw00f",
+    "katana",
+    "whatweb",
+    "amass",
+    "gau",
+    "assetfinder",
+    "dnsx",
+    "naabu",
+}
+
+
+def _build_tool_command(tool: str, url: str, action: dict[str, Any]) -> str:
+    normalized_url = _normalize_target_for_tool(url)
+    sanitized_url = normalized_url.replace("'", "\\'")
+    if tool == "httpx":
+        return f"httpx -rate-limit 5 -threads 1 '{sanitized_url}'"
+    if tool == "subfinder":
+        return f"subfinder -d '{sanitized_url}'"
+    if tool == "nuclei":
+        return f"nuclei -u '{sanitized_url}' -rate-limit 5 -concurrency 1"
+    if tool == "waybackurls":
+        return f"waybackurls '{sanitized_url}'"
+    if tool == "gobuster":
+        return f"gobuster dir -u '{sanitized_url}' -t 1 -delay 1s"
+    if tool == "dirsearch":
+        return f"dirsearch -u '{sanitized_url}' -t 1 --max-rate 1"
+    if tool == "nikto":
+        return f"nikto -host '{sanitized_url}'"
+    if tool == "sqlmap":
+        return f"sqlmap -u '{sanitized_url}' --batch --safe-url --threads=1"
+    if tool == "xsstrike":
+        return f"xsstrike -u '{sanitized_url}'"
+    if tool == "wafw00f":
+        return f"wafw00f '{sanitized_url}'"
+    if tool == "katana":
+        return f"katana -u '{sanitized_url}' -c 1 -rate-limit 5"
+    if tool == "whatweb":
+        return f"whatweb '{sanitized_url}'"
+    if tool == "amass":
+        return f"amass enum -d '{sanitized_url}'"
+    if tool == "gau":
+        return f"gau '{sanitized_url}'"
+    if tool == "assetfinder":
+        return f"assetfinder '{sanitized_url}'"
+    if tool == "dnsx":
+        return f"dnsx -d '{sanitized_url}'"
+    if tool == "naabu":
+        return f"naabu -host '{sanitized_url}' -rate 50"
+    return f"{tool} '{sanitized_url}'"
+
+
+def _normalize_target_for_tool(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return normalized
+    if normalized.startswith(("http://", "https://")):
+        return normalized
+    if normalized.startswith("//"):
+        return f"http:{normalized}"
+    if _looks_like_ip(normalized):
+        return f"http://{normalized}"
+    if "/" in normalized or ":" in normalized:
+        return normalized
+    return f"http://{normalized}"
+
+
+def _looks_like_ip(value: str) -> bool:
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def _sanitize_search_query(value: str) -> str:
     return quote(value, safe="")
 
@@ -311,6 +467,33 @@ def _finding_fingerprint(finding: Finding) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def _action_target(action: dict[str, Any]) -> str:
+    for key in ("asset", "command", "query", "path", "name"):
+        value = str(action.get(key, "")).strip()
+        if value:
+            return value[:300]
+    return str(action.get("action", ""))
+
+
+def _action_tags(action: dict[str, Any], result: ToolResult) -> list[str]:
+    tags = [str(action.get("action", ""))]
+    command = str(action.get("command", "")).lower()
+    query = str(action.get("query", "")).lower()
+    if any(tool in command for tool in ("katana", "subfinder", "waybackurls", "gau", "ffuf", "gobuster", "dirsearch")):
+        tags.append("discovery")
+    if any(tool in command for tool in ("httpx", "wafw00f", "whatweb")):
+        tags.append("fingerprint")
+    if any(tool in command for tool in ("nuclei", "nikto", "xsstrike", "sqlmap")):
+        tags.append("scanner")
+    if "python" in command:
+        tags.append("verification")
+    if query:
+        tags.append("research")
+    if result.meta.get("finding_rejected"):
+        tags.append("rejected")
+    return [tag for tag in tags if tag]
+
+
 def _validate_finding_evidence(finding: Finding) -> str:
     evidence = finding.evidence.strip().lower()
     combined = " ".join([finding.evidence, finding.request, finding.response]).lower()
@@ -319,8 +502,11 @@ def _validate_finding_evidence(finding: Finding) -> str:
         return "Finding rejected: informational observations belong in recon notes, not the findings section."
     if not finding.request.strip() or not finding.response.strip():
         return "Finding rejected: provide the exact request and response used to reproduce the behavior."
-    if not finding.impact.strip():
+    impact_text = finding.impact.strip()
+    if not impact_text:
         return "Finding rejected: describe concrete security impact, not only unexpected behavior."
+    if impact_text.lower() in {"none", "n/a", "no impact", "unknown"}:
+        return "Finding rejected: impact must describe concrete security harm, not 'none' or a placeholder."
     if not evidence:
         return "Finding rejected: evidence is empty. Include a concrete request/response excerpt or evidence file path."
     weak_markers = [
@@ -346,10 +532,15 @@ def _validate_finding_evidence(finding: Finding) -> str:
     benign_markers = ["sitemap available", "endpoint available", "authentication required", "unauthorized html"]
     if any(marker in combined or marker in finding.title.lower() for marker in benign_markers):
         return "Finding rejected: public discovery or expected authentication behavior is not a vulnerability."
+    if "sitemap" in finding.title.lower() or "robots" in finding.title.lower():
+        return "Finding rejected: sitemap or robots.txt discovery belongs in recon notes, not findings."
     if re.search(r"\b(401|403|404)\b", combined) and not any(
         term in combined for term in ["bypass", "cross-tenant", "unauthorized data", "sensitive data"]
     ):
         return "Finding rejected: an expected 401, 403, or 404 response is not a vulnerability without bypass impact."
+    if "http 200" in combined or "200 ok" in combined:
+        if any(term in combined for term in ["links to /api", "flag in api response", "default flag", "idor-test-2"]):
+            return "Finding rejected: an authenticated normal API listing response is not IDOR evidence without cross-tenant or unauthorized data proof."
     return ""
 
 
