@@ -747,6 +747,12 @@ def _auth_context_from_text(text: str) -> str:
 
 
 def _attack_type_for_surface(surface: SurfaceRecord, text: str) -> str:
+    if any(term in text for term in ("xsstrike", "dalfox", "xss", "<script", "onerror=", "alert(1)")):
+        return "xss"
+    if any(term in text for term in ("sqlmap", " union select ", "' or 1=1", "\" or 1=1", "sqli")):
+        return "sqli"
+    if any(term in text for term in ("ssrf", "burp collaborator", "interactsh", "metadata.google.internal", "169.254.169.254")):
+        return "ssrf"
     if surface.surface_type == "graphql":
         return "graphql"
     if surface.surface_type == "js":
@@ -768,19 +774,23 @@ def _attack_type_for_surface(surface: SurfaceRecord, text: str) -> str:
 
 def _priority_attacks_for_surface(surface: SurfaceRecord) -> list[str]:
     if surface.surface_type == "graphql":
-        return ["graphql", "auth", "parameter"]
+        return ["graphql", "auth", "parameter", "xss"]
     if surface.surface_type == "js":
-        return ["js_analysis", "sourcemap", "api", "graphql"]
+        return ["js_analysis", "sourcemap", "api", "graphql", "xss"]
     if surface.surface_type == "api":
-        return ["auth", "parameter", "version", "api"]
+        return ["auth", "parameter", "sqli", "version", "api"]
     if surface.surface_type == "auth":
-        return ["auth", "session", "reset"]
+        return ["auth", "session", "reset", "xss"]
     if surface.surface_type == "upload":
         return ["upload", "content_type", "path"]
     if surface.surface_type == "redirect":
-        return ["redirect", "ssrf", "parameter"]
+        return ["redirect", "ssrf", "parameter", "xss"]
     if surface.surface_type == "version":
         return ["version", "headers", "debug"]
+    if surface.surface_type == "web":
+        if "parameter" in surface.tags:
+            return ["xss", "sqli", "parameter", "probe"]
+        return ["xss", "probe"]
     return ["probe"]
 
 
@@ -791,7 +801,7 @@ def _attack_outcome(text: str, ok: bool, action_name: str) -> str:
         return "error"
     if any(term in text for term in ("401 unauthorized", "403 forbidden", "404 not found", "authentication required", "access denied")):
         return "rejected"
-    if any(term in text for term in ("200 ok", "graphql", "swagger", "openapi", "sourcemap", "sourcemappingurl", "x-powered-by", "set-cookie")):
+    if any(term in text for term in ("200 ok", "graphql", "swagger", "openapi", "sourcemap", "sourcemappingurl", "x-powered-by", "set-cookie", "xsstrike", "sqlmap", "interactsh", "burp collaborator")):
         return "interesting"
     return "tested"
 

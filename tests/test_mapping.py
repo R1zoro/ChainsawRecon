@@ -40,6 +40,25 @@ def test_mapping_state_targets_are_used_for_recon_workflow(tmp_path: Path) -> No
     assert resolve_targets(None, engagement, scope) == ["https://api.example.com", "https://example.com"]
 
 
+def test_attack_handoff_prompt_recommends_follow_up_actions(tmp_path: Path) -> None:
+    scope = ProgramScope(program_name="Acme", allowed_domains=["example.com"])
+    agent = BountyAgent(scope, "https://example.com", AgentSettings(mode="attack", dry_run=True), tmp_path / "runs")
+    agent.run_recon.upsert_surface(
+        SurfaceRecord(
+            surface_key="example.com/api",
+            host="example.com",
+            path_pattern="/api",
+            surface_type="api",
+            source="mapping-test",
+            auth_context="authenticated",
+            tags=("api", "auth"),
+        )
+    )
+
+    prompt = agent._build_phase_handoff_prompt("attack")
+    assert "attack" in prompt.lower() or "auth" in prompt.lower()
+
+
 def test_mapping_payload_persists_structured_targets(tmp_path: Path) -> None:
     scope = ProgramScope(
         program_name="Acme",

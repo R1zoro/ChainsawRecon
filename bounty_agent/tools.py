@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 from html.parser import HTMLParser
+from pathlib import Path
 import re
 import time
 from typing import Any
@@ -191,8 +192,13 @@ class ToolRegistry:
         return ToolResult(True, self.runner.read_file(path))
 
     def _write_file(self, action: dict[str, Any]) -> ToolResult:
-        path = str(action.get("path", ""))
+        path = str(action.get("path", "")).strip()
         content = str(action.get("content", ""))
+        if not path:
+            return ToolResult(False, "Missing file path.")
+        empty_reason = _reject_empty_workspace_write(path, content)
+        if empty_reason:
+            return ToolResult(False, empty_reason, {"write_rejected": True, "path": path})
         self.runner.write_file(path, content)
         return ToolResult(True, f"Wrote {len(content)} bytes to {path}.")
 
@@ -542,6 +548,18 @@ def _validate_finding_evidence(finding: Finding) -> str:
         if any(term in combined for term in ["links to /api", "flag in api response", "default flag", "idor-test-2"]):
             return "Finding rejected: an authenticated normal API listing response is not IDOR evidence without cross-tenant or unauthorized data proof."
     return ""
+
+
+def _reject_empty_workspace_write(path: str, content: str) -> str | None:
+    if content.strip():
+        return None
+    suffix = Path(path).suffix.lower()
+    if suffix in {".py", ".js", ".ts", ".tsx", ".sh", ".bash", ".ps1", ".json", ".md", ".txt", ".yaml", ".yml"}:
+        return (
+            f"Refusing to write empty or whitespace-only content to {path}. "
+            "Write a concise but useful artifact instead."
+        )
+    return None
 
 
 def _validate_command_safety(command: str) -> ToolResult | None:

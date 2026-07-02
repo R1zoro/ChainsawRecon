@@ -20,11 +20,14 @@ def write_report(
     engagement_facts: list[ReconFact] | None = None,
     run_coverage: dict[str, Any] | None = None,
     engagement_coverage: dict[str, Any] | None = None,
+    session_targets: list[str] | None = None,
+    potential_weaknesses_path: Path | None = None,
 ) -> None:
     lines = [
         f"# Bug Bounty Triage Report: {scope.program_name}",
         "",
         f"- Target: `{target}`",
+        f"- Session targets: `{', '.join(session_targets or [target])}`",
         f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
         f"- Findings recorded: `{len(findings)}`",
         f"- Run recon facts: `{len(run_facts or [])}`",
@@ -49,6 +52,10 @@ def write_report(
         "## Target Map",
         "",
         *_render_target_map(run_facts or []),
+        "",
+        "## Potential Weaknesses",
+        "",
+        *_render_potential_weaknesses_note(potential_weaknesses_path),
         "",
         "## Coverage",
         "",
@@ -168,8 +175,8 @@ def _render_recommended_next_steps(run_coverage: dict[str, Any], summary: str) -
     next_tasks = (run_coverage or {}).get("next_tasks", []) or []
     if next_tasks:
         return [
-            "- Prioritize the highest-value untested surfaces first:",
-            *[f"  - {task['surface_type']} {task['surface']} -> {task['attack_type']} ({task['reason']})" for task in next_tasks[:6]],
+            "- Prioritize the highest-value untested surfaces first.",
+            *[f"- {task['surface_type']} {task['surface']} -> {task['attack_type']} ({task['reason']})" for task in next_tasks[:6]],
             "- Validate any promising auth boundary with a small, one-off verification script instead of broad probing.",
         ]
     summary_text = (summary or "").strip()
@@ -204,6 +211,15 @@ def _render_coverage_section(run_coverage: dict[str, Any], engagement_coverage: 
             f"Engagement memory currently tracks {engagement_coverage.get('surface_count', 0)} surfaces and {engagement_coverage.get('attack_count', 0)} attack results."
         )
     return lines or ["No structured coverage data was recorded."]
+
+
+def _render_potential_weaknesses_note(path: Path | None) -> list[str]:
+    if not path:
+        return ["No potential weakness ledger was written."]
+    return [
+        f"Potential weaknesses and candidate chains were written to `{path.name}`.",
+        "- Use that file to review interesting but not yet validated leads across the whole session.",
+    ]
 
 
 def _unique(values: Any) -> list[str]:

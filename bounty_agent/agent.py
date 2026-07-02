@@ -23,7 +23,12 @@ class BountyAgent:
         self.scope = scope
         self.target = target
         self.settings = settings
-        self.run_dir = runs_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{_slug(target)}"
+        self.session_targets = [item for item in settings.session_targets if item] or [target]
+        self.initial_targets = list(dict.fromkeys(self.session_targets))
+        self.pending_targets = list(dict.fromkeys(self.session_targets))
+        self.completed_targets: list[str] = []
+        self.target_outcomes: dict[str, str] = {}
+        self.run_dir = settings.session_run_dir or (runs_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{_slug(target)}")
         self.workspace = self.run_dir / "workspace"
         self.trace = TraceLogger(self.run_dir / "trace.jsonl")
         self.retrieval = self._build_retrieval_store()
@@ -55,63 +60,79 @@ class BountyAgent:
             self.engagement_recon.close()
 
     def _run(self) -> Path:
-        target_decision = self.scope_guard.validate_target(self.target)
-        self.trace.write(
-            "start",
-            target=self.target,
-            scope_allowed=target_decision.allowed,
-            reason=target_decision.reason,
-            runner=self.settings.runner,
-        )
-        if not target_decision.allowed:
-            write_report(
-                self.run_dir / "report.md",
-                self.scope,
-                self.target,
-                [],
-                f"Target blocked before recon: {target_decision.reason}",
-            )
-            return self.run_dir
-
+        self.trace.write("session_start", targets=self.session_targets, runner=self.settings.runner)
         effective_mode = self._resolve_effective_mode()
         self.trace.write("mode_selected", requested=self.settings.mode, effective=effective_mode)
+        self._refresh_session_queue()
+        self._persist_session_state(effective_mode)
 
-        messages = [
-            ChatMessage("system", build_system_prompt(self.scope, self.target, self.settings)),
-            ChatMessage("system", self._build_engagement_memory_prompt()),
-            ChatMessage("system", self._build_coverage_memory_prompt()),
-            ChatMessage("system", self._build_mapping_context_prompt()),
-            ChatMessage("system", self._build_mode_guidance_prompt(effective_mode)),
-            ChatMessage("user", "Begin with safe recon. Record only findings with concrete evidence."),
-        ]
+        while self.pending_targets:
+            index = len(self.completed_targets) + 1
+            current_target = self.pending_targets.pop(0)
+            self.target = current_target
+            target_decision = self.scope_guard.validate_target(current_target)
+            self.trace.write(
+                "start_target",
+                target=current_target,
+                queue_index=index,
+                queue_total=index + len(self.pending_targets),
+                scope_allowed=target_decision.allowed,
+                reason=target_decision.reason,
+            )
+            if not target_decision.allowed:
+                self.target_outcomes[current_target] = f"blocked before recon ({target_decision.reason})"
+                self.completed_targets.append(current_target)
+                self._refresh_session_queue()
+                self._persist_session_state(effective_mode)
+                continue
 
-        for action in deterministic_recon_plan(self.target):
-            if self.settings.dry_run:
-                self.trace.write("dry_run_action", action=action)
-                result_content = f"Dry run: would execute {action.get('command')}"
-                result_ok = True
+            messages = [
+                ChatMessage("system", build_system_prompt(self.scope, current_target, self.settings)),
+                ChatMessage("system", self._build_engagement_memory_prompt()),
+                ChatMessage("system", self._build_coverage_memory_prompt()),
+                ChatMessage("system", self._build_mapping_context_prompt()),
+                ChatMessage("system", self._build_mode_guidance_prompt(effective_mode)),
+                ChatMessage("system", self._build_phase_handoff_prompt(effective_mode)),
+                ChatMessage("user", f"Begin with safe recon for queue target {index}: {current_target}. Pending queue size after this target: {len(self.pending_targets)}. Record only findings with concrete evidence."),
+            ]
+
+            for action in deterministic_recon_plan(current_target):
+                if self.settings.dry_run:
+                    self.trace.write("dry_run_action", action=action)
+                    result_content = f"Dry run: would execute {action.get('command')}"
+                    result_ok = True
+                else:
+                    result = self.tools.execute(action)
+                    result_content = result.content
+                    result_ok = result.ok
+                self.retrieval.add(index, action, result_content, {"type": action.get("action"), "phase": "startup", "target": current_target})
+                messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
+
+            summary = ""
+            if self._should_run_mapping_preflight(effective_mode):
+                self.trace.write("mode_preflight", mode=effective_mode, action="mapping", target=current_target)
+                summary = self._run_mapping_preflight(messages)
+            if effective_mode == "mapping":
+                summary = summary or f"{current_target}: mapping mode completed."
+            elif self.settings.model:
+                summary = self._run_llm_loop(messages)
             else:
-                result = self.tools.execute(action)
-                result_content = result.content
-                result_ok = result.ok
-            self.retrieval.add(0, action, result_content, {"type": action.get("action"), "phase": "startup"})
-            messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
+                summary = f"{current_target}: dry run completed without an LLM."
+            self.target_outcomes[current_target] = summary
+            self.completed_targets.append(current_target)
+            discovered = self._extend_pending_targets_from_recon()
+            if discovered:
+                self.trace.write("queue_extended", source_target=current_target, discovered=discovered)
+            self._refresh_session_queue()
+            self._persist_session_state(effective_mode)
 
-        summary = ""
-        if self._should_run_mapping_preflight(effective_mode):
-            self.trace.write("mode_preflight", mode=effective_mode, action="mapping")
-            summary = self._run_mapping_preflight(messages)
-        if effective_mode == "mapping":
-            summary = summary or "Mapping mode completed. Review target-map.md and the run trace."
-        elif self.settings.model:
-            summary = self._run_llm_loop(messages)
-        else:
-            summary = "Dry run completed without an LLM. Configure --model to enable the JSON action loop."
+        summary_lines = [f"{target}: {self.target_outcomes[target]}" for target in self.completed_targets]
+        summary = "\n".join(summary_lines) if summary_lines else "No targets were processed."
 
         write_report(
             self.run_dir / "report.md",
             self.scope,
-            self.target,
+            ", ".join(self.session_targets),
             self.tools.findings,
             summary,
             self.tools.history,
@@ -119,10 +140,13 @@ class BountyAgent:
             self.engagement_recon.facts(),
             self.run_recon.coverage_summary(),
             self.engagement_recon.coverage_summary(),
+            self.completed_targets or self.session_targets,
+            self._persist_potential_weaknesses(),
         )
         promoted = self._promote_run_memory()
         self.trace.write("recon_promoted", count=promoted, engagement_db=str(self._engagement_db_path()))
         self.trace.write("finish", report=str(self.run_dir / "report.md"))
+        self._persist_session_state(effective_mode, finished=True)
         return self.run_dir
 
     def _run_llm_loop(self, messages: list[ChatMessage]) -> str:
@@ -165,11 +189,14 @@ class BountyAgent:
                 proposed_summary = str(action.get("summary", "Finished."))
                 gaps = _recon_coverage_gaps(self.tools.history[llm_history_start:], self.scope_guard)
                 coverage_gaps = self._surface_coverage_gaps()
+                attack_gaps = self._attack_family_gaps()
                 rejected_reason = ""
                 if gaps:
                     rejected_reason = "Recon coverage is incomplete: " + "; ".join(gaps)
                 elif coverage_gaps:
                     rejected_reason = "Surface coverage is incomplete: " + "; ".join(coverage_gaps)
+                elif attack_gaps:
+                    rejected_reason = "Attack-family coverage is incomplete: " + "; ".join(attack_gaps)
                 elif _summary_claims_findings(proposed_summary) and not self.tools.findings:
                     rejected_reason = "The summary claims a vulnerability or finding, but no finding passed evidence validation."
                 if rejected_reason:
@@ -312,12 +339,37 @@ class BountyAgent:
             lines.append("Attack is the current phase; only proceed when mapping or recon evidence is available for that surface.")
         return "\n".join(lines)
 
+    def _build_phase_handoff_prompt(self, effective_mode: str) -> str:
+        surfaces = self._merged_surfaces()
+        auth_surfaces = [surface for surface in surfaces if surface.auth_context and surface.auth_context != "public"]
+        if effective_mode != "attack":
+            if not auth_surfaces:
+                return "Continue with the current phase and prefer low-rate verification over noisy scans."
+            lines = [
+                "Continue with the current phase and prefer low-rate verification over noisy scans.",
+                "Auth-relevant surfaces are already present, so do not finish before checking login, session, callback, reset, tenant, and account-flow behavior where applicable.",
+            ]
+            for surface in auth_surfaces[:5]:
+                lines.append(f"- {surface.surface_type} {surface.host}{surface.path_pattern} auth={surface.auth_context}")
+            return "\n".join(lines)
+        lines = [
+            "Reinforced recon-to-attack handoff.",
+            "If mapping or recon has already identified an auth-sensitive, API, or tenant-scoped surface, move from generic recon to targeted verification and one focused follow-up check.",
+            "Do not repeat broad crawling once there is clear evidence for a specific surface.",
+        ]
+        if auth_surfaces:
+            lines.append("Current auth-aware surfaces:")
+            for surface in auth_surfaces[:5]:
+                lines.append(f"- {surface.surface_type} {surface.host}{surface.path_pattern} auth={surface.auth_context}")
+        return "\n".join(lines)
+
     def _build_target_map_content(self) -> str:
         payload = self._build_mapping_payload()
         lines = [
             f"# Target map for {self.scope.program_name}",
             "",
-            f"- Target: {self.target}",
+            f"- Current target: {self.target}",
+            f"- Session targets: {', '.join(self.completed_targets + self.pending_targets) or self.target}",
             f"- Program: {self.scope.program_name}",
             f"- Allowed domains: {', '.join(self.scope.allowed_domains) or '(none)'}",
             f"- Excluded domains: {', '.join(self.scope.excluded_domains) or '(none)'}",
@@ -341,14 +393,15 @@ class BountyAgent:
         return "\n".join(lines) + "\n"
 
     def _build_mapping_payload(self) -> dict[str, object]:
-        surfaces = self.engagement_recon.surfaces()
+        surfaces = self._merged_surfaces()
         hosts = sorted({surface.host for surface in surfaces if surface.host and surface.host != "local"})
-        if self.target not in hosts:
-            hosts = [self.target] + hosts
+        for target in reversed(self.completed_targets + self.pending_targets):
+            if target not in hosts:
+                hosts = [target] + hosts
         payload = {
             "program_name": self.scope.program_name,
             "target": self.target,
-            "targets": [self.target],
+            "targets": list(dict.fromkeys(self.completed_targets + self.pending_targets)),
             "hosts": hosts,
             "allowed_domains": self.scope.allowed_domains,
             "excluded_domains": self.scope.excluded_domains,
@@ -372,6 +425,163 @@ class BountyAgent:
         mapping_path = self.run_dir / "mapping-state.json"
         mapping_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return mapping_path
+
+    def _persist_session_state(self, effective_mode: str, finished: bool = False) -> Path:
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "program_name": self.scope.program_name,
+            "effective_mode": effective_mode,
+            "current_target": self.target,
+            "initial_targets": list(self.initial_targets),
+            "completed_targets": list(self.completed_targets),
+            "pending_targets": list(self.pending_targets),
+            "known_targets": list(dict.fromkeys(self.completed_targets + self.pending_targets)),
+            "target_outcomes": dict(self.target_outcomes),
+            "artifacts": {
+                "report": "report.md",
+                "trace": "trace.jsonl",
+                "mapping_state": "mapping-state.json",
+                "potential_weaknesses": "potential-weaknesses.json",
+                "workspace": "workspace",
+            },
+            "finished": finished,
+        }
+        path = self.run_dir / "session-state.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def _refresh_session_queue(self) -> None:
+        if not self.settings.queue_path:
+            return
+        queue = list(dict.fromkeys(self.pending_targets))
+        self.settings.queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings.queue_path.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _extend_pending_targets_from_recon(self) -> list[str]:
+        discovered = self._collect_discovered_targets()
+        known = set(self.completed_targets) | set(self.pending_targets)
+        additions: list[str] = []
+        for candidate in discovered:
+            if candidate in known:
+                continue
+            additions.append(candidate)
+            known.add(candidate)
+            self.pending_targets.append(candidate)
+            self.session_targets.append(candidate)
+        return additions
+
+    def _collect_discovered_targets(self) -> list[str]:
+        candidates: list[str] = []
+        for fact in self.run_recon.facts():
+            if fact.kind == "host":
+                normalized = self._normalize_discovered_target(fact.value)
+                if normalized:
+                    candidates.append(normalized)
+                continue
+            if fact.kind == "endpoint" and self._is_interesting_endpoint_fact(fact):
+                normalized = self._normalize_discovered_target(fact.value)
+                if normalized:
+                    candidates.append(normalized)
+        for surface in self._merged_surfaces():
+            if self._is_interesting_surface(surface):
+                normalized = self._normalize_discovered_target(surface.host)
+                if normalized:
+                    candidates.append(normalized)
+            url = str((surface.meta or {}).get("url", "")).strip()
+            if url and self._is_interesting_surface(surface):
+                normalized = self._normalize_discovered_target(url)
+                if normalized:
+                    candidates.append(normalized)
+        ordered: list[str] = []
+        for candidate in candidates:
+            if candidate not in ordered:
+                ordered.append(candidate)
+        return ordered
+
+    def _normalize_discovered_target(self, value: str) -> str | None:
+        cleaned = str(value or "").strip()
+        if not cleaned or cleaned == "local":
+            return None
+        if cleaned.startswith(("http://", "https://")):
+            decision = self.scope_guard.validate_target(cleaned)
+            return cleaned if decision.allowed else None
+        if "/" in cleaned or "?" in cleaned:
+            cleaned = f"https://{cleaned.lstrip('/')}"
+            decision = self.scope_guard.validate_target(cleaned)
+            return cleaned if decision.allowed else None
+        decision = self.scope_guard.validate_target(cleaned)
+        return cleaned if decision.allowed else None
+
+    def _merged_surfaces(self) -> list[object]:
+        merged: list[object] = []
+        seen: set[tuple[str, str, str]] = set()
+        for surface in [*self.engagement_recon.surfaces(), *self.run_recon.surfaces()]:
+            fingerprint = (surface.surface_key, surface.surface_type, surface.auth_context)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(surface)
+        return merged
+
+    def _is_interesting_endpoint_fact(self, fact: object) -> bool:
+        tags = set(getattr(fact, "tags", ()) or ())
+        if tags & {"api", "graphql", "auth", "upload", "redirect", "js", "version"}:
+            return True
+        path_pattern = str((getattr(fact, "meta", {}) or {}).get("path_pattern", "")).lower()
+        return bool(re.search(r"(api|graphql|swagger|openapi|auth|login|oauth|upload|callback|redirect|reset|admin|internal|debug|\.js\b)", path_pattern))
+
+    def _is_interesting_surface(self, surface: object) -> bool:
+        surface_type = str(getattr(surface, "surface_type", "")).lower()
+        if surface_type in {"api", "graphql", "js", "auth", "upload", "redirect", "version"}:
+            return True
+        tags = set(getattr(surface, "tags", ()) or ())
+        return bool(tags & {"parameter", "js", "schema", "auth"})
+
+    def _persist_potential_weaknesses(self) -> Path:
+        attack_results = self.run_recon.attack_results()
+        weaknesses = []
+        seen: set[tuple[str, str, str]] = set()
+        for result in attack_results:
+            if result.outcome not in {"interesting", "confirmed"}:
+                continue
+            fingerprint = (result.surface_key, result.attack_type, result.auth_context)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            weaknesses.append(
+                {
+                    "surface": result.surface_key,
+                    "attack_type": result.attack_type,
+                    "auth_context": result.auth_context,
+                    "outcome": result.outcome,
+                    "evidence": result.evidence,
+                    "tags": list(result.tags),
+                    "meta": result.meta or {},
+                }
+            )
+        chained = []
+        auth_surfaces = [item for item in weaknesses if item["attack_type"] in {"auth", "graphql", "api"}]
+        js_surfaces = [item for item in weaknesses if item["attack_type"] in {"js_analysis", "sourcemap"}]
+        if auth_surfaces and js_surfaces:
+            for auth_item in auth_surfaces[:4]:
+                for js_item in js_surfaces[:4]:
+                    chained.append(
+                        {
+                            "kind": "candidate_chain",
+                            "from": js_item["surface"],
+                            "to": auth_item["surface"],
+                            "reason": "JS/API evidence may inform an authenticated follow-up path or operation name.",
+                        }
+                    )
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "session_targets": list(self.session_targets),
+            "potential_weaknesses": weaknesses,
+            "candidate_chains": chained,
+        }
+        path = self.run_dir / "potential-weaknesses.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
 
     def _append_tool_feedback(self, messages: list[ChatMessage], action: dict[str, object], result: object) -> None:
         messages.append(ChatMessage("assistant", json.dumps(action)))
@@ -423,6 +633,13 @@ class BountyAgent:
             f"Current run: {run_summary['surface_count']} surfaces, {run_summary['attack_count']} attack results, {run_summary['tested_combinations']} tested combinations.",
             f"Engagement memory: {engagement_summary['surface_count']} surfaces, {engagement_summary['attack_count']} attack results.",
         ]
+        auth_open = [task for task in run_summary.get("next_tasks", []) if task.get("surface_type") == "auth"][:3]
+        if auth_open:
+            lines.append("Unresolved auth-focused tasks in this run:")
+            for task in auth_open:
+                lines.append(
+                    f"- {task['surface']} -> {task['attack_type']} ({task['reason']})"
+                )
         tasks = engagement_summary.get("next_tasks", [])[:4]
         if tasks:
             lines.append("Prominent unresolved tasks from engagement memory:")
@@ -457,6 +674,46 @@ class BountyAgent:
             f"{task['surface']} lacks {task['attack_type']} coverage"
             for task in high_value[:5]
         ]
+
+    def _attack_family_gaps(self) -> list[str]:
+        surfaces = self.run_recon.surfaces()
+        attacks = self.run_recon.attack_results()
+        tested = {(item.surface_key, item.attack_type, item.auth_context) for item in attacks}
+        gaps: list[str] = []
+        for surface in surfaces:
+            required = self._required_attack_families_for_surface(surface)
+            if not required:
+                continue
+            missing = [attack_type for attack_type in required if (surface.surface_key, attack_type, surface.auth_context) not in tested]
+            if missing:
+                gaps.append(f"{surface.surface_key} missing {', '.join(missing[:3])}")
+            if len(gaps) >= 6:
+                break
+        return gaps
+
+    def _required_attack_families_for_surface(self, surface: object) -> list[str]:
+        surface_type = str(getattr(surface, "surface_type", "")).lower()
+        tags = set(getattr(surface, "tags", ()) or ())
+        required: list[str] = []
+        if surface_type == "js":
+            required.extend(["js_analysis", "sourcemap"])
+        elif surface_type == "graphql":
+            required.extend(["graphql", "auth"])
+        elif surface_type == "api":
+            required.extend(["api", "parameter"])
+            if "parameter" in tags:
+                required.append("sqli")
+        elif surface_type == "redirect":
+            required.extend(["redirect", "ssrf"])
+        elif surface_type == "auth":
+            required.extend(["auth", "session"])
+        elif surface_type == "upload":
+            required.extend(["upload", "content_type"])
+        elif surface_type == "web" and "parameter" in tags:
+            required.extend(["xss", "sqli"])
+        elif surface_type == "web":
+            required.append("xss")
+        return list(dict.fromkeys(required))
 
     def _format_tool_feedback(self, action: dict[str, object], ok: bool, content: str) -> str:
         excerpt = content[:2500]

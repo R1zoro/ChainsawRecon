@@ -60,6 +60,9 @@ class AgentSettings:
     allow_all_hosts: bool = False
     max_repeated_commands: int = 2
     engagement_db_path: Path | None = None
+    session_run_dir: Path | None = None
+    session_targets: tuple[str, ...] = ()
+    queue_path: Path | None = None
 
 
 def env_or_default(name: str, default: str) -> str:

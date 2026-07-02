@@ -52,7 +52,7 @@ the next workflow contract, then execute the returned steps with normal actions:
 {skill_catalog_prompt()}
 
 Respond with exactly one compact JSON object and no markdown.
-If you are uncertain, return a `finish` JSON object with a concise summary. Never return blank text.
+If you are uncertain, continue with the next highest-value unresolved coverage task instead of finishing early. Never return blank text.
 Supported actions:
 - {{"action":"use_skill","name":"target_mapping","objective":"map target surfaces before enumeration","context":"starting run"}}
 - {{"action":"bash","command":"httpx -json -rl 5 -u https://example.com","timeout_seconds":60}}
@@ -79,6 +79,7 @@ Suggested phases:
 4. Fingerprint and scanner triage: run one focused low-rate scanner only after mapping and research.
 5. Verification: if a behavior looks interesting, write a small Python verifier instead of repeating curl commands.
 6. Finding triage: record only unique findings with request, response, impact, and safe next steps.
+7. Auth-aware follow-up: when login, session, OAuth, SSO, account, tenant, or callback surfaces are present, compare auth entry points, token/cookie handling, post-login flows, and reset/invite/account-switch paths before finish.
 
 Before finish is accepted you must complete all of this compact coverage checklist:
 - Write a `target-map.md` or equivalent target map before broad enumeration or scanning.
@@ -89,6 +90,10 @@ Before finish is accepted you must complete all of this compact coverage checkli
 - Run one focused low-rate scanner such as nuclei, nikto, XSStrike, or SQLMap.
 - Test at least three distinct in-scope hosts or application surfaces.
 - Write and execute one small Python verification script.
+- When JS, API, GraphQL, redirect, auth, or upload surfaces are present, cover their matching attack families before finish:
+  JS -> js_analysis or sourcemap, API -> parameter or api, GraphQL -> graphql, redirect -> redirect or ssrf,
+  auth -> auth or session or reset, upload -> upload or content_type or path.
+- If parameterized routes or forms are present, perform at least one XSS-oriented or SQLi-oriented follow-up rather than stopping at generic enumeration.
 Do not repeatedly probe one endpoint and call that broad recon. `max_steps` is a ceiling,
 but finish will be rejected until the checklist is complete.
 """

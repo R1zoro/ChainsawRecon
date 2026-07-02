@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 from .agent import BountyAgent
@@ -72,6 +73,10 @@ def main(argv: list[str] | None = None) -> int:
         model = None
     elif model is None and llm_api_key:
         model = provider["model"]
+    targets = resolve_targets(args.target, args.engagement, scope)
+    if not targets:
+        raise SystemExit("No targets found. Provide --target or an engagement with an in-scope asset list.")
+    primary_target = targets[0]
     settings = AgentSettings(
         model=model,
         llm_base_url=llm_base_url,
@@ -102,16 +107,14 @@ def main(argv: list[str] | None = None) -> int:
         allow_all_hosts=args.allow_all_hosts,
         max_repeated_commands=args.max_repeated_commands,
         engagement_db_path=resolve_engagement_db_path(args.engagement_db, runs_dir, args.engagement),
+        session_run_dir=build_session_run_dir(runs_dir, primary_target),
+        session_targets=tuple(targets),
+        queue_path=(args.engagement / "agent" / "target-queue.json") if args.engagement else None,
     )
-    targets = resolve_targets(args.target, args.engagement, scope)
-    if not targets:
-        raise SystemExit("No targets found. Provide --target or an engagement with an in-scope asset list.")
-
-    for target in targets:
-        agent = BountyAgent(scope, target, settings, runs_dir)
-        run_dir = agent.run()
-        print(f"Run complete: {run_dir}")
-        print(f"Report: {run_dir / 'report.md'}")
+    agent = BountyAgent(scope, primary_target, settings, runs_dir)
+    run_dir = agent.run()
+    print(f"Run complete: {run_dir}")
+    print(f"Report: {run_dir / 'report.md'}")
     return 0
 
 
@@ -156,6 +159,11 @@ def resolve_engagement_db_path(engagement_db: Path | None, runs_dir: Path, engag
     return runs_dir / "knowledge.db"
 
 
+def build_session_run_dir(runs_dir: Path, target: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", target).strip("-")[:80] or "session"
+    return runs_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slug}"
+
+
 def resolve_program_scope(program_path: Path, engagement: Path | None) -> ProgramScope:
     scope = ProgramScope.from_file(program_path)
     if engagement is None:
@@ -181,19 +189,35 @@ def resolve_targets(target: str | None, engagement: Path | None, scope: ProgramS
     if engagement is None:
         return [target] if target else []
 
-    mapping_targets = _collect_mapping_state_targets(engagement)
-    if mapping_targets:
-        if target:
-            return list(dict.fromkeys([target, *mapping_targets]))
-        return mapping_targets
+    queue_path = engagement / "agent" / "target-queue.json"
+    seeded_targets = _seed_targets_from_engagement(engagement, target)
+    pending_queue = _load_target_queue(queue_path)
+    if pending_queue:
+        merged = list(dict.fromkeys([*pending_queue, *seeded_targets]))
+        _write_target_queue(queue_path, merged)
+        return merged
 
+    if seeded_targets:
+        _write_target_queue(queue_path, seeded_targets)
+    return seeded_targets
+
+
+def _seed_targets_from_engagement(engagement: Path, target: str | None) -> list[str]:
+    seeded: list[str] = []
+    mapping_targets = _collect_mapping_state_targets(engagement)
+    in_scope_targets = _collect_in_scope_targets(engagement)
+    if target:
+        seeded.append(target)
+    seeded.extend(in_scope_targets)
+    seeded.extend(mapping_targets)
+    return list(dict.fromkeys([item for item in seeded if item]))
+
+
+def _collect_in_scope_targets(engagement: Path) -> list[str]:
     in_scope_path = engagement / "program" / "in-scope.txt"
     if not in_scope_path.exists():
-        return [target] if target else []
-
-    parsed_targets = []
-    if target:
-        parsed_targets.append(target)
+        return []
+    parsed_targets: list[str] = []
     for line in in_scope_path.read_text(encoding="utf-8").splitlines():
         cleaned = line.strip()
         if not cleaned or cleaned.startswith("#"):
@@ -253,10 +277,43 @@ def _normalize_mapping_target(value: object) -> str | None:
     return None
 
 
+def consume_next_target(target: str | None, engagement: Path | None, scope: ProgramScope | None = None) -> str | None:
+    if engagement is None:
+        return target
+
+    queue_path = engagement / "agent" / "target-queue.json"
+    pending_queue = _load_target_queue(queue_path)
+    if not pending_queue:
+        return None
+    next_target = pending_queue[0]
+    remaining = pending_queue[1:]
+    if target and target not in remaining:
+        remaining = [target, *remaining]
+    _write_target_queue(queue_path, remaining)
+    return next_target
+
+
 def read_optional_text(path: Path | None) -> str:
     if path is None or not path.exists():
         return ""
     return path.read_text(encoding="utf-8")
+
+
+def _load_target_queue(queue_path: Path) -> list[str]:
+    if not queue_path.exists():
+        return []
+    try:
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, str) and item.strip()]
+
+
+def _write_target_queue(queue_path: Path, targets: list[str]) -> None:
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.write_text(json.dumps(targets, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _collect_scope_hosts(text: str) -> list[str]:
