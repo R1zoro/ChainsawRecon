@@ -43,7 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-commands-per-minute", type=int, help="Maximum executed bash tool calls per minute.")
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--max-repeated-commands", type=int, default=2)
+    parser.add_argument("--max-malformed-responses", type=int, default=10)
     parser.add_argument("--llm-timeout-seconds", type=int, help="Timeout seconds for LLM HTTP calls.")
+    parser.add_argument("--auth-file", type=Path, help="Optional auth context file with cookies, headers, tokens, or login notes.")
+    parser.add_argument("--priority-file", type=Path, help="Optional file listing targets or endpoints to test in depth first.")
     parser.add_argument("--allow-all-hosts", action="store_true", help="Allow all hosts and skip scope blocking.")
     parser.add_argument("--runs-dir", type=Path, help="Output directory for run artifacts.")
     parser.add_argument("--engagement-db", type=Path, help="Curated engagement recon database. Defaults beside engagement runs.")
@@ -106,10 +109,13 @@ def main(argv: list[str] | None = None) -> int:
         rate_limit_notes=scope.rate_limits.notes,
         allow_all_hosts=args.allow_all_hosts,
         max_repeated_commands=args.max_repeated_commands,
+        max_malformed_responses=max(1, args.max_malformed_responses),
         engagement_db_path=resolve_engagement_db_path(args.engagement_db, runs_dir, args.engagement),
         session_run_dir=build_session_run_dir(runs_dir, primary_target),
         session_targets=tuple(targets),
         queue_path=(args.engagement / "agent" / "target-queue.json") if args.engagement else None,
+        auth_context_path=resolve_auth_context_path(args.auth_file, args.engagement),
+        priority_targets_path=resolve_priority_targets_path(args.priority_file, args.engagement),
     )
     agent = BountyAgent(scope, primary_target, settings, runs_dir)
     run_dir = agent.run()
@@ -148,6 +154,28 @@ def resolve_docker_env_file(docker_env_file: Path | None, engagement: Path | Non
     if engagement:
         candidate = engagement / "program" / "secrets.env"
         return candidate if candidate.exists() else None
+    return None
+
+
+def resolve_auth_context_path(auth_file: Path | None, engagement: Path | None) -> Path | None:
+    if auth_file:
+        return auth_file
+    if engagement:
+        for name in ("auth.txt", "auth.md", "auth.json", "auth.env", "authenticated.txt"):
+            candidate = engagement / "program" / name
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def resolve_priority_targets_path(priority_file: Path | None, engagement: Path | None) -> Path | None:
+    if priority_file:
+        return priority_file
+    if engagement:
+        for name in ("priority-targets.txt", "priority.txt", "deep-targets.txt"):
+            candidate = engagement / "program" / name
+            if candidate.exists():
+                return candidate
     return None
 
 

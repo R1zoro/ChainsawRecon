@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ProgramScope
-from .recon_db import ReconFact
+from .recon_db import AttackResult, ReconFact, SurfaceRecord
 from .tools import Finding
 
 
@@ -56,6 +56,10 @@ def write_report(
         "## Potential Weaknesses",
         "",
         *_render_potential_weaknesses_note(potential_weaknesses_path),
+        "",
+        "## Evidence Trail",
+        "",
+        *_render_evidence_trail(history or []),
         "",
         "## Coverage",
         "",
@@ -118,6 +122,57 @@ def write_report(
                 "",
             ]
         )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_engagement_report(
+    path: Path,
+    scope: ProgramScope,
+    coverage: dict[str, Any],
+    facts: list[ReconFact],
+    surfaces: list[SurfaceRecord],
+    attacks: list[AttackResult],
+) -> None:
+    lines = [
+        f"# Engagement Recon Report: {scope.program_name}",
+        "",
+        f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
+        f"- Known hosts: `{len(_unique(f.value for f in facts if f.kind == 'host'))}`",
+        f"- Known endpoints: `{len([fact for fact in facts if fact.kind == 'endpoint'])}`",
+        f"- Known surfaces: `{len(surfaces)}`",
+        f"- Known attack results: `{len(attacks)}`",
+        "",
+        "## Program Overview",
+        "",
+        f"- Program: {scope.program_name}",
+        f"- Allowed domains: {', '.join(scope.allowed_domains) or '(none)'}",
+        f"- Excluded domains: {', '.join(scope.excluded_domains) or '(none)'}",
+        f"- Allowed URLs: {', '.join(scope.allowed_urls) or '(none)'}",
+        f"- Notes: {scope.notes or '(none)'}",
+        "",
+        "## High-Level Map",
+        "",
+        *_render_target_map(facts),
+        "",
+        "## Technology and Surface Summary",
+        "",
+        *_render_surface_summary(surfaces),
+        "",
+        "## Interesting Historical Checks",
+        "",
+        *_render_attack_summary(attacks),
+        "",
+        "## Coverage Gaps",
+        "",
+        *_render_coverage_section(coverage, coverage),
+        "",
+        "## Operator Notes",
+        "",
+        "- This report is engagement-wide memory, not proof that every listed behavior is still live.",
+        "- Repeated items are deduplicated by host, endpoint, surface, and attack family where possible.",
+        "- Use the per-run report and trace for exact chronological execution details.",
+        "",
+    ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -213,6 +268,78 @@ def _render_coverage_section(run_coverage: dict[str, Any], engagement_coverage: 
     return lines or ["No structured coverage data was recorded."]
 
 
+def _render_evidence_trail(history: list[tuple[dict[str, Any], Any]]) -> list[str]:
+    if not history:
+        return ["No execution history was recorded."]
+    lines: list[str] = []
+    interesting = 0
+    for action, result in history:
+        action_name = str(action.get("action", ""))
+        if action_name == "finish":
+            continue
+        text = str(getattr(result, "content", "")).lower()
+        if not getattr(result, "ok", False) and action_name not in {"record_finding"}:
+            continue
+        if action_name == "bash":
+            detail = str(action.get("command", "")).strip()
+        elif action_name == "search":
+            detail = f"search {action.get('query', '')} via {action.get('engine', '')}".strip()
+        else:
+            detail = str(action.get("path") or action.get("target") or action.get("url") or action_name)
+        if not detail:
+            continue
+        lines.append(f"- `{action_name}` -> `{detail}`")
+        interesting += 1
+        if "graphql" in text or "swagger" in text or "openapi" in text or "sourcemap" in text or "set-cookie" in text:
+            lines.append(f"  Evidence: `{_trim_excerpt(getattr(result, 'content', ''))}`")
+        if interesting >= 20:
+            break
+    return lines or ["No high-signal execution trail entries were selected."]
+
+
+def _render_surface_summary(surfaces: list[SurfaceRecord]) -> list[str]:
+    if not surfaces:
+        return ["No surfaces have been promoted into engagement memory yet."]
+    lines: list[str] = []
+    grouped: dict[str, list[SurfaceRecord]] = {}
+    for surface in surfaces:
+        grouped.setdefault(surface.surface_type, []).append(surface)
+    for surface_type in sorted(grouped):
+        lines.append(f"### {surface_type}")
+        lines.append("")
+        for surface in grouped[surface_type][:12]:
+            tags = ", ".join(surface.tags) or "untagged"
+            lines.append(f"- `{surface.host}{surface.path_pattern}` auth={surface.auth_context} tags={tags}")
+        if len(grouped[surface_type]) > 12:
+            lines.append(f"- ...{len(grouped[surface_type]) - 12} more omitted")
+        lines.append("")
+    return lines
+
+
+def _render_attack_summary(attacks: list[AttackResult]) -> list[str]:
+    if not attacks:
+        return ["No attack history has been promoted into engagement memory yet."]
+    lines: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for attack in attacks:
+        key = (attack.surface_key, attack.attack_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        meta = attack.meta or {}
+        detail = str(meta.get("command") or meta.get("query") or meta.get("target") or "").strip()
+        lines.append(
+            f"- `{attack.attack_type}` on `{attack.surface_key}` outcome=`{attack.outcome}` auth=`{attack.auth_context}`"
+        )
+        if detail:
+            lines.append(f"  Trigger: `{detail[:180]}`")
+        if attack.evidence:
+            lines.append(f"  Evidence: `{_trim_excerpt(attack.evidence)}`")
+        if len(seen) >= 20:
+            break
+    return lines
+
+
 def _render_potential_weaknesses_note(path: Path | None) -> list[str]:
     if not path:
         return ["No potential weakness ledger was written."]
@@ -232,6 +359,13 @@ def _unique(values: Any) -> list[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _trim_excerpt(text: str, limit: int = 180) -> str:
+    value = " ".join(str(text).split())
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
 
 
 def _looks_like_ip(value: str) -> bool:

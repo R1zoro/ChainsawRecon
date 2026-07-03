@@ -59,10 +59,13 @@ class AgentSettings:
     rate_limit_notes: str = ""
     allow_all_hosts: bool = False
     max_repeated_commands: int = 2
+    max_malformed_responses: int = 10
     engagement_db_path: Path | None = None
     session_run_dir: Path | None = None
     session_targets: tuple[str, ...] = ()
     queue_path: Path | None = None
+    auth_context_path: Path | None = None
+    priority_targets_path: Path | None = None
 
 
 def env_or_default(name: str, default: str) -> str:

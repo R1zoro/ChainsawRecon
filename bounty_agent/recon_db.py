@@ -573,7 +573,14 @@ def build_attack_results_from_action_result(
                 source=source,
                 evidence=_short(content),
                 tags=tuple(_attack_tags(text, name, outcome, attack_type)),
-                meta={"surface_type": surface.surface_type, "action": name},
+                meta={
+                    "surface_type": surface.surface_type,
+                    "action": name,
+                    "command": str(action.get("command", "")),
+                    "query": str(action.get("query", "")),
+                    "path": str(action.get("path", "")),
+                    "target": str(action.get("target", "") or action.get("url", "")),
+                },
             )
         )
     if name == "record_finding" and ok:
@@ -600,6 +607,35 @@ def promote_run_facts(run_store: ReconStore, engagement_store: ReconStore, run_i
         if promoted_fact:
             engagement_store.upsert_fact(promoted_fact)
             promoted += 1
+    for surface in run_store.surfaces():
+        engagement_store.upsert_surface(
+            SurfaceRecord(
+                surface_key=surface.surface_key,
+                host=surface.host,
+                path_pattern=surface.path_pattern,
+                surface_type=surface.surface_type,
+                source=f"{surface.source}; promoted_from={run_id}",
+                confidence=surface.confidence,
+                auth_context=surface.auth_context,
+                tags=surface.tags,
+                meta=surface.meta,
+            )
+        )
+        promoted += 1
+    for attack in run_store.attack_results():
+        engagement_store.upsert_attack_result(
+            AttackResult(
+                surface_key=attack.surface_key,
+                attack_type=attack.attack_type,
+                auth_context=attack.auth_context,
+                outcome=attack.outcome,
+                source=f"{attack.source}; promoted_from={run_id}",
+                evidence=attack.evidence,
+                tags=attack.tags,
+                meta=attack.meta,
+            )
+        )
+        promoted += 1
     return promoted
 
 

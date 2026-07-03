@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 import hashlib
 from html.parser import HTMLParser
@@ -198,7 +199,12 @@ class ToolRegistry:
             return ToolResult(False, "Missing file path.")
         empty_reason = _reject_empty_workspace_write(path, content)
         if empty_reason:
-            return ToolResult(False, empty_reason, {"write_rejected": True, "path": path})
+            guidance = _artifact_contract_guidance(path)
+            return ToolResult(
+                False,
+                f"{empty_reason}\nRepair guidance for {path}:\n{guidance}",
+                {"write_rejected": True, "path": path, "guidance": guidance},
+            )
         self.runner.write_file(path, content)
         return ToolResult(True, f"Wrote {len(content)} bytes to {path}.")
 
@@ -238,6 +244,16 @@ class ToolRegistry:
         scope = self.scope_guard.validate_target(finding.asset)
         if finding.asset and not scope.allowed:
             return ToolResult(False, f"Finding asset is out of scope: {scope.reason}")
+        rung, rung_reason = _classify_finding_rung(finding)
+        if rung != "validated":
+            return ToolResult(
+                False,
+                (
+                    f"Finding rejected at ladder rung `{rung}`: {rung_reason}. "
+                    "Save it as evidence, notes, or a potential weakness until stronger proof exists."
+                ),
+                {"finding_rejected": True, "finding_rung": rung},
+            )
         evidence_issue = _validate_finding_evidence(finding)
         if evidence_issue:
             return ToolResult(False, evidence_issue, {"finding_rejected": True})
@@ -454,6 +470,10 @@ def _truncate(value: str, limit: int = 12000) -> str:
 
 def _command_fingerprint(command: str) -> str:
     normalized = re.sub(r"\s+", " ", command.strip().lower())
+    normalized = re.sub(r"(authorization:\s*bearer\s+)[^\s\"']+", r"\1<token>", normalized)
+    normalized = re.sub(r"\b(ldso|ob_ldso|pa_ldso|session[a-z0-9_-]*|csrf[a-z0-9_-]*)=[^;\"'\s]+", r"\1=<value>", normalized)
+    normalized = re.sub(r"([?&][a-z0-9_.-]+=)[^&\s]+", r"\1<value>", normalized)
+    normalized = re.sub(r"\b[a-f0-9]{16,}\b", "<hex>", normalized)
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
@@ -547,19 +567,118 @@ def _validate_finding_evidence(finding: Finding) -> str:
     if "http 200" in combined or "200 ok" in combined:
         if any(term in combined for term in ["links to /api", "flag in api response", "default flag", "idor-test-2"]):
             return "Finding rejected: an authenticated normal API listing response is not IDOR evidence without cross-tenant or unauthorized data proof."
+    if any(term in combined for term in ["duckduckgo", "bing search", "google search", "search results above"]):
+        return "Finding rejected: public research output is context, not vulnerability evidence."
+    if "varnish cache hit" in combined and not any(term in combined for term in ["other tenant", "cross-tenant", "cached private data", "sensitive response body"]):
+        return "Finding rejected: a cache hit alone is not evidence of cross-tenant leakage."
+    if "timed out" in combined or "timeout" in combined:
+        return "Finding rejected: timeout or reachability issues are reliability observations, not security findings."
+    if "invalid or missing ldso cookie" in combined and not any(term in combined for term in ["bypass", "still returned data", "unauthorized data", "other tenant"]):
+        return "Finding rejected: invalid-cookie errors indicate an auth boundary, not a bypass."
+    if re.search(r"\b200 ok\b", combined) and not any(term in combined for term in ["unauthorized", "cross-tenant", "sensitive", "__schema", "mutation", "stack trace", "token", "internal error"]):
+        return "Finding rejected: a 200 OK alone is not enough evidence of a vulnerability."
     return ""
 
 
+def _classify_finding_rung(finding: Finding) -> tuple[str, str]:
+    combined = " ".join([finding.title, finding.request, finding.response, finding.evidence, finding.impact]).lower()
+    if any(term in combined for term in ["search result", "duckduckgo", "bing", "google search", "medium.com", "stackoverflow"]):
+        return ("observed", "public research context does not demonstrate a vulnerability")
+    if any(term in combined for term in ["graphql endpoint found", "endpoint exists", "responds with empty json", "cache hit", "301 moved permanently", "405", "timed out"]):
+        return ("interesting", "this is an interesting surface or behavior, but not proof of exploitability")
+    if any(term in combined for term in ["potential", "investigate further", "verify if", "possible", "may allow"]):
+        return ("candidate", "the write-up still describes a hypothesis rather than a validated issue")
+    if any(term in combined for term in ["unauthorized data", "cross-tenant", "idor", "auth bypass", "schema", "__schema", "stack trace", "internal error", "injection"]) and any(term in combined for term in ["200 ok", "http/1.1 200", "data:", "body:", "{", "["]):
+        return ("validated", "the finding includes both a concrete security hypothesis and a response suggesting impact")
+    return ("suspicious", "the observation needs stronger unauthorized behavior or impact proof before it becomes a finding")
+
+
 def _reject_empty_workspace_write(path: str, content: str) -> str | None:
-    if content.strip():
+    stripped = content.strip()
+    if not stripped:
+        suffix = Path(path).suffix.lower()
+        if suffix in {".py", ".js", ".ts", ".tsx", ".sh", ".bash", ".ps1", ".json", ".md", ".txt", ".yaml", ".yml"}:
+            return (
+                f"Refusing to write empty or whitespace-only content to {path}. "
+                "Write a concise but useful artifact instead."
+            )
         return None
     suffix = Path(path).suffix.lower()
-    if suffix in {".py", ".js", ".ts", ".tsx", ".sh", ".bash", ".ps1", ".json", ".md", ".txt", ".yaml", ".yml"}:
+    basename = Path(path).name.lower()
+    if suffix == ".py":
+        if len(stripped) < 24:
+            return f"Refusing to write underspecified Python artifact to {path}. Include a complete executable script."
+        try:
+            ast.parse(content)
+        except SyntaxError as exc:
+            return f"Refusing to write syntactically invalid Python to {path}: {exc.msg}."
+    if suffix == ".json":
+        try:
+            import json
+
+            json.loads(content)
+        except Exception:
+            return f"Refusing to write invalid JSON to {path}."
+    if suffix == ".txt" and any(term in basename for term in ("request", "response", "evidence", "graphql", "proof", "artifact")):
+        line_count = len([line for line in content.splitlines() if line.strip()])
+        lowered = stripped.lower()
+        if line_count < 2 and not any(term in lowered for term in ("status", "response", "query", "mutation", "headers", "--- stdout ---")):
+            return (
+                f"Refusing to write low-signal text artifact to {path}. "
+                "Preserve the exact request plus observed response or evidence, not only a bare command."
+            )
+        required_markers = ("target:", "response", "why_interesting", "method:")
+        if "graphql" in basename and not any(marker in lowered for marker in ("query", "mutation", "response_status", "response_body_excerpt")):
+            return f"Refusing to write incomplete GraphQL evidence to {path}. Include request shape and response excerpt."
+        if any(term in basename for term in ("request", "response", "evidence")) and sum(marker in lowered for marker in required_markers) < 2:
+            return f"Refusing to write underspecified evidence text to {path}. Include structured request/response sections."
+    if re.search(r"(payload|headers|data)\s*=\s*['\"]?\{\s*$", stripped, re.I):
+        return f"Refusing to write obviously truncated artifact to {path}."
+    if suffix in {".py", ".js", ".ts", ".tsx", ".sh", ".bash", ".ps1", ".json", ".md", ".txt", ".yaml", ".yml"} and stripped.endswith(("payload = '{", 'payload = "{', "headers = {", "data = {", "query = {")):
         return (
-            f"Refusing to write empty or whitespace-only content to {path}. "
-            "Write a concise but useful artifact instead."
+            f"Refusing to write truncated artifact to {path}. "
+            "Write the complete content instead of a partial stub."
         )
     return None
+
+
+def _artifact_contract_guidance(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    basename = Path(path).name.lower()
+    if suffix == ".py":
+        return (
+            "Write a complete runnable verifier with: imports, target URL, headers/cookies if needed, request payload, "
+            "actual request execution, and printed response status plus a short body excerpt.\n"
+            "Template:\n"
+            "import requests\n"
+            "url = 'https://example.com/path'\n"
+            "headers = {'Content-Type': 'application/json'}\n"
+            "cookies = {'name': 'value'}\n"
+            "payload = {'key': 'value'}\n"
+            "resp = requests.post(url, headers=headers, cookies=cookies, json=payload, timeout=20)\n"
+            "print('STATUS:', resp.status_code)\n"
+            "print('HEADERS:', dict(resp.headers))\n"
+            "print('BODY:', resp.text[:800])"
+        )
+    if suffix == ".json":
+        return (
+            "Write valid JSON only. For evidence JSON, prefer keys like target, method, headers, cookies, body, "
+            "response_status, response_headers, response_body_excerpt, and why_interesting."
+        )
+    if suffix == ".txt":
+        if "graphql" in basename:
+            return (
+                "Write structured GraphQL evidence with sections:\n"
+                "TARGET:\nMETHOD:\nHEADERS:\nCOOKIES:\nOPERATION:\nQUERY:\nVARIABLES:\n"
+                "RESPONSE_STATUS:\nRESPONSE_HEADERS:\nRESPONSE_BODY_EXCERPT:\nWHY_INTERESTING:"
+            )
+        if any(term in basename for term in ("request", "response", "evidence", "proof", "artifact")):
+            return (
+                "Write structured evidence text with sections:\n"
+                "TARGET:\nMETHOD:\nHEADERS:\nCOOKIES:\nBODY:\nRESPONSE_STATUS:\n"
+                "RESPONSE_HEADERS:\nRESPONSE_BODY_EXCERPT:\nWHY_INTERESTING:"
+            )
+    return "Write a complete, non-empty artifact that preserves exact inputs, observed outputs, and why the result matters."
 
 
 def _validate_command_safety(command: str) -> ToolResult | None:

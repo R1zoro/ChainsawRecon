@@ -9,7 +9,7 @@ from pathlib import Path
 from .config import AgentSettings, ProgramScope
 from .llm import ChatMessage, LLMClient, NullLLMClient, OpenAICompatibleClient
 from .prompts import build_system_prompt, deterministic_recon_plan
-from .report import write_report
+from .report import write_engagement_report, write_report
 from .retrieval import NullRetrievalStore, RetrievalStore
 from .recon_db import NullReconStore, ReconStore, promote_run_facts
 from .sandbox import DockerSandboxRunner, LocalWorkspaceRunner
@@ -28,6 +28,8 @@ class BountyAgent:
         self.pending_targets = list(dict.fromkeys(self.session_targets))
         self.completed_targets: list[str] = []
         self.target_outcomes: dict[str, str] = {}
+        self.session_step_count = 0
+        self.priority_targets = self._load_priority_targets()
         self.run_dir = settings.session_run_dir or (runs_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{_slug(target)}")
         self.workspace = self.run_dir / "workspace"
         self.trace = TraceLogger(self.run_dir / "trace.jsonl")
@@ -37,6 +39,11 @@ class BountyAgent:
         # create ScopeGuard with per-run dynamic allowlist and optional allow-all
         dynamic_file = self.workspace / "allowed_hosts.txt"
         self.scope_guard = ScopeGuard(scope, dynamic_allow_file=dynamic_file, allow_all=self.settings.allow_all_hosts)
+        self.session_targets = self._sanitize_target_list(self.session_targets)
+        self.initial_targets = self._sanitize_target_list(self.initial_targets)
+        self.pending_targets = self._sanitize_target_list(self.pending_targets)
+        self.priority_targets = self._sanitize_target_list(self.priority_targets)
+        self.pending_targets = self._prioritize_targets(self.pending_targets)
         self.runner = self._build_runner()
         self.tools = ToolRegistry(
             self.runner,
@@ -63,10 +70,14 @@ class BountyAgent:
         self.trace.write("session_start", targets=self.session_targets, runner=self.settings.runner)
         effective_mode = self._resolve_effective_mode()
         self.trace.write("mode_selected", requested=self.settings.mode, effective=effective_mode)
+        self._stage_auth_context()
         self._refresh_session_queue()
         self._persist_session_state(effective_mode)
 
         while self.pending_targets:
+            if self.session_step_count >= self.settings.max_steps:
+                self.trace.write("session_step_budget_exhausted", used=self.session_step_count, limit=self.settings.max_steps)
+                break
             index = len(self.completed_targets) + 1
             current_target = self.pending_targets.pop(0)
             self.target = current_target
@@ -93,6 +104,9 @@ class BountyAgent:
                 ChatMessage("system", self._build_mapping_context_prompt()),
                 ChatMessage("system", self._build_mode_guidance_prompt(effective_mode)),
                 ChatMessage("system", self._build_phase_handoff_prompt(effective_mode)),
+                ChatMessage("system", self._build_auth_context_prompt()),
+                ChatMessage("system", self._build_priority_targets_prompt()),
+                ChatMessage("system", self._build_research_focus_prompt()),
                 ChatMessage("user", f"Begin with safe recon for queue target {index}: {current_target}. Pending queue size after this target: {len(self.pending_targets)}. Record only findings with concrete evidence."),
             ]
 
@@ -145,6 +159,7 @@ class BountyAgent:
         )
         promoted = self._promote_run_memory()
         self.trace.write("recon_promoted", count=promoted, engagement_db=str(self._engagement_db_path()))
+        self._write_engagement_report()
         self.trace.write("finish", report=str(self.run_dir / "report.md"))
         self._persist_session_state(effective_mode, finished=True)
         return self.run_dir
@@ -154,9 +169,10 @@ class BountyAgent:
         invalid_json_count = 0
         repeat_blocks = 0
         finish_rejections = 0
-        llm_history_start = len(self.tools.history)
         action_counts: dict[str, int] = {}
-        for step in range(self.settings.max_steps):
+        local_step = 0
+        while self.session_step_count < self.settings.max_steps:
+            step = self.session_step_count
             try:
                 memory_snippet = self._build_retrieval_context(messages, step)
                 coverage_snippet = self._build_coverage_brief(step)
@@ -170,8 +186,8 @@ class BountyAgent:
             action = parse_json_action(response)
             if not action:
                 invalid_json_count += 1
-                if invalid_json_count >= 5:
-                    message = "Stopped after 5 malformed or empty model responses."
+                if invalid_json_count >= self.settings.max_malformed_responses:
+                    message = f"Stopped after {self.settings.max_malformed_responses} malformed or empty model responses."
                     self.trace.write("model_error", step=step, error=message)
                     return message
                 messages.append(
@@ -179,15 +195,18 @@ class BountyAgent:
                         "user",
                         (
                             "FORMAT ERROR. Reply with one JSON object only. No explanation or markdown. "
-                            'Example: {"action":"finish","summary":"Unable to continue safely."}'
+                            'Example: {"action":"finish","summary":"Unable to continue safely."} '
+                            f"Malformed response budget remaining: {self.settings.max_malformed_responses - invalid_json_count}."
                         ),
                     )
                 )
                 continue
             invalid_json_count = 0
+            self.session_step_count += 1
+            local_step += 1
             if action.get("action") == "finish":
                 proposed_summary = str(action.get("summary", "Finished."))
-                gaps = _recon_coverage_gaps(self.tools.history[llm_history_start:], self.scope_guard)
+                gaps = _recon_coverage_gaps(self.tools.history, self.scope_guard, self.run_recon.coverage_summary())
                 coverage_gaps = self._surface_coverage_gaps()
                 attack_gaps = self._attack_family_gaps()
                 rejected_reason = ""
@@ -202,7 +221,7 @@ class BountyAgent:
                 if rejected_reason:
                     finish_rejections += 1
                     if finish_rejections >= 3:
-                        return f"Stopped because the model attempted to finish before completing recon. {rejected_reason}"
+                        return f"Deferred current target after repeated premature finish attempts. {rejected_reason}"
                     messages.append(ChatMessage("assistant", json.dumps(action)))
                     messages.append(
                         ChatMessage(
@@ -233,7 +252,9 @@ class BountyAgent:
             messages.append(ChatMessage("assistant", json.dumps(action)))
             messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
             if repeat_blocks >= 5:
-                return "Stopped because repeated probes were blocked five times. Review trace and choose a different strategy."
+                return "Deferred current target because repeated probes were blocked five times. Review trace and choose a different strategy."
+        if self.session_step_count >= self.settings.max_steps:
+            return final_summary or f"Reached session step limit after {local_step} steps on this target. Preserve current evidence and continue from queue next run."
         return final_summary or "Reached step limit. Review trace for the latest state."
 
     def _run_mapping_preflight(self, messages: list[ChatMessage]) -> str:
@@ -325,6 +346,38 @@ class BountyAgent:
                 lines.append(f"- {surface_type} {host}{path_pattern} auth={auth_context}")
         return "\n".join(lines)
 
+    def _build_priority_targets_prompt(self) -> str:
+        if not self.priority_targets:
+            return "No operator priority deep-test list is supplied for this run."
+        lines = [
+            "Operator priority deep-test list is active. These targets or endpoints deserve deeper recon and attack attention before broad low-value queue churn:",
+        ]
+        for item in self.priority_targets[:12]:
+            lines.append(f"- {item}")
+        return "\n".join(lines)
+
+    def _build_research_focus_prompt(self) -> str:
+        surfaces = self._merged_surfaces()
+        surface_types = sorted({surface.surface_type for surface in surfaces if getattr(surface, "surface_type", "")})
+        hosts = sorted({surface.host for surface in surfaces if getattr(surface, "host", "") and surface.host != "local"})
+        keywords: list[str] = []
+        if "graphql" in surface_types:
+            keywords.extend(["graphql authz", "graphql introspection", "graphql idor", "apollo"])
+        if "api" in surface_types:
+            keywords.extend(["api authorization", "idor", "openapi", "swagger"])
+        if "js" in surface_types:
+            keywords.extend(["javascript source map", "sdk key exposure", "bundle endpoint extraction"])
+        if "auth" in surface_types:
+            keywords.extend(["sso", "oauth", "session fixation", "tenant switching"])
+        if any("docs" in host for host in hosts):
+            keywords.extend(["sdk", "docs generator", "fern", "code snippets", "sample token"])
+        if not keywords:
+            return "Public research focus: derive searches from observed technologies, SDKs, docs tooling, headers, route names, and bug classes, not only the company name."
+        return (
+            "Public research focus: build search queries from observed technologies and bug classes instead of only the target name. "
+            f"Current promising terms: {', '.join(dict.fromkeys(keywords))}."
+        )
+
     def _build_mode_guidance_prompt(self, effective_mode: str) -> str:
         lines = [
             f"Effective workflow mode: {effective_mode}",
@@ -361,6 +414,27 @@ class BountyAgent:
             lines.append("Current auth-aware surfaces:")
             for surface in auth_surfaces[:5]:
                 lines.append(f"- {surface.surface_type} {surface.host}{surface.path_pattern} auth={surface.auth_context}")
+        return "\n".join(lines)
+
+    def _build_auth_context_prompt(self) -> str:
+        staged = self.workspace / "auth-context.txt"
+        if not staged.exists():
+            return "Authenticated context: none supplied. If auth-only surfaces are discovered, keep notes for a future authenticated run."
+        try:
+            content = staged.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return "Authenticated context file exists but could not be read."
+        if not content:
+            return "Authenticated context file is empty."
+        preview = content[:1200]
+        lines = [
+            "Authenticated context is available in workspace file `auth-context.txt`.",
+            "Use it carefully for authenticated checks, compare unauthenticated and authenticated behavior, and avoid treating normal logged-in access as a finding.",
+            "Auth context preview:",
+            preview,
+        ]
+        if len(content) > len(preview):
+            lines.append(f"...truncated {len(content) - len(preview)} chars")
         return "\n".join(lines)
 
     def _build_target_map_content(self) -> str:
@@ -435,14 +509,20 @@ class BountyAgent:
             "initial_targets": list(self.initial_targets),
             "completed_targets": list(self.completed_targets),
             "pending_targets": list(self.pending_targets),
+            "priority_targets": list(self.priority_targets),
             "known_targets": list(dict.fromkeys(self.completed_targets + self.pending_targets)),
             "target_outcomes": dict(self.target_outcomes),
+            "session_step_limit": self.settings.max_steps,
+            "session_steps_used": self.session_step_count,
+            "session_steps_remaining": max(0, self.settings.max_steps - self.session_step_count),
             "artifacts": {
                 "report": "report.md",
                 "trace": "trace.jsonl",
                 "mapping_state": "mapping-state.json",
                 "potential_weaknesses": "potential-weaknesses.json",
                 "workspace": "workspace",
+                "auth_context": "workspace/auth-context.txt" if (self.workspace / "auth-context.txt").exists() else None,
+                "engagement_report": str(self._engagement_db_path().with_name("engagement-report.md")),
             },
             "finished": finished,
         }
@@ -450,10 +530,22 @@ class BountyAgent:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
 
+    def _stage_auth_context(self) -> Path | None:
+        source = self.settings.auth_context_path
+        if not source or not source.exists():
+            return None
+        target = self.workspace / "auth-context.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = source.read_text(encoding="utf-8", errors="replace")
+        target.write_text(content, encoding="utf-8")
+        self.trace.write("auth_context_staged", source=str(source), target=str(target), bytes=len(content))
+        return target
+
     def _refresh_session_queue(self) -> None:
         if not self.settings.queue_path:
             return
         queue = list(dict.fromkeys(self.pending_targets))
+        queue = self._prioritize_targets(queue)
         self.settings.queue_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings.queue_path.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -468,6 +560,7 @@ class BountyAgent:
             known.add(candidate)
             self.pending_targets.append(candidate)
             self.session_targets.append(candidate)
+        self.pending_targets = self._prioritize_targets(self.pending_targets)
         return additions
 
     def _collect_discovered_targets(self) -> list[str]:
@@ -503,14 +596,72 @@ class BountyAgent:
         if not cleaned or cleaned == "local":
             return None
         if cleaned.startswith(("http://", "https://")):
+            cleaned = self._sanitize_discovered_url(cleaned)
+            if not cleaned:
+                return None
             decision = self.scope_guard.validate_target(cleaned)
             return cleaned if decision.allowed else None
         if "/" in cleaned or "?" in cleaned:
             cleaned = f"https://{cleaned.lstrip('/')}"
+            cleaned = self._sanitize_discovered_url(cleaned)
+            if not cleaned:
+                return None
             decision = self.scope_guard.validate_target(cleaned)
             return cleaned if decision.allowed else None
+        if any(marker in cleaned for marker in ("*", "FUZZ", "robots.txt", "sitemap.xml")):
+            return None
         decision = self.scope_guard.validate_target(cleaned)
         return cleaned if decision.allowed else None
+
+    def _sanitize_discovered_url(self, value: str) -> str | None:
+        cleaned = value.strip()
+        if any(marker in cleaned for marker in ("*", "FUZZ")):
+            return None
+        cleaned = re.sub(r"/(?:robots\.txt|sitemap\.xml)(?:/|$)", "/", cleaned, flags=re.I)
+        cleaned = re.sub(r"/{2,}", "/", cleaned.replace(":/", "://PLACEHOLDER//")).replace("://PLACEHOLDER//", "://")
+        cleaned = cleaned.rstrip("/")
+        if cleaned.endswith(("robots.txt", "sitemap.xml")):
+            return None
+        return cleaned
+
+    def _sanitize_target_list(self, targets: list[str]) -> list[str]:
+        sanitized: list[str] = []
+        for item in targets:
+            cleaned = str(item or "").strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith(("http://", "https://")):
+                cleaned = self._sanitize_discovered_url(cleaned) or ""
+            elif any(marker in cleaned for marker in ("*", "FUZZ", "robots.txt", "sitemap.xml")):
+                cleaned = ""
+            if cleaned and cleaned not in sanitized:
+                sanitized.append(cleaned)
+        return sanitized
+
+    def _load_priority_targets(self) -> list[str]:
+        path = self.settings.priority_targets_path
+        if not path or not path.exists():
+            return []
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        items: list[str] = []
+        for line in raw.splitlines():
+            cleaned = line.strip()
+            if not cleaned or cleaned.startswith("#"):
+                continue
+            items.append(cleaned)
+        return items
+
+    def _prioritize_targets(self, targets: list[str]) -> list[str]:
+        if not self.priority_targets:
+            return list(dict.fromkeys(targets))
+        priority_prefixes = tuple(self.priority_targets)
+        ordered = list(dict.fromkeys(targets))
+        high = [item for item in ordered if item in self.priority_targets or item.startswith(priority_prefixes)]
+        normal = [item for item in ordered if item not in high]
+        return high + normal
 
     def _merged_surfaces(self) -> list[object]:
         merged: list[object] = []
@@ -612,6 +763,11 @@ class BountyAgent:
         if step >= 12 and action_counts.get("write_file", 0) == 0:
             hints.append(
                 "You have not written a verification script yet. If manual curl probes are repeating, write a small Python script in the workspace and run it once."
+            )
+        remaining_steps = max(0, self.settings.max_steps - self.session_step_count)
+        if remaining_steps <= 12:
+            hints.append(
+                f"Session step budget is running low ({remaining_steps} steps remaining). Focus on the current target, preserve complete artifacts, and finish with a concise high-signal summary rather than opening broad new branches."
             )
         if step and step % 10 == 0:
             hints.append(
@@ -811,6 +967,19 @@ class BountyAgent:
             return DockerSandboxRunner(self.workspace, self.settings.docker_image, self.settings.docker_env_file)
         return LocalWorkspaceRunner(self.workspace)
 
+    def _write_engagement_report(self) -> Path:
+        report_path = self._engagement_db_path().with_name("engagement-report.md")
+        write_engagement_report(
+            report_path,
+            self.scope,
+            self.engagement_recon.coverage_summary(),
+            self.engagement_recon.facts(),
+            self.engagement_recon.surfaces(),
+            self.engagement_recon.attack_results(),
+        )
+        self.trace.write("engagement_report_written", path=str(report_path))
+        return report_path
+
 
 def parse_json_action(text: str) -> dict[str, object] | None:
     text = text.strip()
@@ -852,6 +1021,7 @@ def _summary_claims_findings(summary: str) -> bool:
 def _recon_coverage_gaps(
     history: list[tuple[dict[str, object], object]],
     scope_guard: ScopeGuard,
+    coverage_summary: dict[str, object] | None = None,
 ) -> list[str]:
     search_queries: list[str] = []
     commands: list[str] = []
@@ -882,16 +1052,19 @@ def _recon_coverage_gaps(
         "snyk": any("snyk.io" in query or "snyk" in query for query in search_queries),
     }
     command_text = "\n".join(commands)
+    coverage_summary = coverage_summary or {}
+    surface_count = int(coverage_summary.get("surface_count", 0) or 0)
+    attack_count = int(coverage_summary.get("attack_count", 0) or 0)
     gaps: list[str] = []
     if len(set(search_queries)) < 4 or sum(research_sources.values()) < 3:
         gaps.append("run at least four distinct public searches covering at least three research sources")
-    if not re.search(r"\b(katana|subfinder|waybackurls|gau|assetfinder|amass|ffuf|gobuster|dirsearch)\b", command_text):
+    if surface_count < 8 and not re.search(r"\b(katana|subfinder|waybackurls|gau|assetfinder|amass|ffuf|gobuster|dirsearch)\b", command_text):
         gaps.append("use a discovery tool such as katana, subfinder, waybackurls, ffuf, gobuster, or dirsearch")
     if not re.search(r"\b(httpx|wafw00f|whatweb)\b", command_text):
         gaps.append("use a fingerprinting tool such as httpx or wafw00f")
-    if not re.search(r"\b(nuclei|nikto|xsstrike|sqlmap)\b", command_text):
+    if attack_count < 12 and not re.search(r"\b(nuclei|nikto|xsstrike|sqlmap)\b", command_text):
         gaps.append("run one focused low-rate scanner such as nuclei, nikto, XSStrike, or SQLMap")
-    if len(hosts) < 3:
+    if max(len(hosts), surface_count) < 3:
         gaps.append("touch at least three distinct in-scope hosts or application surfaces")
     if not written_files or not executed_python:
         gaps.append("write and execute one small Python verification script")

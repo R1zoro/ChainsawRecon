@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .config import AgentSettings, ProgramScope
 from .skills import skill_catalog_prompt
+from urllib.parse import urlparse
 
 
 def build_system_prompt(scope: ProgramScope, target: str, settings: AgentSettings) -> str:
@@ -62,6 +63,7 @@ Supported actions:
 - {{"action":"search","query":"site:security.snyk.io package or technology advisory","engine":"duckduckgo","max_results":5}}
 - {{"action":"search","query":"site:stackoverflow.com framework error endpoint name","engine":"bing","max_results":5}}
 - {{"action":"read_file","path":"path"}}
+- {{"action":"read_file","path":"auth-context.txt"}}
 - {{"action":"write_file","path":"verify_upload.py","content":"import requests\\n# low-rate verification script here\\n"}}
 - {{"action":"bash","command":"python3 verify_upload.py","timeout_seconds":60}}
 - {{"action":"list_files","path":"."}}
@@ -71,6 +73,26 @@ Supported actions:
 Focus on signal: scope, reproduction evidence, impact, false-positive risk, and next manual verification.
 Do not record 404 responses, scanner failures, missing tools, redirects, or authentication-required responses as vulnerabilities by themselves.
 Do not use `Tool result summary` or `content_length` as evidence. Evidence must include meaningful status, body excerpt, header, request, response, or file path.
+Artifact contracts:
+- Verification scripts must be complete and runnable. A good Python verifier includes imports, target URL, headers/cookies if needed, request data, the actual request call, and printed response status/headers/body excerpt.
+- Evidence files must preserve what was sent and what came back. Do not save a bare curl command by itself.
+- For request/response evidence text files, use sections like:
+  TARGET:
+  METHOD:
+  HEADERS:
+  COOKIES:
+  BODY:
+  RESPONSE_STATUS:
+  RESPONSE_HEADERS:
+  RESPONSE_BODY_EXCERPT:
+  WHY_INTERESTING:
+- For GraphQL evidence, include URL, headers/cookies, operation type, query or mutation, variables, and the observed response excerpt.
+- Prefer stable artifact names such as `verify_<purpose>.py`, `evidence_<surface>.txt`, `request_<surface>.txt`, or `response_<surface>.txt`.
+- If a write_file attempt is rejected for being incomplete, rewrite the full artifact immediately instead of moving on.
+Public research rules:
+- Do not waste searches on generic target-name queries like `site:github target vulnerability`.
+- Build searches from observed technologies, surface types, headers, JS bundle clues, SDK names, docs generators, GraphQL terms, API paths, auth products, and concrete bug classes.
+- Good examples: `site:github.com launchdarkly graphql authz`, `site:snyk.io graphql introspection auth bypass`, `site:stackoverflow.com fern docs api auth header`, `site:cvedetails.com apollo graphql`, `site:medium.com multi-tenant graphql idor`.
 Suggested phases:
 1. Target mapping: use `target_mapping`, then write `target-map.md` from scope, headers,
    robots, sitemap, app/API/docs/auth surfaces, exclusions, auth state, and rate limits.
@@ -80,6 +102,7 @@ Suggested phases:
 5. Verification: if a behavior looks interesting, write a small Python verifier instead of repeating curl commands.
 6. Finding triage: record only unique findings with request, response, impact, and safe next steps.
 7. Auth-aware follow-up: when login, session, OAuth, SSO, account, tenant, or callback surfaces are present, compare auth entry points, token/cookie handling, post-login flows, and reset/invite/account-switch paths before finish.
+8. If `auth-context.txt` is present, read it and use that context for authenticated requests or verification scripts.
 
 Before finish is accepted you must complete all of this compact coverage checklist:
 - Write a `target-map.md` or equivalent target map before broad enumeration or scanning.
@@ -100,11 +123,18 @@ but finish will be rejected until the checklist is complete.
 
 
 def deterministic_recon_plan(target: str) -> list[dict[str, object]]:
+    robots_target = target
+    sitemap_target = target
+    parsed = urlparse(target if "://" in target else f"https://{target}")
+    if parsed.scheme and parsed.netloc and parsed.path and parsed.path not in {"", "/"}:
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        robots_target = base
+        sitemap_target = base
     return [
         {"action": "bash", "command": f"printf '%s\\n' {target}", "timeout_seconds": 5},
         {"action": "bash", "command": f"curl -I -L --max-time 20 {target}", "timeout_seconds": 30},
-        {"action": "bash", "command": f"curl -fsSL --max-time 20 {target}/robots.txt", "timeout_seconds": 30},
-        {"action": "bash", "command": f"curl -fsSL --max-time 20 {target}/sitemap.xml", "timeout_seconds": 30},
+        {"action": "bash", "command": f"curl -fsSL --max-time 20 {robots_target}/robots.txt", "timeout_seconds": 30},
+        {"action": "bash", "command": f"curl -fsSL --max-time 20 {sitemap_target}/sitemap.xml", "timeout_seconds": 30},
         {
             "action": "bash",
             "command": "for t in curl python3 httpx nuclei ffuf katana subfinder dnsx naabu gobuster dirsearch nikto sqlmap wafw00f xsstrike gitjacker; do command -v \"$t\" >/dev/null 2>&1 && echo \"$t=present\" || echo \"$t=missing\"; done",
