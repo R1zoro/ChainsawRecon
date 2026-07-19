@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,13 @@ from typing import Any
 from .config import ProgramScope
 from .recon_db import AttackResult, ReconFact, SurfaceRecord
 from .tools import Finding
+
+
+_SEVERITY_SORT = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
+
+
+def _severity_key(finding: Finding) -> int:
+    return _SEVERITY_SORT.get(finding.severity.strip().lower(), 99)
 
 
 def write_report(
@@ -23,102 +31,133 @@ def write_report(
     session_targets: list[str] | None = None,
     potential_weaknesses_path: Path | None = None,
 ) -> None:
+    run_coverage = run_coverage or {}
+    sorted_findings = sorted(findings, key=_severity_key)
+
+    # Severity summary table
+    severity_counts = Counter(f.severity.strip().lower() for f in findings)
+    severity_table = [
+        "| Severity | Count |",
+        "|----------|-------|",
+    ]
+    for sev in ("critical", "high", "medium", "low", "info"):
+        severity_table.append(f"| {sev} | {severity_counts.get(sev, 0)} |")
+    if sum(severity_counts.values()) == 0:
+        severity_table = ["No findings recorded."]
+
     lines = [
         f"# Bug Bounty Triage Report: {scope.program_name}",
         "",
-        f"- Target: `{target}`",
-        f"- Session targets: `{', '.join(session_targets or [target])}`",
-        f"- Generated: `{datetime.now().isoformat(timespec='seconds')}`",
-        f"- Findings recorded: `{len(findings)}`",
-        f"- Run recon facts: `{len(run_facts or [])}`",
-        f"- Prior engagement facts loaded: `{len(engagement_facts or [])}`",
-        f"- Run surfaces: `{(run_coverage or {}).get('surface_count', 0)}`",
-        f"- Run attack results: `{(run_coverage or {}).get('attack_count', 0)}`",
+        "---",
         "",
-        "## Summary",
+        f"**Target:** `{target}`",
+        f"**Generated:** `{datetime.now().isoformat(timespec='seconds')}`",
+        f"**Session targets:** `{', '.join(session_targets or [target])}`",
+        f"**Findings:** `{len(findings)}`",
+        f"**Surfaces tested:** `{(run_coverage or {}).get('surface_count', 0)}`",
+        f"**Attack combos tested:** `{(run_coverage or {}).get('tested_combinations', 0)}`",
+        "",
+        "---",
+        "",
+        "## 📋 Executive Summary",
         "",
         summary or "No summary provided.",
         "",
-        "## Methodology",
+        "## 🔴 Severity Breakdown",
+        "",
+        *severity_table,
+        "",
+        "## 🎯 Scope & Methodology",
         "",
         *_render_methodology(target, scope),
         "",
-        "## Scope Notes",
+        "### Scope",
         "",
-        f"- Allowed domains: {', '.join(scope.allowed_domains) or '(none)'}",
-        f"- Excluded domains: {', '.join(scope.excluded_domains) or '(none)'}",
-        f"- Program notes: {scope.notes or '(none)'}",
+        f"- **Program:** {scope.program_name}",
+        f"- **Allowed domains:** {', '.join(scope.allowed_domains) or '(none)'}",
+        f"- **Excluded domains:** {', '.join(scope.excluded_domains) or '(none)'}",
+        f"- **Notes:** {scope.notes or '(none)'}",
         "",
-        "## Target Map",
+        "## 🗺️ Target Map",
         "",
         *_render_target_map(run_facts or []),
         "",
-        "## Potential Weaknesses",
+        "## ⚡ Potential Weaknesses",
         "",
         *_render_potential_weaknesses_note(potential_weaknesses_path),
         "",
-        "## Evidence Trail",
+        "## 📜 Evidence Trail",
         "",
         *_render_evidence_trail(history or []),
         "",
-        "## Coverage",
+        "## 📊 Coverage Analysis",
         "",
-        *_render_coverage_section(run_coverage or {}, engagement_coverage or {}),
+        *_render_coverage_section(run_coverage, engagement_coverage or {}),
         "",
-        "## Recommended Next Steps",
+        "## ➡️ Recommended Next Steps",
         "",
-        *_render_recommended_next_steps(run_coverage or {}, summary),
+        *_render_recommended_next_steps(run_coverage, summary),
         "",
-        "## Findings",
+        "---",
+        "",
+        "## 🔍 Findings Details",
         "",
     ]
-    if not findings:
+    if not sorted_findings:
         lines.append("No findings were recorded. Review `trace.jsonl` for recon output and blocked actions.")
         if history:
-            lines.extend(["", "## Recon Mapping", "", "The following recon steps were executed during the run:", ""])
+            lines.extend(["", "### Recon Mapping (Execution Log)", "", "The following recon steps were executed:", ""])
             for idx, (action, result) in enumerate(history, start=1):
-                if idx > 30:
-                    lines.append(f"{idx}. ...additional recon steps omitted from report; see `trace.jsonl`.")
+                if idx > 40:
+                    lines.append(f"{idx}. ...additional steps omitted; see `trace.jsonl`.")
                     break
                 if action.get("action") == "bash":
-                    lines.append(f"{idx}. `{action.get('command')}` -> exit_code={result.ok}")
+                    lines.append(f"{idx}. `{action.get('command')}` → exit_code={result.ok}")
                 elif action.get("action") == "search":
-                    lines.append(f"{idx}. search `{action.get('query')}` via {action.get('engine')} -> exit_code={result.ok}")
+                    lines.append(f"{idx}. search `{action.get('query')}` via {action.get('engine')} → exit_code={result.ok}")
                 else:
-                    lines.append(f"{idx}. {action.get('action')} -> exit_code={result.ok}")
-    for idx, finding in enumerate(findings, start=1):
+                    lines.append(f"{idx}. {action.get('action')} → exit_code={result.ok}")
+
+    for idx, finding in enumerate(sorted_findings, start=1):
+        severity_badge = {
+            "critical": "🔴 CRITICAL",
+            "high": "🟠 HIGH",
+            "medium": "🟡 MEDIUM",
+            "low": "🟢 LOW",
+            "info": "🔵 INFO",
+        }.get(finding.severity.strip().lower(), "⚪ UNKNOWN")
+
         lines.extend(
             [
                 f"### {idx}. {finding.title}",
                 "",
-                f"- Severity: `{finding.severity}`",
-                f"- Asset: `{finding.asset}`",
+                f"- **Severity:** `{severity_badge}`",
+                f"- **Asset:** `{finding.asset}`",
+                f"- **Impact:** {finding.impact.strip()}",
                 "",
-                "Request:",
+                "#### Request",
                 "",
-                "```text",
+                "```http",
                 finding.request.strip() or "(not provided)",
                 "```",
                 "",
-                "Response:",
+                "#### Response",
                 "",
-                "```text",
+                "```http",
                 finding.response.strip() or "(not provided)",
                 "```",
                 "",
-                "Evidence:",
+                "#### Evidence",
                 "",
                 "```text",
                 finding.evidence.strip(),
                 "```",
                 "",
-                "Impact:",
-                "",
-                finding.impact.strip(),
-                "",
-                "Next steps:",
+                "#### Next Steps",
                 "",
                 finding.next_steps.strip() or "Manually verify impact and program eligibility.",
+                "",
+                "---",
                 "",
             ]
         )
@@ -231,7 +270,7 @@ def _render_recommended_next_steps(run_coverage: dict[str, Any], summary: str) -
     if next_tasks:
         return [
             "- Prioritize the highest-value untested surfaces first.",
-            *[f"- {task['surface_type']} {task['surface']} -> {task['attack_type']} ({task['reason']})" for task in next_tasks[:6]],
+            *[f"- {task['surface_type']} `{task['surface']}` → `{task['attack_type']}` ({task['reason']})" for task in next_tasks[:6]],
             "- Validate any promising auth boundary with a small, one-off verification script instead of broad probing.",
         ]
     summary_text = (summary or "").strip()
@@ -245,25 +284,26 @@ def _render_coverage_section(run_coverage: dict[str, Any], engagement_coverage: 
     if not run_coverage:
         return ["No structured coverage data was recorded."]
     lines.append(
-        f"Current run has {run_coverage.get('surface_count', 0)} surfaces and {run_coverage.get('tested_combinations', 0)} tested surface/attack combinations."
+        f"Current run has **{run_coverage.get('surface_count', 0)}** surfaces and **{run_coverage.get('tested_combinations', 0)}** tested surface/attack combinations."
     )
     surface_types = run_coverage.get("surface_types", {})
     if surface_types:
-        lines.append("Surface types:")
+        lines.append("")
+        lines.append("**Surface type breakdown:**")
         for surface_type, count in sorted(surface_types.items(), key=lambda item: item[0]):
             lines.append(f"- `{surface_type}`: {count}")
     next_tasks = run_coverage.get("next_tasks", [])[:8]
     if next_tasks:
         lines.append("")
-        lines.append("Untested high-value follow-ups:")
+        lines.append("**Untested high-value follow-ups:**")
         for task in next_tasks:
             lines.append(
-                f"- `{task['surface_type']}` `{task['surface']}` -> `{task['attack_type']}` ({task['reason']})"
+                f"- `{task['surface_type']}` `{task['surface']}` → `{task['attack_type']}` ({task['reason']})"
             )
     if engagement_coverage.get("surface_count", 0):
         lines.append("")
         lines.append(
-            f"Engagement memory currently tracks {engagement_coverage.get('surface_count', 0)} surfaces and {engagement_coverage.get('attack_count', 0)} attack results."
+            f"Engagement memory currently tracks **{engagement_coverage.get('surface_count', 0)}** surfaces and **{engagement_coverage.get('attack_count', 0)}** attack results."
         )
     return lines or ["No structured coverage data was recorded."]
 
@@ -288,7 +328,7 @@ def _render_evidence_trail(history: list[tuple[dict[str, Any], Any]]) -> list[st
             detail = str(action.get("path") or action.get("target") or action.get("url") or action_name)
         if not detail:
             continue
-        lines.append(f"- `{action_name}` -> `{detail}`")
+        lines.append(f"- `{action_name}` → `{detail}`")
         interesting += 1
         if "graphql" in text or "swagger" in text or "openapi" in text or "sourcemap" in text or "set-cookie" in text:
             lines.append(f"  Evidence: `{_trim_excerpt(getattr(result, 'content', ''))}`")

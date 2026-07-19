@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 import subprocess
 
 
@@ -15,6 +16,9 @@ class CommandResult:
 
 
 class SandboxRunner:
+    def __init__(self, settings: Any = None) -> None:
+        self.settings = settings
+
     def exec(self, command: str, timeout_seconds: int) -> CommandResult:
         raise NotImplementedError
 
@@ -32,7 +36,8 @@ class SandboxRunner:
 
 
 class LocalWorkspaceRunner(SandboxRunner):
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, settings: Any = None) -> None:
+        super().__init__(settings)
         self.workspace = workspace
         self.workspace.mkdir(parents=True, exist_ok=True)
 
@@ -82,8 +87,8 @@ class LocalWorkspaceRunner(SandboxRunner):
 
 
 class DockerSandboxRunner(LocalWorkspaceRunner):
-    def __init__(self, workspace: Path, image: str, env_file: Path | None = None) -> None:
-        super().__init__(workspace)
+    def __init__(self, workspace: Path, image: str, env_file: Path | None = None, settings: Any = None) -> None:
+        super().__init__(workspace, settings)
         self.image = image
         self.env_file = env_file
         self.container_id: str | None = None

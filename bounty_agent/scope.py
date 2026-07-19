@@ -36,7 +36,14 @@ class ScopeGuard:
         hosts = self._extract_hosts(command)
         if not hosts:
             return ScopeDecision(True, "Command contains no explicit remote host.", ())
-        return self.validate_hosts(hosts)
+        # Exempt package registries and code hosts for downloads
+        exempt_hosts = {"github.com", "raw.githubusercontent.com", "pypi.org", "pypi.python.org",
+                        "files.pythonhosted.org", "npmjs.org", "registry.npmjs.org",
+                        "registry.npmjs.com", "rubygems.org", "crates.io", "cran.r-project.org"}
+        remaining = tuple(h for h in hosts if h not in exempt_hosts)
+        if not remaining:
+            return ScopeDecision(True, "All hosts are exempt package registries.", hosts)
+        return self.validate_hosts(remaining)
 
     def validate_hosts(self, hosts: tuple[str, ...] | list[str]) -> ScopeDecision:
         if self.allow_all:
@@ -99,11 +106,16 @@ class ScopeGuard:
         cleaned = token.strip("()[]{}<>,;\"'")
         if not cleaned:
             return None
+        # Skip local file paths (contain backslash, or start with ./ or .\\)
+        if "\\\\" in cleaned or cleaned.startswith("./") or cleaned.startswith(".\\\\"):
+            return None
         if "://" in cleaned:
             return urlparse(cleaned).hostname
         if cleaned.startswith("//"):
             return urlparse(f"https:{cleaned}").hostname
-        candidate = cleaned.split("/", 1)[0].split(":", 1)[0].lower().strip(".")
+        # Normalize backslashes to forward slashes for path handling
+        normalized = cleaned.replace("\\\\", "/")
+        candidate = normalized.split("/", 1)[0].split(":", 1)[0].lower().strip(".")
         if self._is_ip(candidate) or self._is_domain(candidate):
             return candidate
         return None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from dataclasses import dataclass, field
 import hashlib
 from html.parser import HTMLParser
@@ -55,6 +56,7 @@ class ToolRegistry:
         command_delay_seconds: float = 0.0,
         max_commands_per_minute: int = 0,
         max_repeated_commands: int = 2,
+        allow_search: bool = False,
     ) -> None:
         self.runner = runner
         self.scope_guard = scope_guard
@@ -65,20 +67,29 @@ class ToolRegistry:
         self.history: list[tuple[dict[str, Any], ToolResult]] = []
         self.rate_limiter = CommandRateLimiter(command_delay_seconds, max_commands_per_minute, trace)
         self.max_repeated_commands = max(1, max_repeated_commands)
+        self.allow_search = allow_search
         self.command_counts: dict[str, int] = {}
         self.skill_counts: dict[str, int] = {}
         self.finding_fingerprints: set[str] = set()
+        self._tool_presence_cache: dict[str, bool] = {}
 
     def execute(self, action: dict[str, Any]) -> ToolResult:
         name = str(action.get("action", "")).strip()
         self.trace.write("tool_call", action=action)
+        # Reset consecutive search counter on non-search actions
+        if name != "search":
+            self._consecutive_search_count = 0
         try:
             if name == "bash":
                 result = self._bash(action)
             elif name in _TOOL_ACTIONS:
                 result = self._tool_action(action)
             elif name == "search":
-                result = self._search(action)
+                result = self._search(action) if self.allow_search else ToolResult(
+                    False,
+                    "Internet search is disabled in mapping, recon, and attack modes. Use observed target evidence and installed tools.",
+                    {"search_disabled": True},
+                )
             elif name == "read_file":
                 result = self._read_file(action)
             elif name == "write_file":
@@ -126,7 +137,7 @@ class ToolRegistry:
 
     def _bash(self, action: dict[str, Any]) -> ToolResult:
         command = str(action.get("command", "")).strip()
-        timeout = int(action.get("timeout_seconds", 60))
+        timeout = int(action.get("timeout_seconds", self.runner.settings.command_timeout_seconds))
         if not command:
             return ToolResult(False, "Missing command.")
         safety_result = _validate_command_safety(command)
@@ -144,6 +155,20 @@ class ToolRegistry:
         self.rate_limiter.wait()
         result = self.runner.exec(command, timeout)
         self._add_discovered_hosts(result.stdout or "", result.stderr or "")
+        # IP block detection: if 403/429/Cloudflare detected, wait and retry
+        combined = (result.stdout or "") + " " + (result.stderr or "")
+        if result.exit_code != 0 and any(marker in combined.lower() for marker in ["403", "429", "cloudflare", "waf", "rate limit", "too many requests"]):
+            block_count = getattr(self, "_ip_block_count", 0) + 1
+            self._ip_block_count = block_count
+            if block_count <= 3:
+                wait_time = 60 * block_count  # 60s, 120s, 180s
+                self.trace.write("ip_block_detected", wait_seconds=wait_time, attempt=block_count)
+                time.sleep(wait_time)
+                # Retry once after waiting
+                result = self.runner.exec(command, timeout)
+                self._add_discovered_hosts(result.stdout or "", result.stderr or "")
+        else:
+            self._ip_block_count = 0
         content = (
             f"exit_code={result.exit_code} timed_out={result.timed_out}\n"
             f"--- stdout ---\n{_truncate(result.stdout)}\n"
@@ -160,29 +185,34 @@ class ToolRegistry:
         if not url:
             return ToolResult(False, f"Missing target for {name} action.")
         command = _build_tool_command(name, url, action)
-        return self._bash({**action, "action": "bash", "command": command, "timeout_seconds": action.get("timeout_seconds", 60)})
+        return self._bash({**action, "action": "bash", "command": command, "timeout_seconds": action.get("timeout_seconds", self.runner.settings.command_timeout_seconds)})
 
     def _search(self, action: dict[str, Any]) -> ToolResult:
         query = str(action.get("query", "")).strip()
-        engine = str(action.get("engine", "duckduckgo")).strip().lower()
+        engine = str(action.get("engine", "google")).strip().lower()
         max_results = int(action.get("max_results", 5))
         if not query:
             return ToolResult(False, "Missing query.")
-        if engine not in {"duckduckgo", "bing", "google"}:
-            return ToolResult(False, f"Unsupported search engine: {engine}")
+        if engine != "google":
+            return ToolResult(False, f"Unsupported search engine: {engine}. Assistant search is Google-only.")
         if max_results <= 0 or max_results > 10:
             return ToolResult(False, "max_results must be between 1 and 10.")
+        # Search death spiral limit: max 3 consecutive searches
+        self._consecutive_search_count = getattr(self, '_consecutive_search_count', 0) + 1
+        if self._consecutive_search_count > 3:
+            self._consecutive_search_count = 0
+            return ToolResult(
+                False,
+                "Search blocked after 3 consecutive searches without a non-search action. "
+                "Execute a bash command, write_file, or use_skill before searching again.",
+                {"search_blocked": True},
+            )
 
         safe_query = _sanitize_search_query(query)
-        if engine == "duckduckgo":
-            command = f"curl -fsSL 'https://html.duckduckgo.com/html/?q={safe_query}'"
-        elif engine == "bing":
-            command = f"curl -fsSL 'https://www.bing.com/search?q={safe_query}'"
-        else:
-            command = f"curl -fsSL 'https://www.google.com/search?q={safe_query}'"
+        command = f"curl -fsSL 'https://www.google.com/search?q={safe_query}'"
 
         self.rate_limiter.wait()
-        result = self.runner.exec(command, int(action.get("timeout_seconds", 30)))
+        result = self.runner.exec(command, int(action.get("timeout_seconds", self.runner.settings.command_timeout_seconds)))
         content = _format_search_results(result.stdout or "", max_results)
         if result.exit_code != 0 and result.stderr:
             content += f"\n--- tool error ---\n{_truncate(result.stderr)}"
@@ -194,9 +224,21 @@ class ToolRegistry:
 
     def _write_file(self, action: dict[str, Any]) -> ToolResult:
         path = str(action.get("path", "")).strip()
-        content = str(action.get("content", ""))
         if not path:
             return ToolResult(False, "Missing file path.")
+        repeat_result = self._check_repeated_write(path)
+        if repeat_result:
+            return repeat_result
+        if "content" not in action:
+            guidance = _artifact_contract_guidance(path or "output.txt")
+            return ToolResult(
+                False,
+                "write_file requires a 'content' field with the file body. "
+                "Include the full file text in the JSON action itself, not just the path.\n"
+                f"Repair guidance:\n{guidance}",
+                {"write_rejected": True, "path": path, "reason": "missing_content_field"},
+            )
+        content = str(action.get("content", ""))
         empty_reason = _reject_empty_workspace_write(path, content)
         if empty_reason:
             guidance = _artifact_contract_guidance(path)
@@ -208,12 +250,31 @@ class ToolRegistry:
         self.runner.write_file(path, content)
         return ToolResult(True, f"Wrote {len(content)} bytes to {path}.")
 
+    def _check_repeated_write(self, path: str) -> ToolResult | None:
+        count = self.command_counts.get(f"_write_{path}", 0) + 1
+        self.command_counts[f"_write_{path}"] = count
+        if count <= 2:
+            return None
+        return ToolResult(
+            False,
+            f"write_file for {path} blocked after {count} attempts.\n"
+            "The previous attempts were rejected because content was missing or invalid.\n"
+            "STOP and switch strategy: use bash with cat/tee to write the file, or write a different artifact.",
+            {"write_blocked": True, "path": path, "attempts": count},
+        )
+
     def _list_files(self, action: dict[str, Any]) -> ToolResult:
         path = str(action.get("path", "."))
         return ToolResult(True, "\n".join(self.runner.list_files(path)))
 
     def _use_skill(self, action: dict[str, Any]) -> ToolResult:
         name = str(action.get("name", ""))
+        if name == "public_research" and not self.allow_search:
+            return ToolResult(
+                False,
+                "public_research is assistant-only. Use fingerprinting, surface discovery, or validation from observed target evidence.",
+                {"skill_disabled": True},
+            )
         repeat_result = self._check_repeated_skill(action)
         if repeat_result:
             return repeat_result
@@ -262,7 +323,7 @@ class ToolRegistry:
         if fingerprint in self.finding_fingerprints:
             return ToolResult(
                 True,
-                "Duplicate finding suppressed. Do not record it again; either add new evidence, write a verification script, search for related CVEs/CWEs, or finish.",
+                "Duplicate finding suppressed. Do not record it again; either add new evidence, write a verification script, or finish.",
                 {"duplicate": True},
             )
 
@@ -289,6 +350,13 @@ class ToolRegistry:
         )
 
     def _check_repeated_command(self, command: str) -> ToolResult | None:
+        # Exempt GraphQL introspection queries (they are all different, not repeats)
+        if _is_graphql_introspection(command):
+            return None
+        # Exempt baseline recon checks that run on every target (robots.txt, sitemap.xml, tool presence)
+        if _is_baseline_recon_command(command):
+            return None
+
         fingerprint = _command_fingerprint(command)
         count = self.command_counts.get(fingerprint, 0) + 1
         self.command_counts[fingerprint] = count
@@ -298,8 +366,9 @@ class ToolRegistry:
             False,
             (
                 f"Repeated command blocked after {self.max_repeated_commands} runs.\n"
-                "Do not run the same probe again. Change strategy now: write a small Python verification script, "
-                "search public references for the observed technology/CWE/CVE, enumerate a new endpoint class, "
+                "Do not run the same probe again. Change strategy now: write a comprehensive Python verification script "
+                "(50-200 payload/query variations) and run it once, "
+                "enumerate a new endpoint class, "
                 "or record a final finding with unique evidence."
             ),
             {"repeat_blocked": True, "repeat_count": count, "fingerprint": fingerprint},
@@ -378,6 +447,22 @@ _TOOL_ACTIONS = {
     "assetfinder",
     "dnsx",
     "naabu",
+    "inql",
+    "clairvoyance",
+    "grapeql",
+    "feroxbuster",
+    "dalfox",
+    "crtsh",
+    "git",
+    "pip",
+    "pip3",
+    "npm",
+    "wget",
+    "curl",
+    "dig",
+    "nslookup",
+    "openssl",
+    "nmap",
 }
 
 
@@ -418,6 +503,18 @@ def _build_tool_command(tool: str, url: str, action: dict[str, Any]) -> str:
         return f"dnsx -d '{sanitized_url}'"
     if tool == "naabu":
         return f"naabu -host '{sanitized_url}' -rate 50"
+    if tool == "inql":
+        return f"inql --no-color -t '{sanitized_url}'"
+    if tool == "clairvoyance":
+        return f"clairvoyance '{sanitized_url}'"
+    if tool == "grapeql":
+        return f"grapeql '{sanitized_url}'"
+    if tool == "feroxbuster":
+        return f"feroxbuster -u '{sanitized_url}' -t 2 -d 3 --no-recursion --time-limit 60s"
+    if tool == "dalfox":
+        return f"dalfox url '{sanitized_url}' --only-custom-payload --no-gf --silence --skip-bav"
+    if tool == "crtsh":
+        return f"crtsh '{sanitized_url}'"
     return f"{tool} '{sanitized_url}'"
 
 
@@ -474,6 +571,10 @@ def _command_fingerprint(command: str) -> str:
     normalized = re.sub(r"\b(ldso|ob_ldso|pa_ldso|session[a-z0-9_-]*|csrf[a-z0-9_-]*)=[^;\"'\s]+", r"\1=<value>", normalized)
     normalized = re.sub(r"([?&][a-z0-9_.-]+=)[^&\s]+", r"\1<value>", normalized)
     normalized = re.sub(r"\b[a-f0-9]{16,}\b", "<hex>", normalized)
+    # Normalize GraphQL query bodies - replace all field names with <field>
+    if '{"query"' in normalized or '"query":"' in normalized:
+        normalized = re.sub(r"\b[a-z_]+(?=\s*[:\(\{])", "<field>", normalized)
+        normalized = re.sub(r"\b[a-z_]+(?=\s*\()", "<field>", normalized)
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
@@ -509,8 +610,10 @@ def _action_tags(action: dict[str, Any], result: ToolResult) -> list[str]:
         tags.append("discovery")
     if any(tool in command for tool in ("httpx", "wafw00f", "whatweb")):
         tags.append("fingerprint")
-    if any(tool in command for tool in ("nuclei", "nikto", "xsstrike", "sqlmap")):
+    if any(tool in command for tool in ("nuclei", "nikto", "xsstrike", "sqlmap", "dalfox")):
         tags.append("scanner")
+    if "inql" in command or "graphql" in command:
+        tags.append("graphql")
     if "python" in command:
         tags.append("verification")
     if query:
@@ -567,7 +670,7 @@ def _validate_finding_evidence(finding: Finding) -> str:
     if "http 200" in combined or "200 ok" in combined:
         if any(term in combined for term in ["links to /api", "flag in api response", "default flag", "idor-test-2"]):
             return "Finding rejected: an authenticated normal API listing response is not IDOR evidence without cross-tenant or unauthorized data proof."
-    if any(term in combined for term in ["duckduckgo", "bing search", "google search", "search results above"]):
+    if any(term in combined for term in ["google search", "search results above"]):
         return "Finding rejected: public research output is context, not vulnerability evidence."
     if "varnish cache hit" in combined and not any(term in combined for term in ["other tenant", "cross-tenant", "cached private data", "sensitive response body"]):
         return "Finding rejected: a cache hit alone is not evidence of cross-tenant leakage."
@@ -582,7 +685,7 @@ def _validate_finding_evidence(finding: Finding) -> str:
 
 def _classify_finding_rung(finding: Finding) -> tuple[str, str]:
     combined = " ".join([finding.title, finding.request, finding.response, finding.evidence, finding.impact]).lower()
-    if any(term in combined for term in ["search result", "duckduckgo", "bing", "google search", "medium.com", "stackoverflow"]):
+    if any(term in combined for term in ["search result", "google search", "medium.com", "stackoverflow"]):
         return ("observed", "public research context does not demonstrate a vulnerability")
     if any(term in combined for term in ["graphql endpoint found", "endpoint exists", "responds with empty json", "cache hit", "301 moved permanently", "405", "timed out"]):
         return ("interesting", "this is an interesting surface or behavior, but not proof of exploitability")
@@ -716,17 +819,28 @@ def _validate_command_safety(command: str) -> ToolResult | None:
         "dirsearch": [" --max-rate ", " -t 1", " -t 2", " -t 3", " -t 4", " -t 5"],
         "sqlmap": [" --delay=", " --threads=1", " --safe-url", " --batch"],
     }
-    padded = f" {lowered} "
-    for tool, required_any in scanner_rate_hints.items():
-        if re.search(rf"(^|[;&|]\s*){tool}\b|\s{tool}\b", lowered) and not any(hint in padded for hint in required_any):
-            return ToolResult(
-                False,
-                (
-                    f"{tool} command blocked because it lacks explicit low-rate/concurrency controls. "
-                    "Add the tool's rate, delay, or low-thread flags according to the program policy."
-                ),
-                {"rate_guard_blocked": True, "tool": tool},
-            )
+    # Check each pipe segment separately for rate flags
+    # Allow if ANY segment has rate flags (not all segments need them)
+    segments = lowered.split("|")
+    has_any_rate_flag = any(
+        any(hint in f" {seg.strip()} " for hint in hints)
+        for seg in segments
+        for hints in scanner_rate_hints.values()
+    )
+    if has_any_rate_flag:
+        return None
+    for segment in segments:
+        seg_padded = f" {segment.strip()} "
+        for tool, required_any in scanner_rate_hints.items():
+            if re.search(rf"(^|[;&]\s*){tool}\b|\s{tool}\b", segment) and not any(hint in seg_padded for hint in required_any):
+                return ToolResult(
+                    False,
+                    (
+                        f"{tool} command blocked because it lacks explicit low-rate/concurrency controls. "
+                        "Add the tool's rate, delay, or low-thread flags according to the program policy."
+                    ),
+                    {"rate_guard_blocked": True, "tool": tool},
+                )
     return None
 
 
@@ -770,3 +884,45 @@ def _unwrap_search_url(value: str) -> str:
     if "uddg" in query and query["uddg"]:
         return unquote(query["uddg"][0])
     return value
+
+
+def _is_graphql_introspection(command: str) -> bool:
+    """Detect if a command is a GraphQL introspection or query probe.
+
+    GraphQL queries are all different (different fields, arguments, variables)
+    so they should not be treated as repeated commands. This exempts:
+    - Introspection queries (__schema, __type, __typename)
+    - GraphQL POST requests with query bodies
+    - GET requests with ?query= parameter containing GraphQL syntax
+    """
+    lowered = command.lower()
+    # GraphQL introspection markers
+    if any(marker in lowered for marker in ("__schema", "__type", "__typename")):
+        return True
+    # GraphQL query/mutation/subscription in POST body or GET query param
+    if '{"query"' in lowered or '"query":"' in lowered or "'query':'" in lowered:
+        return True
+    if "?query=" in lowered and any(marker in lowered for marker in ("{", "query", "mutation", "subscription")):
+        return True
+    # GraphQL content-type header
+    if "application/graphql" in lowered:
+        return True
+    return False
+
+
+def _is_baseline_recon_command(command: str) -> bool:
+    """Exempt baseline recon checks that run on EVERY target from repeat-blocking.
+
+    The deterministic recon plan runs these on each target:
+    - robots.txt fetch
+    - sitemap.xml fetch
+    - tool presence check (for t in curl python3 ...)
+    """
+    lowered = command.lower()
+    # robots.txt or sitemap.xml fetch
+    if "robots.txt" in lowered or "sitemap.xml" in lowered:
+        return True
+    # Tool presence check command
+    if "command -v" in lowered and "for t in" in lowered:
+        return True
+    return False

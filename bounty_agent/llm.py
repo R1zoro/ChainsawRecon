@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import time
 from typing import Any
 from urllib import error, request
@@ -32,6 +33,8 @@ class OpenAICompatibleClient(LLMClient):
         else:
             self.model = model
         self.timeout_seconds = max(30, timeout_seconds)
+        self._is_ollama = base_url.rstrip("/").endswith(":11434") or model.startswith("ollama/")
+        self.ollama_keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", "-1")
 
     def complete(self, messages: list[ChatMessage]) -> str:
         body: dict[str, Any] = {
@@ -39,7 +42,15 @@ class OpenAICompatibleClient(LLMClient):
             "messages": [{"role": item.role, "content": item.content} for item in messages],
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
+            "max_tokens": 8192,
         }
+        if self._is_ollama:
+            body["options"] = {
+                "num_predict": 8192,
+                "num_ctx": 12288,
+                "temperature": 0.2,
+                "keep_alive": self.ollama_keep_alive,
+            }
         data = json.dumps(body).encode("utf-8")
         req = request.Request(
             f"{self.base_url}/chat/completions",

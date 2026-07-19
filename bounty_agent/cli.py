@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--program", type=Path, help="Path to program scope JSON.")
     parser.add_argument("--engagement", type=Path, help="Engagement folder containing program/scope.json.")
     parser.add_argument("--target", help="Target URL, domain, or IP to test. Optional when --engagement is supplied.")
-    parser.add_argument("--mode", choices=["mapping", "recon", "attack", "auto"], default="auto")
+    parser.add_argument("--mode", choices=["mapping", "recon", "attack", "assistant", "auto"], default="auto")
     parser.add_argument("--provider", choices=sorted(PROVIDER_DEFAULTS), default="ollama")
     parser.add_argument("--model", help="OpenAI-compatible model spec, e.g. ollama/qwen2.5-coder:7b.")
     parser.add_argument("--no-llm", action="store_true", help="Do not call an LLM, even if an API key is configured.")
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command-delay-seconds", type=float, help="Minimum delay before each executed bash tool call.")
     parser.add_argument("--max-commands-per-minute", type=int, help="Maximum executed bash tool calls per minute.")
     parser.add_argument("--max-steps", type=int, default=12)
-    parser.add_argument("--max-repeated-commands", type=int, default=2)
+    parser.add_argument("--max-repeated-commands", type=int, default=5)
     parser.add_argument("--max-malformed-responses", type=int, default=10)
     parser.add_argument("--llm-timeout-seconds", type=int, help="Timeout seconds for LLM HTTP calls.")
     parser.add_argument("--auth-file", type=Path, help="Optional auth context file with cookies, headers, tokens, or login notes.")
@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         llm_timeout_seconds=(
             args.llm_timeout_seconds
             if args.llm_timeout_seconds is not None
-            else 240
+            else 480
         ),
         rate_limit_notes=scope.rate_limits.notes,
         allow_all_hosts=args.allow_all_hosts,

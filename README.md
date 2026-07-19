@@ -1,335 +1,180 @@
-# Bounty Agent
+# ChainsawRecon
 
-Bounty Agent is a scope-aware bug bounty assistant inspired by the earlier CTF solver architecture. It keeps the same clean boundary:
+ChainsawRecon is a scope-aware, local-LLM bug-bounty reconnaissance and validation agent. It runs approved security tooling inside a Docker sandbox, keeps an auditable trace of every model decision and command, and turns useful observations into durable engagement knowledge.
 
-- the LLM proposes compact JSON actions
-- the agent validates scope and command safety
-- tools run in a controlled workspace or container
-- every action is traced
-- final output is a triage/report artifact
+It is designed to assist authorized testing only. The program scope and rules in an engagement are the source of truth.
 
-The goal is not to blindly exploit programs. The first version helps you reduce noisy recon output into safer next steps, likely false positives, and evidence needed for a valid report.
+## What It Does
 
-## Quick Start
+- Starts from an engagement rather than a single URL, so all declared in-scope assets can enter a shared target queue.
+- Moves through mapping, recon, and attack work while retaining evidence and coverage state across targets.
+- Uses a local OpenAI-compatible model server such as Ollama; the model proposes compact JSON actions and never receives host-shell access.
+- Executes approved tools in one Docker sandbox per run with scope checks, command-rate limits, and artifact validation.
+- Maintains two layers of memory: a disposable run database and a curated engagement database promoted after the run.
+- Writes compact reports, a validation queue, and reusable asset catalogs for both future runs and manual testing.
+- Supports API, GraphQL, JavaScript, source-map, authentication-surface, and conventional web reconnaissance workflows.
 
-Use a conservative local run for an engagement like this:
+Read the detailed system description in [architecture.md](architecture.md).
 
-```powershell
-uv run bounty-agent `
-  --engagement engagements\acme `
-  --mode auto `
-  --target https://example.com `
-  --provider groq `
-  --model groq/llama-3.3-70b-versatile `
-  --max-steps 12 `
-  --max-repeated-commands 2 `
-  --command-delay-seconds 2 `
-  --max-commands-per-minute 20 `
-  --dry-run
-```
+## Prerequisites
 
-If you want the agent to stay strictly in a safe dry-run loop first, keep `--dry-run` in place and remove it only after you are happy with the planned actions.
+- Python 3.10+
+- Docker Desktop running
+- Ollama running locally, with a compatible model already pulled
+- An authorized engagement folder created from `engagements/_template`
 
-## Workflow modes
-
-The CLI now supports three explicit workflow modes plus an automatic default:
-
-- mapping: build a lightweight target map, save it to target-map.md, and stop once the map is complete.
-- recon: use the target map and prior evidence to enumerate one target at a time with low-rate checks.
-- attack: run mapping first when needed, then continue into deeper validation and exploitation-style follow-up.
-- auto: choose the safest next phase based on existing evidence.
-
-Example usage:
+Build or rebuild the Docker image whenever `sandbox/Dockerfile.sandbox` changes:
 
 ```powershell
-uv run bounty-agent --engagement engagements\acme --mode mapping
-uv run bounty-agent --engagement engagements\acme --mode recon
-uv run bounty-agent --engagement engagements\acme --mode attack
+docker build --pull --no-cache -f sandbox/Dockerfile.sandbox -t bounty-sandbox:latest .
 ```
 
-When you provide an engagement folder without a specific `--target`, the agent will infer targets from the engagement's in-scope asset list and use them as the initial run queue.
+The default `--docker-image bounty-sandbox` resolves to the same `:latest` tag, so no CLI change is required. The first build can take a while because Kali packages, Go tools, and Python tools are installed from upstream sources.
 
-## Engagement Folders
+Optionally confirm that the key commands are present after the build:
 
-For real programs, use one folder per engagement:
-
-```text
-engagements/<program-name>/
-  program/
-    scope.json
-    prompt.md
-    secrets.env
-    in-scope.txt
-    out-of-scope.txt
-    rules.md
-  manual/
-    notes.md
-    findings.md
-    report-drafts.md
-  agent/
-    runs/
+```powershell
+docker run --rm bounty-sandbox:latest bash -lc "command -v httpx nuclei katana inql clairvoyance grapeql feroxbuster dalfox"
 ```
 
-Use `program/` for the bounty platform's source-of-truth rules, scope, rate limits, and the prompt you want the agent to follow. Use `manual/` for your own discoveries and rough notes. The agent writes traces, workspaces, and reports under `agent/runs/`.
+Some optional Python packages are intentionally non-fatal in the Dockerfile because upstream package/CLI names can change. A missing command in this check means that tool should not be selected until the image recipe is adjusted and rebuilt.
 
-Create a new local engagement from the template:
+## Create an Engagement
 
 ```powershell
 Copy-Item -Recurse engagements\_template engagements\acme
 ```
 
-Then run against that engagement:
-
-```powershell
-uv run bounty-agent `
-  --engagement engagements\acme `
-  --target https://example.com `
-  --provider groq `
-  --dry-run
-```
-
-The agent automatically loads:
+Populate the engagement before executing anything:
 
 ```text
-engagements\acme\program\scope.json
-engagements\acme\program\prompt.md
+engagements/acme/
+  program/
+    scope.json          # machine-readable scope and rate limits
+    in-scope.txt        # optional additional in-scope assets
+    out-of-scope.txt    # exclusions
+    rules.md            # program rules and constraints
+    prompt.md           # concise program-specific testing context
+    secrets.env         # optional local-only auth material; do not commit
+    priority-targets.txt # optional endpoints to deep-test first
+  manual/               # operator notes and report drafts
+  agent/                # generated database, asset catalog, reports, and runs
 ```
 
-If present, Docker runs also pass this file into the sandbox:
+Keep credentials, cookies, reports, and target data out of public commits unless the program explicitly permits disclosure.
+
+## Run the Agent
+
+Your current command shape remains valid. `--target` is optional and should normally be omitted when the engagement already contains scope and seed assets.
+
+```powershell
+python -m bounty_agent.cli `
+  --engagement engagements\<engagement-name> `
+  --mode attack `
+  --provider ollama `
+  --model ollama/chrisdiochavez/ANINOGPT-PILIPINAS-ATAKE:latestv3 `
+  --llm-base-url http://localhost:11434/v1 `
+  --llm-api-key ollama `
+  --runner docker `
+  --docker-image bounty-sandbox `
+  --execute `
+  --max-steps 1500 `
+  --max-commands-per-minute 40
+```
+
+For a safe planning pass, replace `--execute` with `--dry-run`. Do not use both.
+
+### Modes
+
+| Mode | Use |
+|---|---|
+| `mapping` | Build or refresh the asset and surface map. No broad attack work. |
+| `recon` | Perform low-rate discovery and fingerprinting against mapped targets. |
+| `attack` | Runs mapping preflight when necessary, then performs evidence-led verification. |
+| `auto` | Selects a safe next phase from existing mapping and engagement memory. |
+| `assistant` | Operator-led helper mode. Internet search is allowed only here and only when explicitly requested. |
+
+Autonomous mapping, recon, attack, and auto modes do not use web/GitHub/public-vulnerability searches. They rely on program-provided scope, observed responses, local tools, and stored engagement evidence.
+
+## How a Run Works
+
+1. The CLI loads program scope, exclusions, saved mapping state, and the target queue.
+2. The agent opens one run database and the engagement knowledge database.
+3. It starts one long-lived Docker sandbox for the run.
+4. Deterministic, low-rate startup checks collect baseline information before model-directed work.
+5. The model receives a compact retrieval context, current target, coverage gaps, and only the highest-value prior facts.
+6. The model emits one JSON action. The agent validates scope, rate limits, repeats, command safety, and artifact quality before executing it.
+7. Results become trace events, run facts, surface records, and test-coverage records. New high-value in-scope targets can join the same run queue.
+8. On completion, promotable facts are curated into engagement memory and the reports/catalogs are regenerated.
+
+The global `--max-steps` budget is shared across the entire queue. A target change does not grant a new budget. As the remaining budget becomes small, the agent should focus on highest-value coverage, validation, and reporting rather than open-ended queue expansion.
+
+## Outputs
+
+Each run lives under `engagements/<name>/agent/runs/<timestamp>-<seed>/`:
 
 ```text
-engagements\acme\program\secrets.env
+trace.jsonl             # append-only audit log of model responses and tool results
+session.state.json      # run status, global progress, queue, and artifact locations
+mapping-state.json      # durable structured target map
+report.md               # concise run report
+validation-queue.json   # hypotheses needing confirmation or reproduction
+priority-followups.md   # operator-oriented next actions
+interesting-leads.md    # non-validated leads, kept separate from findings
+auth-surfaces.md        # authentication-relevant surfaces
+workspace/              # validated scripts, evidence, and tool outputs
+recon.db                # disposable run-local database
 ```
 
-Example `secrets.env`:
-
-```env
-API_TOKEN=
-OBLDSO=
-LDSO=
-```
-
-Do not commit real secrets. Real engagement folders are ignored by Git by default.
-
-You can override the prompt file:
-
-```powershell
-uv run bounty-agent `
-  --engagement engagements\acme `
-  --target https://example.com `
-  --prompt prompts\my-strategy.md `
-  --dry-run
-```
-
-To validate the folder and scope without calling any model:
-
-```powershell
-uv run bounty-agent `
-  --engagement engagements\acme `
-  --target https://example.com `
-  --no-llm `
-  --dry-run
-```
-
-Real engagement folders are ignored by Git by default. Only `engagements/_template` is meant to be committed.
-
-Create a program config:
-
-```json
-{
-  "program_name": "Example Program",
-  "allowed_domains": ["example.com", "*.example.com"],
-  "excluded_domains": ["admin.example.com"],
-  "allowed_urls": ["https://example.com"],
-  "notes": "Only test assets explicitly listed as in scope."
-}
-```
-
-Run a dry recon session:
-
-```bash
-uv run bounty-agent --program examples/program.example.json --target https://example.com --dry-run
-```
-
-Without `uv`, the equivalent is:
-
-```bash
-python -m bounty_agent.cli --program examples/program.example.json --target https://example.com --dry-run
-```
-
-Run approved commands inside a Docker sandbox on Kali:
-
-```bash
-docker build -f sandbox/Dockerfile.sandbox -t bounty-sandbox .
-
-uv run bounty-agent \
-  --program examples/program.example.json \
-  --target https://example.com \
-  --runner docker \
-  --docker-image bounty-sandbox \
-  --execute
-```
-
-## Docker Space Management
-
-Docker Desktop stores Linux images, containers, volumes, and build cache inside its WSL-managed disk. Kali-based images and repeated rebuilds can consume many GB quickly.
-
-Check current Docker usage:
-
-```powershell
-docker system df
-docker images
-docker ps -a
-```
-
-Build the sandbox image intentionally:
-
-```powershell
-docker build -f sandbox/Dockerfile.sandbox -t bounty-sandbox .
-```
-
-After changing `sandbox/Dockerfile.sandbox`, rebuild the same tag. Docker may keep old intermediate layers in build cache, so inspect usage after rebuild:
-
-```powershell
-docker system df
-```
-
-Safe cleanup after agent runs:
-
-```powershell
-docker container prune
-docker builder prune
-```
-
-More aggressive cleanup, still usually safe if you only want to remove unused Docker data:
-
-```powershell
-docker system prune
-```
-
-Heavy cleanup: removes unused images too. This may remove images you will need to download/build again later:
-
-```powershell
-docker system prune -a
-```
-
-Volume cleanup: only run this if you are sure you do not need Docker volumes from other projects:
-
-```powershell
-docker volume prune
-```
-
-One command to reset this project's sandbox image only:
-
-```powershell
-docker rm -f $(docker ps -aq --filter ancestor=bounty-sandbox)
-docker rmi bounty-sandbox
-docker builder prune
-```
-
-If PowerShell complains about `$(...)` because there are no containers, remove the image directly:
-
-```powershell
-docker rmi bounty-sandbox
-docker builder prune
-```
-
-Recommended habit:
-
-- Run `docker system df` before and after big rebuilds.
-- Use `docker builder prune` after several Dockerfile experiments.
-- Use `docker system prune -a` only when you are comfortable rebuilding/downloading unused images.
-- Avoid `docker volume prune` unless you know other Docker projects do not store important data in volumes.
-
-Use an OpenAI-compatible local model endpoint, such as Ollama on your Windows host:
-
-```bash
-uv run bounty-agent \
-  --program examples/program.example.json \
-  --target https://example.com \
-  --model ollama/qwen2.5-coder:7b \
-  --llm-base-url http://WINDOWS_HOST_IP:11434/v1 \
-  --llm-api-key ollama
-```
-
-Use Groq:
-
-```powershell
-# .env
-GROQ_API_KEY=gsk_your_key_here
-```
-
-Then run:
-
-```powershell
-$env:UV_CACHE_DIR = Join-Path $env:TEMP 'bounty-agent-uv-cache'
-
-uv run bounty-agent `
-  --program examples/program.example.json `
-  --target https://example.com `
-  --provider groq `
-  --model groq/llama-3.3-70b-versatile
-```
-
-Groq uses `https://api.groq.com/openai/v1` as the OpenAI-compatible base URL.
-
-Artifacts are written to:
+The engagement directory accumulates curated memory and reusable catalogs:
 
 ```text
-engagements/<program-name>/agent/runs/<timestamp>-<target>/
-  trace.jsonl
-  report.md
-  workspace/
+agent/knowledge.db           # curated cross-run recon memory
+agent/engagement-report.md   # consolidated readable engagement picture
+agent/assets/
+  all-surfaces.txt
+  live-hosts.txt
+  urls.txt
+  api-endpoints.txt
+  graphql-endpoints.txt
+  js-bundles.txt
+  source-maps.txt
+  docs-sdk-endpoints.txt
+  auth-surfaces.txt
+  test-progress.tsv
 ```
 
-## JSON Action Protocol
+The run database may contain incomplete or noisy observations. Only promotable facts move into `knowledge.db`; raw research queries are excluded. `test-progress.tsv` is especially useful for selecting a manual follow-up surface without redoing already-covered checks.
 
-The model must respond with one JSON object:
+## Tooling
 
-```json
-{"action":"bash","command":"httpx -json -u https://example.com","timeout_seconds":60}
-```
+The Docker image includes a practical set of discovery, API/GraphQL, and validation tools, including `httpx`, `katana`, `nuclei`, `subfinder`, `dnsx`, `naabu`, `ffuf`, `feroxbuster`, `gobuster`, `dirsearch`, `sqlmap`, `dalfox`, `wafw00f`, `inql`, `clairvoyance`, `grapeql`, `arjun`, `graphql-cop`, `gau`, `waybackurls`, `assetfinder`, and `trufflehog` where available.
 
-Supported actions:
+Tool availability is checked at run startup. A tool being named in the repository does not guarantee its upstream package installed successfully; use the post-build check above if a specific tool matters to an engagement.
 
-- `use_skill`
-- `bash`
-- `search`
-- `read_file`
-- `write_file`
-- `list_files`
-- `record_finding`
-- `finish`
+## Authentication
 
-Commands are checked against target scope before execution.
+The agent can use operator-supplied authentication context, but autonomous modes do not create accounts or run arbitrary login automation. Prefer a local, uncommitted auth file or Docker env file with the minimum necessary cookies/headers. The agent can record observed authentication surfaces and compare authenticated versus unauthenticated responses when valid context is supplied.
 
-## Agent Skills
+Never place fresh session tokens in a committed `prompt.md`, README, trace, or public issue.
 
-The agent includes built-in playbooks that the model can request during a run:
+## Safety and Scope
 
-- `public_research`
-- `surface_discovery`
-- `fingerprint`
-- `scanner_triage`
-- `verification_script`
-- `finding_triage`
+- `--execute` is required before commands run; otherwise actions are traced as dry-run plans.
+- Every tool request is scope-checked before it reaches Docker.
+- The sandbox is the execution boundary; the model cannot directly execute commands on the host.
+- Rate limits and command spacing are configurable in the engagement scope and CLI.
+- Repeated commands and malformed actions are controlled to prevent low-value loops.
+- WAF/Cloudflare-like blocking is treated as a signal to slow down, preserve evidence, and defer rather than to bypass protections.
+- Findings follow a ladder: signal -> hypothesis -> reproduced -> validated. A scanner result alone is not a confirmed vulnerability.
 
-Example:
+## Development Notes
 
-```json
-{"action":"use_skill","name":"public_research","objective":"find public clues for API authorization bugs","context":"baseline headers collected"}
-```
+- Use `rg` for code searches and exclude `runs/`, `__pycache__/`, virtual environments, caches, and large traces unless a specific investigation needs a small excerpt.
+- Preserve traces as audit data. Improve reports and structured stores rather than rewriting historical trace files.
+- Rebuild `bounty-sandbox` after changing the Dockerfile. Rebuild is unnecessary after Python-only agent changes.
+- Review [architecture.md](architecture.md) before making workflow changes: queue, memory, evidence, and reporting are deliberately separate concerns.
 
-The returned skill text is a workflow contract: allowed tools, steps, artifacts, validation checks, and stop conditions. The model still has to execute the steps with normal actions such as `search`, `bash`, `write_file`, and `record_finding`. This is intentional; it keeps the agent auditable and prevents a vague prompt from turning into repeated commands or weak findings.
+## License and Responsible Use
 
-## Safety Model
-
-- Program scope is loaded before any command runs.
-- Commands that reference out-of-scope hosts are blocked.
-- `--execute` is required before commands run.
-- `--runner docker` starts one long-lived container for the run, mounts the run workspace at `/workspace`, and executes tool calls with `docker exec`.
-- The Docker sandbox uses Docker's default bridge network. In normal Docker Desktop setups, the container can reach the internet unless Docker Desktop, Windows firewall, VPN policy, DNS, or your network blocks it. The agent still scope-checks `bash` commands before execution, while the separate `search` action can query public research sources.
-- Rate limits can be configured in `program/scope.json` with `rate_limits.delay_seconds` and `rate_limits.max_commands_per_minute`.
-- The built-in limiter delays between agent tool calls. For scanners such as `nuclei`, `ffuf`, `httpx`, or `katana`, still use their own rate/concurrency flags according to the program policy.
-- `--allow-all-hosts` disables host scope blocking for commands, but it does not disable command safety checks, duplicate-command blocking, rate guards, or destructive-command blocking.
-- Prefer accurate `program/scope.json` entries over `--allow-all-hosts` for real bounty programs. Use `--allow-all-hosts` only for your own lab/student target or when you intentionally want public research/search domains to be reachable.
+Use ChainsawRecon only against systems for which you have explicit authorization and within the applicable program rules.

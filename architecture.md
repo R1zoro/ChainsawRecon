@@ -1,281 +1,327 @@
-# CTF Agent Architecture Summary
+# ChainsawRecon Workflow and Architecture
 
-This project is a multi-model CTF solving system. The agent process runs on the operator machine, talks to one or more LLM providers, starts one Docker sandbox per solver, exposes sandbox tools to the model, records every action, and exports a solve report plus generated exploit files.
+## Purpose
 
-## Process Layout
+ChainsawRecon is an engagement-first, evidence-led bug-bounty agent. Its job is not to produce a long list of generic scanner messages. Its job is to preserve the working memory a careful tester would build: what is in scope, what is alive, what technology and application surfaces exist, which checks were actually performed, what evidence supports a lead, and what should happen next.
+
+The agent runs only within a user-provided authorized engagement. It combines a local LLM, deterministic tooling, a Docker sandbox, structured databases, a target queue, and generated reports.
+
+## Core Design Principles
+
+1. Engagement before target: scope files and the target queue are primary. A CLI `--target` is an optional seed, not the sole focus.
+2. One run, many targets: newly discovered in-scope assets join the current run queue. They do not create unrelated standalone runs.
+3. Evidence before conclusions: a tool result is an observation; a finding needs a reproducible security hypothesis and supporting response evidence.
+4. Two-tier memory: raw run state is disposable; only curated, high-value facts become cross-run engagement memory.
+5. Compact model context: the model sees the current target, relevant surfaces, prior coverage, and selected facts, not every URL, trace, or program line on every call.
+6. Human handoff matters: compact catalogs and validation queues are first-class artifacts, not side effects of a report.
+7. Safety is architectural: scope validation, rate limits, command policies, and sandboxing happen before execution, not as model instructions alone.
+
+## System Context
 
 ```mermaid
 flowchart LR
-    OP["Operator CLI / meeting workflow"]
-    CLI["backend.cli"]
-    SWARM["ChallengeSwarm"]
-    SOLVER["Solver per model"]
-    LLM["LLM provider\nOllama/Groq/Pydantic AI/Claude/Codex"]
-    DOCKER["DockerSandbox\nctf-sandbox container"]
-    DIST["/challenge/distfiles\nread-only challenge files"]
-    WS["/challenge/workspace\nwritable solver workspace"]
-    TRACE["logs/trace-*.jsonl"]
-    REPORT["challenge/artifacts/.../report.md"]
-
-    OP --> CLI
-    CLI --> SWARM
-    SWARM --> SOLVER
-    SOLVER <--> LLM
-    SOLVER --> DOCKER
-    DOCKER --> DIST
-    DOCKER --> WS
-    SOLVER --> TRACE
-    SWARM --> REPORT
+    O["Authorized operator"] --> E["Engagement folder\nscope, rules, targets, auth context"]
+    O --> C["CLI"]
+    C --> A["ChainsawRecon orchestrator"]
+    A <--> M["Local model server\nOllama OpenAI-compatible API"]
+    A --> G["Scope guard, rate limiter, repeat controls"]
+    G --> S["Long-lived Docker sandbox\nbounty-sandbox"]
+    S --> T["Recon, API, GraphQL, JS, scanner tools"]
+    A --> R["Run database and trace"]
+    A --> K["Curated engagement knowledge"]
+    R --> H["Run report, evidence, validation queue"]
+    K --> H2["Engagement report and reusable asset catalogs"]
+    H --> O
+    H2 --> O
 ```
 
-## Main Entry Points
+### Trust Boundaries
 
-- `backend/cli.py`: Click CLI. Handles local challenge mode, smoke recon mode, and full coordinator mode.
-- `backend/config.py`: Settings loaded from `.env` and environment variables.
-- `backend/models.py`: Maps model specs like `ollama/qwen2.5-coder:7b` or `groq/...` to provider clients and model settings.
-- `backend/agents/swarm.py`: Runs a group of solvers on one challenge and cancels siblings once a flag is confirmed.
-- `backend/agents/solver.py`: Main per-model solving loop.
-- `backend/sandbox.py`: Docker lifecycle and command/file execution.
-- `backend/artifacts.py`: Copies workspace, trace, and writes `report.md`.
+| Component | Responsibility | Trust boundary |
+|---|---|---|
+| Operator | Defines authorization, scope, rate limits, credentials, and priorities | Only the operator may expand testing authority. |
+| Engagement folder | Durable program-specific input and generated memory | Sensitive data must remain local and uncommitted. |
+| Orchestrator | Prompt assembly, action validation, queue management, persistence, and reports | Does not trust raw model output. |
+| Local LLM | Chooses the next constrained action from compact evidence | Cannot access host shell or bypass the validator. |
+| Docker sandbox | Runs approved tools in a contained workspace | Receives only validated actions and scoped mounts. |
+| Target systems | Authorized program assets only | Scope guard and program rules decide whether an action is permitted. |
 
-## Local Challenge Flow
-
-1. Operator runs:
-
-   ```bash
-   ctf-solve --challenge mychalls/foo --models ollama/qwen2.5-coder:7b
-   ```
-
-2. `backend.cli` loads `metadata.yml`, creates a `CTFdClient`, `CostTracker`, and `ChallengeSwarm`.
-
-3. `ChallengeSwarm` creates one solver per model.
-
-4. Each solver starts one Docker container from `ctf-sandbox`.
-
-5. The challenge folder is mounted into the container:
-
-   - Host challenge `distfiles/` -> container `/challenge/distfiles` as read-only.
-   - Temporary host workspace -> container `/challenge/workspace` as read-write.
-   - `metadata.yml` -> container `/challenge/metadata.yml` as read-only.
-
-6. The model receives a system prompt describing the challenge and available tools.
-
-7. The solver executes model actions against the sandbox.
-
-8. Every tool call, tool result, model response, token usage, and finish event is written to JSONL trace.
-
-9. At the end, `backend.artifacts.export_solver_artifacts()` copies the workspace and trace into:
-
-   ```text
-   challenge/artifacts/<timestamp>-<model>/
-     workspace/
-     trace.jsonl
-     report.md
-   ```
-
-## Sandbox Tool Execution
-
-The LLM never directly controls the host shell. It only gets tool wrappers.
-
-For Pydantic AI-compatible providers, tools come from `backend.tools.sandbox`:
-
-- `bash(command, timeout_seconds)`
-- `read_file(path)`
-- `write_file(path, content)`
-- `list_files(path)`
-- `web_fetch(url, method, body)`
-- `webhook_create()`
-- `webhook_get_requests(uuid)`
-- `check_findings()`
-- `notify_coordinator(message)`
-- `view_image(filename)` for vision-capable models
-- `submit_flag(flag)` when not in dry-run mode
-
-Those wrappers call provider-independent logic in `backend.tools.core`, which calls `DockerSandbox`.
-
-`DockerSandbox.exec()` runs:
-
-```bash
-timeout --signal=KILL --kill-after=5 <seconds> bash -c '<command>'
-```
-
-inside the container using Docker exec. Output is captured, truncated, traced, and sent back to the model.
-
-## Local Ollama / Host Windows Model Flow
-
-For local models such as Qwen through Ollama, the repo uses an OpenAI-compatible HTTP endpoint:
+## Engagement Layout
 
 ```text
-Kali VM or agent process -> http://host.docker.internal:11434/v1 or http://<Windows-host-ip>:11434/v1 -> Ollama on Windows
+engagements/<program>/
+  program/
+    scope.json              Machine-readable scope, limits, and allowed hosts
+    in-scope.txt            Optional seed assets and endpoints
+    out-of-scope.txt        Explicit exclusions
+    rules.md                Human-readable program restrictions
+    prompt.md               Concise testing context for the model
+    secrets.env             Optional local auth data; never commit
+    priority-targets.txt    Optional deep-test list
+  manual/
+    notes.md                Human observations
+    findings.md             Human-managed finding notes
+    report-drafts.md        Draft submissions
+  agent/
+    knowledge.db            Curated cross-run memory
+    engagement-report.md    Consolidated human-readable target picture
+    assets/                 Reusable inventories and coverage data
+    runs/                   Immutable per-run artifacts
 ```
 
-In this repo, `Settings.ollama_base_url` defaults to:
+`scope.json`, rules, and operator direction always override model suggestions. The agent should decline or defer actions that do not satisfy them.
 
-```text
-http://localhost:11434/v1
-```
-
-For a Kali VM agent talking to Windows-host Ollama, set:
-
-```env
-OLLAMA_BASE_URL=http://<windows-host-ip>:11434/v1
-OLLAMA_API_KEY=ollama
-```
-
-Or pass:
-
-```bash
-ctf-solve --ollama-base-url http://<windows-host-ip>:11434/v1 --models ollama/qwen2.5-coder:7b
-```
-
-Ollama/Groq use the text-command loop in `backend/agents/solver.py` instead of native function calling. The model must emit compact JSON actions:
-
-```json
-{"action":"bash","command":"checksec /challenge/distfiles/chall","timeout_seconds":60}
-```
-
-Supported text-loop actions:
-
-- `bash`
-- `read_file`
-- `write_file`
-- `list_files`
-- `submit`
-- `give_up`
-
-This avoids brittle local model function-calling while still allowing all sandbox tooling.
-
-## Kali VM + Windows Host Architecture
-
-Recommended deployment for your next agent:
+## Run Lifecycle
 
 ```mermaid
-flowchart TB
-    subgraph Windows["Windows Host"]
-        OLLAMA["Ollama\nqwen2.5-coder:7b\nOpenAI-compatible API :11434"]
-        STORAGE["Challenge folders / shared repo"]
-    end
-
-    subgraph Kali["Kali VM"]
-        AGENT["Python agent CLI"]
-        DOCKERD["Docker Engine"]
-        CONTAINER["ctf-sandbox container"]
-        TRACE["trace + reports"]
-    end
-
-    AGENT <--> |HTTP /v1/chat/completions| OLLAMA
-    AGENT --> DOCKERD
-    DOCKERD --> CONTAINER
-    CONTAINER --> |tools: pwntools, gdb, r2, curl, patchelf| CONTAINER
-    STORAGE --> |shared folder or git pull| AGENT
-    AGENT --> TRACE
+flowchart TD
+    A["Load engagement and scope"] --> B["Seed or restore target queue"]
+    B --> C["Create one run directory\ntrace + run-local recon.db"]
+    C --> D["Open curated knowledge.db"]
+    D --> E["Start one Docker sandbox"]
+    E --> F["Select highest-priority pending target"]
+    F --> G["Deterministic baseline checks\nlow-rate map, probe, fingerprint"]
+    G --> H["Build compact model context\ncurrent target + relevant memory + coverage gaps"]
+    H --> I["Model returns one JSON action"]
+    I --> J{"Validator accepts?"}
+    J -->|No| K["Trace rejection and give focused repair guidance"]
+    K --> H
+    J -->|Yes| L["Execute through Docker sandbox"]
+    L --> M["Record results as facts, surfaces, coverage, and evidence"]
+    M --> N["Promote discovered in-scope targets into this run queue"]
+    N --> O{"Global step budget\nand queue state"}
+    O -->|More work| F
+    O -->|Complete or stopped| P["Generate run artifacts"]
+    P --> Q["Curate promotable facts into knowledge.db"]
+    Q --> R["Regenerate engagement report and asset catalogs"]
 ```
 
-The clean boundary is:
+The entire queue shares one global `--max-steps` budget. This prevents a target switch from silently resetting the overall limit. As budget gets low, scheduling should favor an existing high-value hypothesis, coverage completion for a priority surface, artifact completion, and reporting over broad new discovery.
 
-- Kali runs the agent, Docker, CTF tools, exploit scripts, and challenge services.
-- Windows runs only the model server.
-- The agent talks to Windows Ollama over HTTP.
-- The model never gets direct host execution; it only asks the agent to run sandbox tools.
+## Phases and Decision Model
 
-## Binary Challenge Runtime / libc Handling
+### Mapping
 
-The current sandbox includes common pwn tooling and i386 support. The workflow is:
+Mapping builds the minimal, durable picture needed to work safely and efficiently:
 
-1. Run `file`, `ldd`, `checksec`, and execution smoke checks.
-2. If challenge-provided `.so` files exist, run with:
+- In-scope roots, hosts, and endpoint seeds.
+- DNS/HTTP reachability and technology hints.
+- API, GraphQL, JavaScript, source-map, documentation/SDK, and authentication surfaces.
+- Candidate target queue entries with source and priority.
 
-   ```bash
-   LD_LIBRARY_PATH=/challenge/distfiles ./chall
-   ```
+Mapping is intentionally structured and low rate. It writes a durable `mapping-state.json` that later phases can reuse.
 
-3. If a different loader/libc is required, download or copy matching files into:
+### Recon
 
-   ```text
-   /challenge/workspace/libc/
-   ```
+Recon turns a mapped surface into actionable test context:
 
-4. Patch a workspace copy, never the read-only distfile:
+- Probe live services and identify frameworks, CDN/WAF behavior, and response baselines.
+- Extract route, API, GraphQL, parameter, bundle, and source-map clues.
+- Compare authentication state only when supplied context is valid.
+- Use specialized local tools where surface evidence justifies them.
+- Persist coverage: a surface should record which attack families and auth contexts were attempted.
 
-   ```bash
-   cp /challenge/distfiles/chall /challenge/workspace/chall.patched
-   patchelf --set-interpreter /challenge/workspace/libc/ld-linux-x86-64.so.2 \
-            --set-rpath /challenge/workspace/libc \
-            /challenge/workspace/chall.patched
-   ```
+### Attack
 
-5. Run exploit validation against the patched runtime.
+Attack is not indiscriminate scanning. It begins with the existing map and recon record, then chooses a focused validation family appropriate to the surface: for example authorization behavior for a tenant-scoped API, input handling for a parameterized route, or schema/documentation analysis for GraphQL.
 
-6. Keep only useful exploit artifacts in `/challenge/workspace`; remove bulky downloads before final export if they are not needed in the report.
+An attack result is classified as a signal, hypothesis, reproduced issue, validated issue, rejected result, or blocked/deferred surface. Only validated, evidence-supported findings should appear as confirmed vulnerabilities.
 
-## Solver Workflow
+### Assistant
 
-`backend/agents/solver.py` is the brain of a single model run:
+Assistant mode is operator-led. It is deliberately separate from autonomous testing modes. It can help an operator reason about results and, when explicitly asked, perform a focused Google search and return selected sources. Public search/GitHub research is disabled in mapping, recon, attack, and auto modes so low-quality search results do not pollute context or engagement memory.
 
-1. Start sandbox.
-2. Build prompt with `backend.prompts.build_prompt()`.
-3. For text-loop providers, run deterministic recon first.
-4. Select pwn skill snippets from `ctf-pwn/`.
-5. Optionally run deterministic pwn autopilot for known patterns such as format-string global writes.
-6. Ask model for next JSON action.
-7. Execute action in sandbox.
-8. Append result to conversation.
-9. Reject low-value loops, placeholder flags, malformed JSON, and early `give_up`.
-10. Submit or dry-run verify candidate flag.
+## Target Queue and Priorities
 
-The most important recent workflow refinement is step 5: when recon proves a known vulnerability class, the agent should run a deterministic validator or exploit template instead of waiting for a small local model to invent the exact payload.
+Every in-scope seed should be eligible for the queue. A target is promoted when it is in scope and has evidence that makes it useful to pursue: a live host, a discovered endpoint, an API/GraphQL route, a JavaScript-derived surface, an auth-sensitive path, or an operator priority entry.
 
-## Coordinator Mode
+The queue does not mean every URL gets equal effort. Scheduling order is shaped by:
 
-Coordinator mode is for full CTF events:
+1. Operator `priority-targets.txt` entries.
+2. Authentication, tenant, API, GraphQL, JavaScript, source-map, and documented SDK surfaces.
+3. High-confidence live assets and evidence-bearing endpoints.
+4. Untested coverage combinations that are relevant to a surface.
+5. Broad lower-signal discovery results.
 
-- `backend.poller.CTFdPoller` watches CTFd for new and solved challenges.
-- `backend.agents.coordinator_loop` starts an event loop.
-- `backend.agents.coordinator_core` exposes coordinator tools:
-  - fetch challenges
-  - spawn swarm
-  - check status
-  - read solver trace
-  - bump stuck agent
-  - broadcast hints
-  - submit flag
-  - kill swarm
-- `backend.agents.codex_coordinator` drives Codex App Server through JSON-RPC dynamic tools.
-- `backend.agents.claude_coordinator` does the same concept through Claude Agent SDK tools.
+Duplicate canonical targets are rejected. Queue state and completed targets are written into the run state so a later run can understand what was already covered.
 
-The coordinator does not solve directly. It manages many swarms, reads traces, and sends targeted hints.
+## Model Context and Token Discipline
 
-## Artifact / Meeting Docs Pipeline
+The LLM does not need a full trace or every asset on each turn. The orchestrator should supply a bounded context containing:
 
-Every solver run produces three useful meeting artifacts:
+- Current phase, current queue target, remaining global step budget, and queue size.
+- The applicable compact program rules and scope summary.
+- A small set of relevant engagement facts and surfaces.
+- Current target’s known routes, technologies, auth context, and recent tool observations.
+- Coverage gaps and validation tasks that are actionable now.
+- The strict JSON action protocol and tool availability.
 
-- `trace.jsonl`: exact sequence of model responses, tool calls, outputs, errors, usage, and finish state.
-- `workspace/`: generated scripts, exploit harnesses, temporary helpers.
-- `report.md`: human-readable solve summary with hardening, suspicious lines, commands run, exploit artifacts, and status notes.
+Older raw tool output is condensed or retrieved on demand. Full traces remain on disk for audit but are not prompt material. This avoids prompt truncation and prevents a model from repeatedly reacting to stale, low-value content.
 
-For meeting docs, the simplest pipeline is:
+## Action and Validation Loop
+
+The local model returns exactly one compact action, such as a tool call, a safe shell command, artifact read/write, finding record, or finish request. The orchestrator validates it before execution.
+
+```mermaid
+sequenceDiagram
+    participant L as Local LLM
+    participant A as Agent validator
+    participant D as Docker sandbox
+    participant DB as Run database
+    L->>A: Compact JSON action
+    A->>A: Scope, syntax, repetition, rate, safety, phase checks
+    alt Rejected
+        A->>DB: Trace rejection
+        A->>L: Short repair guidance
+    else Accepted
+        A->>D: Approved tool/command
+        D->>A: Bounded stdout/stderr/result
+        A->>DB: Trace + fact + surface + coverage/evidence
+        A->>L: Relevant result summary
+    end
+```
+
+The validator controls malformed requests, repeated commands, unsupported tools, unsafe commands, invalid scopes, empty/truncated scripts, and premature finish attempts. It should not reduce legitimate deep work merely because a target is difficult; it should require concrete mapping/recon/validation coverage before accepting a finish.
+
+## Sandbox
+
+The `bounty-sandbox` Docker image is built from `sandbox/Dockerfile.sandbox`. The agent creates one long-lived container per run, using a writable workspace for generated scripts and evidence. The model interacts through constrained tool wrappers; it does not receive direct host command access.
+
+Included tool families:
+
+- Discovery and mapping: `httpx`, `katana`, `subfinder`, `assetfinder`, `dnsx`, `naabu`, `gau`, `waybackurls`, `ffuf`, `feroxbuster`, `gobuster`, `dirsearch`.
+- Fingerprinting and scanners: `nuclei`, `whatweb`, `wafw00f`, `nikto`, `nmap`.
+- API and GraphQL: `inql`, `clairvoyance`, `grapeql`, `arjun`, `graphql-cop`, `curl`, Python requests.
+- Validation and analysis: `sqlmap`, `dalfox`, `xsstrike`, `commix`, `trufflehog`, JavaScript/source-map analysis helpers.
+
+Tool capability should remain evidence-led. For example, GraphQL tooling is useful after a GraphQL endpoint is observed; it should not be blindly fired at every host.
+
+## Data Model: Run State Versus Engagement Memory
+
+```mermaid
+flowchart LR
+    A["Raw tool result"] --> B["run/recon.db\nall observations for this run"]
+    B --> C{"Promotion filter\nuseful, in-scope, evidence-backed?"}
+    C -->|No| D["Remain run-local\ntrace/report may reference it"]
+    C -->|Yes| E["agent/knowledge.db\ncurated cross-run memory"]
+    E --> F["engagement-report.md"]
+    E --> G["agent/assets/*.txt and test-progress.tsv"]
+    B --> H["validation-queue.json\ninteresting/confirmed leads"]
+```
+
+The run database can safely hold tentative, incomplete, or failed observations because it is a snapshot of a single run. The engagement database is a conservative memory store. Public-search queries are excluded from promotion. This separation prevents one poor model decision from permanently contaminating future runs.
+
+## Human-Facing Artifacts
+
+### Per-run
+
+- `trace.jsonl`: audit log; preserve it unchanged.
+- `session.state.json`: current phase, queue, global steps, stop status, and artifact locations.
+- `mapping-state.json`: reusable structured mapping output.
+- `report.md`: concise narrative for what happened this run.
+- `validation-queue.json`: machine-readable list of leads needing reproduction or stronger proof.
+- `priority-followups.md`, `interesting-leads.md`, `auth-surfaces.md`: compact operator handoff files.
+- `workspace/`: only useful evidence and valid scripts should survive; empty or truncated artifacts are rejected.
+
+### Engagement-wide
+
+- `knowledge.db`: curated facts, surfaces, tested combinations, and attack results.
+- `engagement-report.md`: a deduplicated overview of the target’s layout, technologies, live surfaces, APIs, auth areas, coverage, and active leads.
+- `assets/*.txt`: practical manual-testing inventories such as live hosts, URLs, API routes, GraphQL endpoints, JS bundles, source maps, documentation/SDK targets, and auth surfaces.
+- `test-progress.tsv`: maps stable surface IDs to attack family, auth context, outcome, and source so a human or later run can resume deliberately.
+
+## Authentication Workflow
+
+Authentication is operator-controlled. The preferred flow is:
+
+1. The operator obtains a valid test-account session through the permitted application flow.
+2. Minimal necessary cookies, headers, or tokens are placed in a local, uncommitted secrets or Docker env file.
+3. The agent uses that context only against in-scope assets and can compare guest and authenticated behavior.
+4. Observed endpoints, redirects, cookie domains, session refresh behavior, and authorization-sensitive routes are recorded as surfaces.
+5. The agent does not persist raw credentials into reports, normal prompts, or public artifacts.
+
+Fully autonomous credential login is intentionally not assumed: SSO, MFA, device binding, anti-bot systems, and program rules make it unsafe and unreliable. Browser/HAR-assisted operator capture is a sensible future addition for replayable authorized requests.
+
+## WAF and Cloudflare Behavior
+
+WAF or Cloudflare responses are context, not a challenge to defeat. The correct adaptive behavior is to:
+
+- Capture status, headers, and block evidence.
+- Reduce request rate and concurrency within program rules.
+- Avoid repetitive retries that add no evidence.
+- Mark the surface blocked or deferred in coverage state.
+- Continue with other authorized surfaces or request an operator-provided authenticated/browser-derived request when appropriate.
+
+The agent should never attempt to evade protections, rotate identity, or bypass access controls.
+
+## Reporting and Finding Quality
+
+Reports should be deduplicated and decision-oriented. A good report says what surface was observed, what was tested, the exact result/evidence path, the confidence level, what remains untested, and the next smallest validation step.
+
+It should not repeat every URL, include raw search noise, treat a version banner as a vulnerability by itself, or call an unverified scanner result a confirmed bug.
+
+Useful finding states:
+
+| State | Meaning | Required next step |
+|---|---|---|
+| Signal | Something unusual was observed | Determine whether it has security impact. |
+| Hypothesis | A plausible vulnerability theory exists | Run one focused, authorized validation. |
+| Reproduced | Behavior can be repeated | Establish impact and affected authorization context. |
+| Validated | Reproducible security impact with evidence | Prepare a program-quality report. |
+| Rejected | Expected or non-security behavior | Record briefly to prevent duplicate work. |
+| Blocked/deferred | Insufficient authorization, WAF, outage, or rule constraint | Preserve context and return later. |
+
+## Current Improvement Opportunities
+
+The architecture deliberately leaves room for higher-value improvements:
+
+1. HAR/proxy import: ingest an operator-provided browser capture into a normalized request catalog, then derive auth surfaces and safe replay templates.
+2. Request/response normalization: store canonical request fingerprints, parameter schemas, response hashes, and differential comparisons instead of raw text blobs.
+3. Better auth state modeling: explicitly track guest, authenticated-user, tenant-A, tenant-B, expired-session, and privileged roles where program authorization permits them.
+4. Hypothesis graph: link a potential weakness to required prerequisites, evidence nodes, related endpoints, and attempted validations; this makes chaining deliberate rather than speculative.
+5. Task-value scheduling: score pending work from surface sensitivity, novelty, coverage gap, evidence confidence, cost, and remaining budget.
+6. Deterministic validators: for repeatable low-risk checks, generate structured probes from observed API schemas and parameter types rather than relying on the model to improvise every request.
+7. Artifact contracts: make evidence files require command, timestamp, request, sanitized response metadata, interpretation, and reproduction status.
+8. Model evaluation harness: replay fixed, sanitized run snapshots against candidate models and measure malformed actions, duplicate commands, coverage completion, evidence quality, and premature finish rate.
+9. Snapshot and rollback controls: retain versioned engagement-memory snapshots so erroneous promotion can be reviewed or reverted without touching raw run data.
+10. Program-rule compiler: convert common rule constraints into explicit machine checks, such as prohibited endpoints, request ceilings, authentication restrictions, and required headers.
+
+## Build and Operation Reference
+
+Rebuild the sandbox when its Dockerfile changes:
+
+```powershell
+docker build --pull --no-cache -f sandbox/Dockerfile.sandbox -t bounty-sandbox:latest .
+```
+
+Run an authorized engagement without supplying a single `--target` seed:
+
+```powershell
+python -m bounty_agent.cli `
+  --engagement engagements\<engagement-name> `
+  --mode attack `
+  --provider ollama `
+  --model ollama/chrisdiochavez/ANINOGPT-PILIPINAS-ATAKE:latestv3 `
+  --llm-base-url http://localhost:11434/v1 `
+  --llm-api-key ollama `
+  --runner docker `
+  --docker-image bounty-sandbox `
+  --execute `
+  --max-steps 1500 `
+  --max-commands-per-minute 40
+```
+
+Use `--dry-run` rather than `--execute` when you want to inspect planning and validation behavior without issuing commands.
+
+## Diagram Prompt Seed
+
+For a high-level public architecture diagram, preserve this relationship:
 
 ```text
-trace.jsonl + workspace/ + metadata.yml -> report.md -> meeting summary
+Operator-defined engagement -> CLI/orchestrator -> local Ollama model
+Local model -> constrained JSON action -> scope/safety validator -> Docker sandbox tools
+Docker results -> run trace + run database -> curated engagement knowledge
+Curated knowledge -> consolidated report + reusable asset catalogs -> operator and next run
 ```
 
-A future improvement would be a dedicated `meeting_report.md` exporter that includes:
-
-- architecture diagram
-- challenge timeline
-- model mistakes
-- successful tool chain
-- unresolved blockers
-- recommended next engineering changes
-
-## Important Design Lessons
-
-- Do not let the model stop at "I found the vulnerability." Force the next phase: validate primitive, write exploit, run exploit, submit.
-- For local models, prefer JSON text protocol over provider-native tool calls.
-- Put all challenge tooling in Docker, not on the host.
-- Mount challenge files read-only and force all generated files into `/challenge/workspace`.
-- Trace everything. The trace is how the coordinator, reports, and humans debug the agent.
-- Build deterministic autopilots for common bug classes: format strings, ret2win, simple BOF offset finding, one-gadget/libc leak workflows, path traversal, SQLi, JWT weak secret, etc.
-- Keep cache and artifact folders out of code searches and model context.
-- Treat libc/loader mismatch as normal pwn workflow, not an error. Download or mount the matching runtime, patch a workspace copy, validate, then clean up.
-
+For a workflow diagram, show mapping -> recon -> attack as evidence-led phases within one shared run and target queue, with run-local memory promoted conservatively into engagement-wide memory after the run.

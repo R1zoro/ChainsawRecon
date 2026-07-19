@@ -462,7 +462,7 @@ def build_surfaces_from_action_result(
         if primary_url:
             parsed_primary = urlparse(primary_url)
             primary_path = _path_pattern(parsed_primary.path or "/")
-            if parsed_primary.hostname:
+            if parsed_primary.hostname and not _is_noise_host(parsed_primary.hostname):
                 surfaces.append(
                     SurfaceRecord(
                         surface_key=f"{parsed_primary.hostname}{primary_path}",
@@ -479,7 +479,7 @@ def build_surfaces_from_action_result(
         for url in _extract_urls(text):
             parsed = urlparse(url)
             host = parsed.hostname or ""
-            if not host:
+            if not host or _is_noise_host(host):
                 continue
             path_pattern = _path_pattern(parsed.path or "/")
             surfaces.append(
@@ -672,8 +672,11 @@ def _promotable_fact(fact: ReconFact, run_id: str) -> ReconFact | None:
         return _with_source(fact, run_id, "observed")
     if fact.kind == "endpoint" and fact.confidence == "observed" and _is_useful_endpoint(fact):
         return _with_source(fact, run_id, "observed")
-    if fact.kind == "research_query" and fact.confidence == "observed":
-        return _with_source(fact, run_id, "observed")
+    # Public research is intentionally run-local context. It must never become
+    # durable engagement memory because search results age quickly and are not
+    # evidence about the target.
+    if fact.kind == "research_query":
+        return None
     if fact.status == "skip" and fact.evidence:
         return _with_source(fact, run_id, fact.confidence)
     return None
@@ -683,8 +686,37 @@ def _with_source(fact: ReconFact, run_id: str, confidence: str) -> ReconFact:
     return ReconFact(fact.kind, fact.key, fact.value, confidence, f"{fact.source}; promoted_from={run_id}", fact.evidence, fact.status, fact.tags, fact.meta)
 
 
+# Known third-party CDN/analytics/saas hosts that are never in scope
+_BUILTIN_EXCLUDED_HOSTS: set[str] = {
+    "cdn.segment.com",
+    "consent.cookiebot.com",
+    "client-registry.mutinycdn.com",
+    "www.googletagmanager.com",
+    "www.sitemaps.org",
+    "jqlang.org",
+    "127.0.0.1",
+    "localhost",
+    "host",
+}
+
+
+def _is_noise_host(host: str) -> bool:
+    """Filter out known third-party CDN/analytics and localhost noise hosts."""
+    if not host:
+        return True
+    lowered = host.lower().strip(".")
+    if lowered in _BUILTIN_EXCLUDED_HOSTS:
+        return True
+    if lowered.startswith(("192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")):
+        return True
+    return False
+
+
 def _surface_fingerprint(surface_key: str, surface_type: str, auth_context: str) -> str:
-    data = "\n".join([surface_key.lower(), surface_type.lower(), auth_context.lower()])
+    # Deduplicate by surface_key (host+path) only, not by auth_context
+    # This prevents the same URL from appearing 3 times (public, authenticated, auth)
+    normalized_key = surface_key.lower().rstrip("\\/").replace("\\", "")
+    data = "\n".join([normalized_key, surface_type.lower()])
     return hashlib.sha256(data.encode("utf-8", errors="replace")).hexdigest()[:32]
 
 
