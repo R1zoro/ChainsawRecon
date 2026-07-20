@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .config import AgentSettings, ProgramScope
 from .skills import skill_catalog_prompt, get_skill
-from urllib.parse import urlparse
 
 
 def build_system_prompt(scope: ProgramScope, target: str, settings: AgentSettings) -> str:
@@ -31,18 +30,21 @@ Rate={rate_limit_notes}. Custom={custom_prompt}.
 RULES:
 - Execute EXACTLY ONE action per response as compact JSON. No planning, no nested actions.
 - Never output role, thought, type, data, id, status, next_step, execution, reasoning fields.
-- For Python scripts: write_file path=verify_<purpose>.py then bash to run it.
+- Work from a security objective and create a hypothesis before broad or invasive testing.
+- Prefer create_hypothesis with title, security_question, surface, and required_evidence before choosing a specialized scanner.
+- Use record_evidence to preserve material request/response observations and save_artifact for structured outputs.
+- For Python checks, prefer create_verifier with target, purpose, optional method, headers, and body; then bash to run it.
 - For long-running tools (nuclei, inql, feroxbuster, dalfox, bulk Python scripts): use timeout_seconds=300 or higher.
 - finish only after recon coverage is complete. Blocked by missing: map, discovery, fingerprint, scanner, script, validation.
 
 {research_rules}
 
-WRITE_FILE RULES:
-- write_file REQUIRES a 'content' field with the COMPLETE file text. Example:
-  {{"action":"write_file","path":"verify.py","content":"import requests\nurl='https://...'\n..."}}
-- If write_file fails twice for the same path, STOP and use bash heredoc instead:
-  bash -c 'cat > verify.py << "EOF"\nimport requests\n...\nEOF'
-- Never retry write_file with missing content more than twice.
+STRUCTURED ARTIFACT RULES:
+- save_artifact requires artifact_type and object data. Example:
+  {{"action":"save_artifact","artifact_type":"api_endpoint","name":"users","data":{{"url":"https://...","method":"GET","source":"observed response"}}}}
+- create_hypothesis example:
+  {{"action":"create_hypothesis","title":"Possible object authorization gap","security_question":"Can user A read user B's object?","surface":"https://.../objects/{{id}}","required_evidence":["two authorized contexts","control and changed-object responses"]}}
+- Never write an empty file. Use write_file only for genuinely custom complete content; prefer typed actions whenever possible.
 
 BULK TESTING RULES:
 - For GraphQL endpoints: use one of the exposed schema tools (inql, clairvoyance, or grapeql) before manual mutation testing, then save the schema and operation list.
@@ -91,27 +93,15 @@ PHASES: map -> discover(low-rate) -> fingerprint -> scanner -> verify -> validat
 SKILL CATALOG:
 {skill_catalog}
 
-STARTUP PIPELINE:
-When starting a new target, run this automated pipeline:
-1. discovery: waybackurls <target> | head -100 OR katana -u <target> -c 1 -rate-limit 5
-2. fingerprint: httpx -probe -status-code -content-length -title -tech-detect -silent on discovered URLs
-3. Save results to workspace/endpoints_<target>.txt
-4. Then proceed with targeted testing based on discovered surfaces"""
+STARTING A TARGET:
+The orchestration layer has already checked local tool availability. Remote discovery is not automatic.
+First decide what observation or hypothesis has the highest value, then select one scoped, low-rate experiment."""
 
 
 def deterministic_recon_plan(target: str) -> list[dict[str, object]]:
-    robots_target = target
-    sitemap_target = target
-    parsed = urlparse(target if "://" in target else f"https://{target}")
-    if parsed.scheme and parsed.netloc and parsed.path and parsed.path not in {"", "/"}:
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        robots_target = base
-        sitemap_target = base
+    # This is intentionally local-only. Network reconnaissance is model-directed
+    # and therefore visible in the action budget and hypothesis trail.
     return [
-        {"action": "bash", "command": f"printf '%s\\n' {target}", "timeout_seconds": 5},
-        {"action": "bash", "command": f"curl -I -L --max-time 20 {target}", "timeout_seconds": 30},
-        {"action": "bash", "command": f"curl -fsSL --max-time 20 {robots_target}/robots.txt", "timeout_seconds": 30},
-        {"action": "bash", "command": f"curl -fsSL --max-time 20 {sitemap_target}/sitemap.xml", "timeout_seconds": 30},
         {
             "action": "bash",
             "command": "for t in curl python3 httpx nuclei ffuf katana subfinder dnsx naabu gobuster dirsearch nikto sqlmap wafw00f xsstrike gitjacker inql clairvoyance grapeql arjun feroxbuster dalfox crtsh; do command -v \"$t\" >/dev/null 2>&1 && echo \"$t=present\" || echo \"$t=missing\"; done",

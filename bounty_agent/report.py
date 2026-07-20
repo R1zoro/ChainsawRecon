@@ -171,6 +171,7 @@ def write_engagement_report(
     facts: list[ReconFact],
     surfaces: list[SurfaceRecord],
     attacks: list[AttackResult],
+    world_summary: dict[str, Any] | None = None,
 ) -> None:
     lines = [
         f"# Engagement Recon Report: {scope.program_name}",
@@ -197,6 +198,10 @@ def write_engagement_report(
         "",
         *_render_surface_summary(surfaces),
         "",
+        "## Architecture Evidence",
+        "",
+        *_render_world_summary(world_summary),
+        "",
         "## Interesting Historical Checks",
         "",
         *_render_attack_summary(attacks),
@@ -213,6 +218,18 @@ def write_engagement_report(
         "",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _render_world_summary(summary: dict[str, Any] | None) -> list[str]:
+    if not summary:
+        return ["No Phase 2 world-model evidence recorded yet."]
+    technologies = summary.get("technologies", [])
+    services = summary.get("services", [])
+    routes = summary.get("routes", [])
+    lines = [f"- Services: `{len(services)}`; routes: `{len(routes)}`; technologies: `{len(technologies)}`."]
+    if technologies:
+        lines.append("- Observed technology: " + ", ".join(f"`{item.get('name')}`" for item in technologies[:20]))
+    return lines
 
 
 def _render_target_map(facts: list[ReconFact]) -> list[str]:

@@ -67,6 +67,8 @@ class AgentSettings:
     queue_path: Path | None = None
     auth_context_path: Path | None = None
     priority_targets_path: Path | None = None
+    source_code_path: Path | None = None
+    har_paths: tuple[Path, ...] = ()
 
 
 def env_or_default(name: str, default: str) -> str:

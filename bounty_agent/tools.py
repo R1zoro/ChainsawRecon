@@ -5,12 +5,14 @@ import os
 from dataclasses import dataclass, field
 import hashlib
 from html.parser import HTMLParser
+import json
 from pathlib import Path
 import re
 import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from .engagement_state import EngagementStateStore
 from .retrieval import RetrievalStore
 from .recon_db import (
     NullReconStore,
@@ -57,6 +59,9 @@ class ToolRegistry:
         max_commands_per_minute: int = 0,
         max_repeated_commands: int = 2,
         allow_search: bool = False,
+        state_store: EngagementStateStore | None = None,
+        run_id: str = "",
+        max_actions: int = 0,
     ) -> None:
         self.runner = runner
         self.scope_guard = scope_guard
@@ -72,15 +77,50 @@ class ToolRegistry:
         self.skill_counts: dict[str, int] = {}
         self.finding_fingerprints: set[str] = set()
         self._tool_presence_cache: dict[str, bool] = {}
+        self.state_store = state_store
+        self.run_id = run_id
+        self.active_objective_id: str | None = None
+        self.active_hypothesis_id: str | None = None
+        self.active_target = ""
+        self.max_actions = max(0, max_actions)
+        self.action_count = 0
+
+    def set_execution_context(self, *, objective_id: str | None = None, hypothesis_id: str | None = None,
+                              target: str = "") -> None:
+        """Attach all subsequent actions to the current security objective."""
+        self.active_objective_id = objective_id
+        self.active_hypothesis_id = hypothesis_id
+        self.active_target = target
 
     def execute(self, action: dict[str, Any]) -> ToolResult:
         name = str(action.get("action", "")).strip()
+        if name != "finish" and self.max_actions and self.action_count >= self.max_actions:
+            result = ToolResult(
+                False,
+                f"Action budget exhausted ({self.action_count}/{self.max_actions}). Preserve evidence and finish or defer.",
+                {"budget_blocked": True, "actions_used": self.action_count, "actions_limit": self.max_actions},
+            )
+            self.trace.write("tool_result", ok=result.ok, content=_truncate(result.content), meta=result.meta)
+            self.history.append((action, result))
+            self._record_recon_state(action, result)
+            self._record_phase_one_state(action, result)
+            return result
+        if name != "finish":
+            self.action_count += 1
         self.trace.write("tool_call", action=action)
         # Reset consecutive search counter on non-search actions
         if name != "search":
             self._consecutive_search_count = 0
         try:
-            if name == "bash":
+            if self.state_store and _requires_hypothesis(action) and not (
+                action.get("hypothesis_id") or self.active_hypothesis_id
+            ):
+                result = ToolResult(
+                    False,
+                    "This attack action requires a recorded hypothesis first. Use create_hypothesis with the security question and required evidence, then run one bounded experiment.",
+                    {"hypothesis_required": True},
+                )
+            elif name == "bash":
                 result = self._bash(action)
             elif name in _TOOL_ACTIONS:
                 result = self._tool_action(action)
@@ -100,6 +140,16 @@ class ToolRegistry:
                 result = self._use_skill(action)
             elif name == "record_finding":
                 result = self._record_finding(action)
+            elif name == "create_objective":
+                result = self._create_objective(action)
+            elif name == "create_hypothesis":
+                result = self._create_hypothesis(action)
+            elif name == "record_evidence":
+                result = self._record_evidence(action)
+            elif name == "save_artifact":
+                result = self._save_artifact(action)
+            elif name == "create_verifier":
+                result = self._create_verifier(action)
             elif name == "finish":
                 result = ToolResult(True, "Finished.")
             else:
@@ -109,7 +159,24 @@ class ToolRegistry:
         self.trace.write("tool_result", ok=result.ok, content=_truncate(result.content), meta=result.meta)
         self.history.append((action, result))
         self._record_recon_state(action, result)
+        self._record_phase_one_state(action, result)
         return result
+
+    def _record_phase_one_state(self, action: dict[str, Any], result: ToolResult) -> None:
+        if not self.state_store:
+            return
+        try:
+            target = _action_target(action) or self.active_target
+            objective_id = str(action.get("objective_id") or self.active_objective_id or "") or None
+            hypothesis_id = str(action.get("hypothesis_id") or self.active_hypothesis_id or "") or None
+            self.state_store.record_action(
+                self.run_id, action, result.ok, result.content, target=target,
+                objective_id=objective_id, hypothesis_id=hypothesis_id, meta=result.meta,
+            )
+            if "=present" in result.content or "=missing" in result.content:
+                self.state_store.record_tool_inventory(result.content, source=f"run:{self.run_id}")
+        except Exception as exc:
+            self.trace.write("phase_one_state_error", error=f"{type(exc).__name__}: {exc}")
 
     def _record_recon_state(self, action: dict[str, Any], result: ToolResult) -> None:
         source = f"tool:{len(self.history)}"
@@ -250,6 +317,97 @@ class ToolRegistry:
         self.runner.write_file(path, content)
         return ToolResult(True, f"Wrote {len(content)} bytes to {path}.")
 
+    def _create_objective(self, action: dict[str, Any]) -> ToolResult:
+        if not self.state_store:
+            return ToolResult(False, "Structured engagement state is unavailable.")
+        title = str(action.get("title", "")).strip()
+        target = str(action.get("target") or self.active_target or "").strip()
+        if not title or not target:
+            return ToolResult(False, "create_objective requires title and target.")
+        objective_id = self.state_store.ensure_objective(
+            title, target, source="model", priority=int(action.get("priority", 50)),
+            description=str(action.get("description", "")).strip(), meta={"action": action},
+        )
+        self.active_objective_id = objective_id
+        return ToolResult(True, f"Created security objective {objective_id}: {title}", {"objective_id": objective_id})
+
+    def _create_hypothesis(self, action: dict[str, Any]) -> ToolResult:
+        if not self.state_store:
+            return ToolResult(False, "Structured engagement state is unavailable.")
+        title = str(action.get("title", "")).strip()
+        question = str(action.get("security_question") or action.get("question") or "").strip()
+        surface = str(action.get("surface") or action.get("target") or self.active_target or "").strip()
+        if not title or not question or not surface:
+            return ToolResult(False, "create_hypothesis requires title, security_question, and surface.")
+        required = action.get("required_evidence", [])
+        if not isinstance(required, list):
+            return ToolResult(False, "required_evidence must be a JSON list.")
+        hypothesis_id = self.state_store.create_hypothesis(
+            title, question, surface, objective_id=str(action.get("objective_id") or self.active_objective_id or "") or None,
+            state=str(action.get("state", "suspected")), confidence=str(action.get("confidence", "candidate")),
+            required_evidence=[str(item) for item in required], source="model", meta={"action": action},
+        )
+        self.active_hypothesis_id = hypothesis_id
+        return ToolResult(True, f"Created hypothesis {hypothesis_id}: {title}", {"hypothesis_id": hypothesis_id})
+
+    def _record_evidence(self, action: dict[str, Any]) -> ToolResult:
+        if not self.state_store:
+            return ToolResult(False, "Structured engagement state is unavailable.")
+        kind = str(action.get("kind", "")).strip()
+        summary = str(action.get("summary", "")).strip()
+        location = str(action.get("location", "")).strip()
+        content = str(action.get("content", ""))
+        if not kind or not summary:
+            return ToolResult(False, "record_evidence requires kind and summary.")
+        if not location:
+            location = f"inline:{kind}"
+        evidence_id = self.state_store.record_evidence(
+            kind, location, summary, content=content,
+            objective_id=str(action.get("objective_id") or self.active_objective_id or "") or None,
+            hypothesis_id=str(action.get("hypothesis_id") or self.active_hypothesis_id or "") or None,
+            source="model", meta={"action": action},
+        )
+        return ToolResult(True, f"Recorded evidence {evidence_id}: {summary}", {"evidence_id": evidence_id})
+
+    def _save_artifact(self, action: dict[str, Any]) -> ToolResult:
+        kind = _safe_artifact_component(str(action.get("artifact_type") or action.get("kind") or ""))
+        data = action.get("data")
+        if not kind or not isinstance(data, dict):
+            return ToolResult(False, "save_artifact requires artifact_type and an object data field.")
+        name = _safe_artifact_component(str(action.get("name") or data.get("name") or kind))
+        path = f"artifacts/{kind}/{name}.json"
+        content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        self.runner.write_file(path, content)
+        artifact_id = ""
+        if self.state_store:
+            artifact_id = self.state_store.save_artifact(kind, Path(path), str(data.get("summary") or kind), source="model", meta=data)
+            self.state_store.record_evidence(
+                "artifact", path, str(data.get("summary") or f"Saved {kind} artifact"), content=content,
+                objective_id=str(action.get("objective_id") or self.active_objective_id or "") or None,
+                hypothesis_id=str(action.get("hypothesis_id") or self.active_hypothesis_id or "") or None,
+                source="model", meta={"artifact_id": artifact_id},
+            )
+        return ToolResult(True, f"Saved typed {kind} artifact to {path}.", {"path": path, "artifact_id": artifact_id})
+
+    def _create_verifier(self, action: dict[str, Any]) -> ToolResult:
+        target = str(action.get("target") or self.active_target or "").strip()
+        purpose = _safe_artifact_component(str(action.get("purpose") or "verification"))
+        if not target:
+            return ToolResult(False, "create_verifier requires a target.")
+        method = str(action.get("method") or "GET").upper()
+        path = str(action.get("path") or f"verify_{purpose}.py")
+        code = _render_verifier(target, method, action.get("headers"), action.get("body"))
+        self.runner.write_file(path, code)
+        if self.state_store:
+            self.state_store.save_artifact("verifier", Path(path), f"{purpose} verifier for {target}", source="model")
+            self.state_store.record_evidence(
+                "verifier", path, f"Generated {purpose} verifier", content=code,
+                objective_id=str(action.get("objective_id") or self.active_objective_id or "") or None,
+                hypothesis_id=str(action.get("hypothesis_id") or self.active_hypothesis_id or "") or None,
+                source="model",
+            )
+        return ToolResult(True, f"Created verifier {path} for {method} {target}.", {"path": path})
+
     def _check_repeated_write(self, path: str) -> ToolResult | None:
         count = self.command_counts.get(f"_write_{path}", 0) + 1
         self.command_counts[f"_write_{path}"] = count
@@ -292,6 +450,12 @@ class ToolRegistry:
         return ToolResult(True, guidance, {"skill": skill.name})
 
     def _record_finding(self, action: dict[str, Any]) -> ToolResult:
+        if self.state_store and not (action.get("hypothesis_id") or self.active_hypothesis_id):
+            return ToolResult(
+                False,
+                "Finding rejected: link it to a recorded hypothesis and its supporting evidence first.",
+                {"finding_rejected": True, "hypothesis_required": True},
+            )
         finding = Finding(
             title=str(action.get("title", "Untitled finding")),
             severity=str(action.get("severity", "unknown")),
@@ -464,6 +628,21 @@ _TOOL_ACTIONS = {
     "openssl",
     "nmap",
 }
+
+
+_HYPOTHESIS_REQUIRED_TOOLS = {
+    "sqlmap", "xsstrike", "dalfox", "inql", "clairvoyance", "grapeql",
+}
+
+
+def _requires_hypothesis(action: dict[str, Any]) -> bool:
+    name = str(action.get("action", "")).strip().lower()
+    if name in _HYPOTHESIS_REQUIRED_TOOLS:
+        return True
+    if name != "bash":
+        return False
+    command = str(action.get("command", "")).lower()
+    return any(re.search(rf"(^|[;&|\s]){re.escape(tool)}\b", command) for tool in _HYPOTHESIS_REQUIRED_TOOLS)
 
 
 def _build_tool_command(tool: str, url: str, action: dict[str, Any]) -> str:
@@ -782,6 +961,29 @@ def _artifact_contract_guidance(path: str) -> str:
                 "RESPONSE_HEADERS:\nRESPONSE_BODY_EXCERPT:\nWHY_INTERESTING:"
             )
     return "Write a complete, non-empty artifact that preserves exact inputs, observed outputs, and why the result matters."
+
+
+def _safe_artifact_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip(".-").lower()
+    return cleaned[:80]
+
+
+def _render_verifier(target: str, method: str, headers: object, body: object) -> str:
+    safe_headers = headers if isinstance(headers, dict) else {}
+    safe_body = body if isinstance(body, (dict, list, str, int, float, bool)) or body is None else None
+    return (
+        "# Generated by ChainsawRecon. Review before executing against an authorized target.\n"
+        "import json\n"
+        "import requests\n\n"
+        f"URL = {target!r}\n"
+        f"METHOD = {method!r}\n"
+        f"HEADERS = {safe_headers!r}\n"
+        f"BODY = {safe_body!r}\n\n"
+        "response = requests.request(METHOD, URL, headers=HEADERS, json=BODY, timeout=20, allow_redirects=False)\n"
+        "print('STATUS:', response.status_code)\n"
+        "print('HEADERS:', json.dumps(dict(response.headers), sort_keys=True))\n"
+        "print('BODY:', response.text[:2000])\n"
+    )
 
 
 def _validate_command_safety(command: str) -> ToolResult | None:

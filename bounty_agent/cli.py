@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-malformed-responses", type=int, default=10)
     parser.add_argument("--llm-timeout-seconds", type=int, help="Timeout seconds for LLM HTTP calls.")
     parser.add_argument("--auth-file", type=Path, help="Optional auth context file with cookies, headers, tokens, or login notes.")
+    parser.add_argument("--source-dir", type=Path, help="Optional local source tree to map without executing it.")
+    parser.add_argument("--har-file", type=Path, action="append", default=[], help="Optional browser HAR capture to import as local evidence. Repeatable.")
     parser.add_argument("--priority-file", type=Path, help="Optional file listing targets or endpoints to test in depth first.")
     parser.add_argument("--allow-all-hosts", action="store_true", help="Allow all hosts and skip scope blocking.")
     parser.add_argument("--runs-dir", type=Path, help="Output directory for run artifacts.")
@@ -116,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         queue_path=(args.engagement / "agent" / "target-queue.json") if args.engagement else None,
         auth_context_path=resolve_auth_context_path(args.auth_file, args.engagement),
         priority_targets_path=resolve_priority_targets_path(args.priority_file, args.engagement),
+        source_code_path=args.source_dir,
+        har_paths=tuple(args.har_file),
     )
     agent = BountyAgent(scope, primary_target, settings, runs_dir)
     run_dir = agent.run()

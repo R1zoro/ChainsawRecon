@@ -8,7 +8,10 @@ import tempfile
 from pathlib import Path
 
 from .config import AgentSettings, ProgramScope
+from .browser_evidence import parse_har
+from .engagement_state import EngagementStateStore, extract_hosts
 from .llm import ChatMessage, LLMClient, NullLLMClient, OpenAICompatibleClient
+from .mapping import MappingCoordinator
 from .prompts import build_system_prompt, deterministic_recon_plan
 from .report import write_engagement_report, write_report
 from .retrieval import NullRetrievalStore, RetrievalStore
@@ -17,6 +20,9 @@ from .sandbox import DockerSandboxRunner, LocalWorkspaceRunner
 from .scope import ScopeGuard
 from .tools import ToolRegistry
 from .trace import TraceLogger
+from .source_analysis import analyze_source_tree
+from .technologies import detect_technology_observations, get_playbook
+from .world_model import Relationship, Route, Session, SourceAsset as WorldSourceAsset, Technology, WorldModel, host_from_url, stable_id
 
 
 class BountyAgent:
@@ -37,6 +43,15 @@ class BountyAgent:
         self.retrieval = self._build_retrieval_store()
         self.run_recon = self._build_run_recon_store()
         self.engagement_recon = self._build_engagement_recon_store()
+        self.engagement_state = self._build_engagement_state_store()
+        self.mapping_coordinator = MappingCoordinator()
+        self.world_model = WorldModel(
+            self.engagement_recon,
+            stable_id("engagement", str(self._engagement_db_path().parent.resolve()), scope.program_name),
+            program_name=scope.program_name,
+            target=target,
+            mode=settings.mode,
+        )
         # create ScopeGuard with per-run dynamic allowlist and optional allow-all
         dynamic_file = self.workspace / "allowed_hosts.txt"
         self.scope_guard = ScopeGuard(scope, dynamic_allow_file=dynamic_file, allow_all=self.settings.allow_all_hosts)
@@ -56,6 +71,9 @@ class BountyAgent:
             max_commands_per_minute=settings.max_commands_per_minute,
             max_repeated_commands=settings.max_repeated_commands,
             allow_search=settings.mode == "assistant",
+            state_store=self.engagement_state,
+            run_id=self.run_dir.name,
+            max_actions=settings.max_steps,
         )
         self.llm = self._build_llm()
 
@@ -67,12 +85,15 @@ class BountyAgent:
             self.retrieval.close()
             self.run_recon.close()
             self.engagement_recon.close()
+            self.engagement_state.close()
 
     def _run(self) -> Path:
         self.trace.write("session_start", targets=self.session_targets, runner=self.settings.runner)
         effective_mode = self._resolve_effective_mode()
         self.trace.write("mode_selected", requested=self.settings.mode, effective=effective_mode)
         self._stage_auth_context()
+        self._import_phase_two_evidence()
+        self._sync_world_model()
         self._refresh_session_queue()
         self._persist_session_state(effective_mode)
 
@@ -83,6 +104,13 @@ class BountyAgent:
             index = len(self.completed_targets) + 1
             current_target = self.pending_targets.pop(0)
             self.target = current_target
+            objective_id = self.engagement_state.ensure_objective(
+                title=f"Map and assess {current_target}",
+                target=current_target,
+                source="run-start",
+                description="Build enough target evidence to select safe, high-value security experiments.",
+            )
+            self.tools.set_execution_context(objective_id=objective_id, target=current_target)
             target_decision = self.scope_guard.validate_target(current_target)
             self.trace.write(
                 "start_target",
@@ -102,6 +130,7 @@ class BountyAgent:
             messages = [
                 ChatMessage("system", build_system_prompt(self.scope, current_target, self.settings)),
                 ChatMessage("system", self._build_engagement_memory_prompt()),
+                ChatMessage("system", self._build_world_model_prompt()),
                 ChatMessage("system", self._build_coverage_memory_prompt()),
                 ChatMessage("system", self._build_mapping_context_prompt()),
                 ChatMessage("system", self._build_mode_guidance_prompt(effective_mode)),
@@ -113,6 +142,7 @@ class BountyAgent:
                 ChatMessage("user", f"Begin with safe recon for queue target {index}: {current_target}. Pending queue size after this target: {len(self.pending_targets)}. Record only findings with concrete evidence."),
             ]
 
+            # Capability inventory is local-only. Every remote request is selected by the model.
             for action in deterministic_recon_plan(current_target):
                 if self.settings.dry_run:
                     self.trace.write("dry_run_action", action=action)
@@ -122,34 +152,14 @@ class BountyAgent:
                     result = self.tools.execute(action)
                     result_content = result.content
                     result_ok = result.ok
+                    self.session_step_count = self.tools.action_count
                 self.retrieval.add(index, action, result_content, {"type": action.get("action"), "phase": "startup", "target": current_target})
                 messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
-            # Automated startup pipeline: run discovery tools on the target
-            if not self.settings.dry_run and self.settings.model:
-                startup_actions = [
-                    {"action": "bash", "command": f"waybackurls {current_target} 2>/dev/null | head -50 | httpx -silent -status-code -title -tech-detect -rate-limit 10 2>/dev/null {self.workspace}/startup_endpoints.txt", "timeout_seconds": 60},
-                    {"action": "bash", "command": f"katana -u {current_target} -c 1 -rate-limit 5 -silent 2>/dev/null | head -50 | httpx -silent -status-code -title -tech-detect -rate-limit 10 2>/dev/null -a {self.workspace}/startup_endpoints.txt", "timeout_seconds": 60},
-                ]
-                for sa in startup_actions:
-                    sa_result = self.tools.execute(sa)
-                    self.retrieval.add(index, sa, sa_result.content, {"type": "bash", "phase": "startup_pipeline", "target": current_target})
-                    messages.append(ChatMessage("user", self._format_tool_feedback(sa, sa_result.ok, sa_result.content)))
-
-            # Phase 0: Subdomain discovery before LLM loop
-            if not self.settings.dry_run and self.settings.model:
-                discovery_actions = [
-                    {"action": "bash", "command": f"subfinder -d {current_target} -silent 2>/dev/null | head -100", "timeout_seconds": 60},
-                    {"action": "bash", "command": f"subfinder -d {current_target} -silent 2>/dev/null | head -100 | httpx -silent -status-code -title -tech-detect -rate-limit 10 2>/dev/null", "timeout_seconds": 60},
-                ]
-                for da in discovery_actions:
-                    da_result = self.tools.execute(da)
-                    self.retrieval.add(index, da, da_result.content, {"type": "bash", "phase": "discovery", "target": current_target})
-                    messages.append(ChatMessage("user", self._format_tool_feedback(da, da_result.ok, da_result.content)))
-
             summary = ""
             if self._should_run_mapping_preflight(effective_mode):
                 self.trace.write("mode_preflight", mode=effective_mode, action="mapping", target=current_target)
                 summary = self._run_mapping_preflight(messages)
+                self.session_step_count = self.tools.action_count
             if effective_mode == "mapping":
                 summary = summary or f"{current_target}: mapping mode completed."
             elif self.settings.model:
@@ -185,6 +195,8 @@ class BountyAgent:
         promoted = self._promote_run_memory()
         self.trace.write("recon_promoted", count=promoted, engagement_db=str(self._engagement_db_path()))
         self._write_engagement_asset_catalog()
+        self._write_phase_one_engagement_artifacts()
+        self._sync_world_model()
         self._write_engagement_report()
         self.trace.write("finish", report=str(self.run_dir / "report.md"))
         self._persist_session_state(effective_mode, finished=True)
@@ -265,7 +277,6 @@ class BountyAgent:
                 )
                 continue
             invalid_json_count = 0
-            self.session_step_count += 1
             local_step += 1
             if action.get("action") == "finish":
                 proposed_summary = str(action.get("summary", "Finished."))
@@ -305,10 +316,12 @@ class BountyAgent:
                 result_content = f"Dry run: would execute {action.get('command')}"
                 result_ok = True
                 self.trace.write("dry_run_action", action=action)
+                self.session_step_count += 1
             else:
                 result = self.tools.execute(action)
                 result_content = result.content
                 result_ok = result.ok
+                self.session_step_count = self.tools.action_count
                 if result.meta.get("repeat_blocked"):
                     repeat_blocks += 1
             self.retrieval.add(step, action, result_content, {"type": action.get("action")})
@@ -585,6 +598,7 @@ class BountyAgent:
         return mapping_path
 
     def _persist_session_state(self, effective_mode: str, finished: bool = False) -> Path:
+        phase_one_budget = self.engagement_state.budget_summary(self.run_dir.name)
         payload = {
             "generated_at": datetime.now().isoformat(),
             "program_name": self.scope.program_name,
@@ -599,6 +613,7 @@ class BountyAgent:
             "session_step_limit": self.settings.max_steps,
             "session_steps_used": self.session_step_count,
             "session_steps_remaining": max(0, self.settings.max_steps - self.session_step_count),
+            "phase_one_budget": phase_one_budget,
             "artifacts": {
                 "report": "report.md",
                 "trace": "trace.jsonl",
@@ -615,6 +630,8 @@ class BountyAgent:
                 "priority_followups": "priority-followups.md",
                 "surface_memory": "surface-memory.json",
                 "engagement_assets": str(self._engagement_db_path().parent / "assets"),
+                "structured_knowledge": str(self._engagement_db_path().parent / "knowledge"),
+                "catalogs": str(self._engagement_db_path().parent / "catalogs"),
             },
             "finished": finished,
         }
@@ -632,6 +649,117 @@ class BountyAgent:
         target.write_text(content, encoding="utf-8")
         self.trace.write("auth_context_staged", source=str(source), target=str(target), bytes=len(content))
         return target
+
+    def _import_phase_two_evidence(self) -> None:
+        """Map user-provided source and HAR evidence locally, without replaying it."""
+        source = self.settings.source_code_path
+        if source:
+            try:
+                analysis = analyze_source_tree(source)
+                self._ingest_source_analysis(analysis)
+                self.trace.write("source_analysis_imported", root=str(source), files=analysis.files_scanned, routes=len(analysis.routes))
+            except (OSError, ValueError) as exc:
+                self.trace.write("source_analysis_failed", root=str(source), error=f"{type(exc).__name__}: {exc}")
+        for har_path in self.settings.har_paths:
+            try:
+                capture = parse_har(har_path)
+                capture_id = self.world_model.add_browser_capture(capture.path, capture.title, "har-import", {"requests": len(capture.requests)})
+                for request in capture.requests:
+                    decision = self.scope_guard.validate_target(request.url)
+                    if not decision.allowed:
+                        continue
+                    self.world_model.add_browser_request(
+                        capture_id, method=request.method, url=request.url, request_headers=request.request_headers,
+                        request_body=request.request_body, response_status=request.response_status,
+                        response_headers=request.response_headers, response_body_excerpt=request.response_body_excerpt,
+                        auth_context=request.auth_context, source="har-import",
+                    )
+                    host = host_from_url(request.url)
+                    app_id, services = self.world_model.ensure_topology([host])
+                    path = _path_from_url(request.url)
+                    route = Route(stable_id("route", services[host], request.method, path), services[host], host, path,
+                                  request.method, request.auth_context, "har-import", {"status": request.response_status})
+                    self.world_model.upsert_route(route)
+                    self.world_model.link(Relationship("service", services[host], "serves", "route", route.id, "har-import"))
+                    for item in detect_technology_observations(request.response_headers, request.response_body_excerpt, request.url):
+                        technology = Technology(stable_id("tech", app_id, item.name), item.name, item.category, "har-import",
+                                                item.version, item.confidence, app_id=app_id, service_id=services[host], playbook=get_playbook(item.name))
+                        self.world_model.upsert_technology(technology)
+                for index, session in enumerate(capture.sessions):
+                    self.world_model.upsert_session(Session(
+                        stable_id("session", capture.path, str(index)), context=session.context, cookie_scope=session.cookie_scope,
+                        samesite=session.samesite, httponly=session.httponly, secure=session.secure,
+                        browser_only=session.browser_only, cookies=session.cookies, headers=session.headers,
+                    ))
+                self.trace.write("har_imported", path=str(har_path), requests=len(capture.requests))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self.trace.write("har_import_failed", path=str(har_path), error=f"{type(exc).__name__}: {exc}")
+
+    def _ingest_source_analysis(self, analysis: object) -> None:
+        # `analysis` is kept structural so source processing remains isolated from the LLM loop.
+        default_host = host_from_url(self.target)
+        app_id, services = self.world_model.ensure_topology([default_host] if default_host else [])
+        for asset in analysis.source_assets:
+            asset_id = self.world_model.add_source_asset(WorldSourceAsset(asset.path, asset.kind, asset.checksum, "source-import", asset.language, asset.framework, {"root": analysis.root, "evidence": list(asset.evidence)}))
+            self.world_model.link(Relationship("application", app_id, "contains", "source_asset", asset_id, "source-import"))
+        for framework in analysis.frameworks:
+            item = Technology(stable_id("tech", app_id, framework), framework, "framework", "source-import", confidence="confirmed", app_id=app_id, playbook=get_playbook(framework))
+            self.world_model.upsert_technology(item)
+        for language in analysis.languages:
+            self.world_model.upsert_technology(Technology(stable_id("tech", app_id, language), language, "language", "source-import", confidence="confirmed", app_id=app_id))
+        source_technologies = [
+            Technology(stable_id("tech", app_id, name), name, "framework", "source-import", confidence="confirmed", app_id=app_id)
+            for name in analysis.frameworks
+        ] + [
+            Technology(stable_id("tech", app_id, name), name, "language", "source-import", confidence="confirmed", app_id=app_id)
+            for name in analysis.languages
+        ]
+        self.world_model.set_application_technology_fields(app_id, source_technologies)
+        for discovered in analysis.routes:
+            service_id = services.get(default_host)
+            if not service_id:
+                continue
+            route_id = stable_id("route", service_id, discovered.method, discovered.path)
+            self.world_model.upsert_route(Route(route_id, service_id, default_host, discovered.path, discovered.method, discovered.auth_hint, "source-import", {"source_file": discovered.source_file}))
+            self.world_model.link(Relationship("source", discovered.source_file, "declares", "route", route_id, "source-import"))
+        for endpoint in analysis.client_endpoints:
+            service_id = services.get(default_host)
+            if not service_id:
+                continue
+            route_id = stable_id("route", service_id, "GET", endpoint)
+            self.world_model.upsert_route(Route(route_id, service_id, default_host, endpoint, "GET", "unknown", "source-import", {"source_file": "client-artifact"}))
+            self.world_model.link(Relationship("application", app_id, "references", "route", route_id, "source-import"))
+
+    def _sync_world_model(self) -> None:
+        surfaces = self._merged_surfaces()
+        self.world_model.ingest_surfaces(surfaces, source="recon")
+        for observation in [*self.engagement_recon.observations(200), *self.run_recon.observations(200)]:
+            host = host_from_url(observation.target) or host_from_url(self.target)
+            if not host:
+                continue
+            app_id, services = self.world_model.ensure_topology([host])
+            for item in detect_technology_observations({}, observation.summary, observation.target):
+                technology = Technology(stable_id("tech", app_id, item.name), item.name, item.category, observation.source,
+                                        item.version, item.confidence, app_id=app_id, service_id=services[host], playbook=get_playbook(item.name))
+                self.world_model.upsert_technology(technology)
+                self.world_model.set_application_technology_fields(app_id, [technology])
+        self.world_model.write_catalogs(self._engagement_db_path().parent / "catalogs")
+
+    def _build_world_model_prompt(self) -> str:
+        summary = self.world_model.architecture_summary()
+        mapping = self.mapping_coordinator.assess(
+            self._merged_surfaces(), technology_count=len(summary["technologies"]),
+            browser_capture_count=len(summary["browser_captures"]), source_asset_count=len(summary["source_assets"]),
+        )
+        if not summary["services"] and not summary["technologies"]:
+            return f"Architecture world model: no verified topology yet. Current mapping phase: {mapping.phase.name}; focus: {'; '.join(mapping.recommended_focus)}."
+        technologies = ", ".join(item["name"] for item in summary["technologies"][:12]) or "none"
+        routes = ", ".join(f"{item['method']} {item['host']}{item['path']}" for item in summary["routes"][:12]) or "none"
+        return (
+            "Architecture world model (evidence, not proof): "
+            f"services={len(summary['services'])}; technologies={technologies}; routes={routes}; mapping phase={mapping.phase.name}. "
+            "Use it to form a bounded hypothesis and select representative surfaces; do not assume unverified relationships are exploitable."
+        )
 
     # ── Early-stop control signal ────────────────────────────────────────
 
@@ -1160,6 +1288,17 @@ class BountyAgent:
             self.trace.write("engagement_recon_disabled", error=f"{type(exc).__name__}: {exc}")
             return NullReconStore()
 
+    def _build_engagement_state_store(self) -> EngagementStateStore:
+        """Open durable objectives, hypotheses, evidence, and action accounting."""
+        path = self._engagement_db_path().parent / "knowledge" / "state.db"
+        try:
+            store = EngagementStateStore(path)
+            self.trace.write("engagement_state_enabled", path=str(store.path))
+            return store
+        except Exception as exc:
+            self.trace.write("engagement_state_fallback", error=f"{type(exc).__name__}: {exc}")
+            return EngagementStateStore(self.run_dir / "knowledge" / "state.db")
+
     def _engagement_db_path(self) -> Path:
         return self.settings.engagement_db_path or self.run_dir.parent / "knowledge.db"
 
@@ -1170,8 +1309,10 @@ class BountyAgent:
 
     def _build_engagement_memory_prompt(self) -> str:
         facts = [fact for fact in self.engagement_recon.facts() if fact.kind != "research_query"][:15]
+        objectives = self.engagement_state.objectives()[:5]
+        hypotheses = [item for item in self.engagement_state.hypotheses() if item["state"] not in {"validated", "rejected"}][:6]
 
-        if not facts:
+        if not facts and not objectives and not hypotheses:
             return "Curated engagement memory: none yet."
         counts = self.engagement_recon.summary_counts()
         lines = [
@@ -1183,6 +1324,16 @@ class BountyAgent:
             lines.append(
                 f"- {fact.kind} {fact.key}: {_trim_text(fact.value, 120)} confidence={fact.confidence} status={fact.status} tags={tags}"
             )
+        if objectives:
+            lines.extend(["Active security objectives:"])
+            for objective in objectives:
+                lines.append(f"- [{objective['status']}] {objective['title']} target={objective['target']}")
+        if hypotheses:
+            lines.append("Open hypotheses (do not call these findings):")
+            for hypothesis in hypotheses:
+                lines.append(
+                    f"- [{hypothesis['state']}/{hypothesis['confidence']}] {hypothesis['title']} on {hypothesis['surface']}"
+                )
         return "\n".join(lines)
 
     def _build_runner(self) -> LocalWorkspaceRunner:
@@ -1199,6 +1350,7 @@ class BountyAgent:
             [fact for fact in self.engagement_recon.facts() if fact.kind != "research_query"],
             self.engagement_recon.surfaces(),
             self.engagement_recon.attack_results(),
+            self.world_model.architecture_summary(),
         )
         self.trace.write("engagement_report_written", path=str(report_path))
         return report_path
@@ -1259,6 +1411,66 @@ class BountyAgent:
             (root / name).write_text("\n".join(sorted(values)) + ("\n" if values else ""), encoding="utf-8")
         self.trace.write("engagement_asset_catalog_written", path=str(root), files=len(buckets) + 1)
         return root
+
+    def _write_phase_one_engagement_artifacts(self) -> Path:
+        """Publish durable machine state and concise catalogs shared by every run."""
+        knowledge_root = self._engagement_db_path().parent / "knowledge"
+        catalog_root = self._engagement_db_path().parent / "catalogs"
+        exports = self.engagement_state.write_machine_exports(knowledge_root)
+        catalog_root.mkdir(parents=True, exist_ok=True)
+
+        surfaces = self._merged_surfaces()
+        facts = [*self.engagement_recon.facts(), *self.run_recon.facts()]
+        hosts = {surface.host.lower() for surface in surfaces if surface.host and surface.host != "local"}
+        hosts.update(str(fact.value).lower() for fact in facts if fact.kind == "host" and fact.value)
+        hosts.update(extract_hosts("\n".join(str(fact.value) for fact in facts if fact.kind == "endpoint")))
+        urls = {
+            str((surface.meta or {}).get("url") or f"https://{surface.host}{surface.path_pattern}")
+            for surface in surfaces if surface.host and surface.host != "local"
+        }
+        typed_urls = {"api-endpoints.txt": set(), "graphql-endpoints.txt": set(), "js-bundles.txt": set()}
+        for surface in surfaces:
+            url = str((surface.meta or {}).get("url") or f"https://{surface.host}{surface.path_pattern}")
+            if surface.surface_type == "api":
+                typed_urls["api-endpoints.txt"].add(url)
+            elif surface.surface_type == "graphql":
+                typed_urls["graphql-endpoints.txt"].add(url)
+            elif surface.surface_type == "js":
+                typed_urls["js-bundles.txt"].add(url)
+        catalog_values: dict[str, set[str]] = {
+            "subdomains-subfinder.txt": self.engagement_state.discovered_hosts_for_tool("subfinder"),
+            "subdomains-sublist3r.txt": self.engagement_state.discovered_hosts_for_tool("sublist3r"),
+            "live-subdomains.txt": hosts,
+            "urls.txt": urls,
+            **typed_urls,
+        }
+        for name, values in catalog_values.items():
+            (catalog_root / name).write_text("\n".join(sorted(item for item in values if item)) + ("\n" if values else ""), encoding="utf-8")
+
+        known_host_lines = [f"- `{host}`" for host in sorted(hosts)] or ["- No live hosts recorded yet."]
+        architecture = [
+            f"# Engagement Architecture: {self.scope.program_name}", "",
+            "This is an evidence-led Phase 1 inventory, not a completed application architecture analysis.", "",
+            "## Known hosts", "",
+            *known_host_lines,
+            "", "## Observed surfaces", "",
+        ]
+        for surface in sorted(surfaces, key=lambda item: (item.host, item.path_pattern))[:200]:
+            architecture.append(f"- `{surface.surface_type}` `{surface.host}{surface.path_pattern}` auth=`{surface.auth_context}`")
+        if not surfaces:
+            architecture.append("- No surfaces recorded yet.")
+        architecture.extend(["", "## Active security objectives", ""])
+        for objective in self.engagement_state.objectives()[:30]:
+            architecture.append(f"- [{objective['status']}] {objective['title']} (`{objective['target']}`)")
+        (catalog_root / "architecture.md").write_text("\n".join(architecture) + "\n", encoding="utf-8")
+
+        progress = ["hypothesis_id\tstate\tconfidence\tsurface\ttitle"]
+        for item in self.engagement_state.hypotheses():
+            progress.append(f"{item['hypothesis_id']}\t{item['state']}\t{item['confidence']}\t{item['surface']}\t{item['title']}")
+        (catalog_root / "testing-progress.tsv").write_text("\n".join(progress) + "\n", encoding="utf-8")
+        budget = self.engagement_state.budget_summary(self.run_dir.name)
+        self.trace.write("phase_one_artifacts_written", knowledge=str(knowledge_root), catalogs=str(catalog_root), exports=list(exports), budget=budget)
+        return catalog_root
 
     @staticmethod
     def _surface_catalog_id(surface_key: str) -> str:
@@ -1568,6 +1780,11 @@ def _recon_coverage_gaps(
 
 def _slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")[:80] or "target"
+
+
+def _path_from_url(value: str) -> str:
+    match = re.match(r"https?://[^/]+(?P<path>/[^?#]*)?", value, flags=re.I)
+    return (match.group("path") if match and match.group("path") else "/")
 
 
 def _trim_text(value: str, limit: int) -> str:

@@ -84,6 +84,11 @@ python -m bounty_agent.cli `
 
 For a safe planning pass, replace `--execute` with `--dry-run`. Do not use both.
 
+To enrich an authorized engagement with evidence already collected locally,
+append `--source-dir <local-source-tree>` and/or one or more `--har-file
+<browser-capture.har>` arguments. These inputs are mapped locally; HAR requests
+are not replayed merely because they are imported.
+
 ### Modes
 
 | Mode | Use |
@@ -130,7 +135,9 @@ The engagement directory accumulates curated memory and reusable catalogs:
 
 ```text
 agent/knowledge.db           # curated cross-run recon memory
+agent/knowledge/             # structured objectives, hypotheses, evidence, action accounting, tool manifest
 agent/engagement-report.md   # consolidated readable engagement picture
+agent/catalogs/              # human-friendly shared inventories and architecture summary
 agent/assets/
   all-surfaces.txt
   live-hosts.txt
@@ -143,6 +150,20 @@ agent/assets/
   auth-surfaces.txt
   test-progress.tsv
 ```
+
+`agent/knowledge/` is the machine-readable Phase 1 source of truth. It records
+security objectives, hypotheses, evidence references, executed actions, typed
+artifacts, and a verified tool manifest. `agent/catalogs/` is regenerated from
+that state and contains practical files such as `subdomains-subfinder.txt`,
+`subdomains-sublist3r.txt`, `live-subdomains.txt`, `api-endpoints.txt`,
+`graphql-endpoints.txt`, `js-bundles.txt`, `architecture.md`, and
+`testing-progress.tsv` for manual work and future runs.
+
+Phase 2 adds `world-model.json`, `technologies.json`, and `routes.json` to the
+catalogs. `architecture.md` becomes an evidence-led topology spanning services,
+routes, technology observations, source assets, browser captures, and session
+contexts. Sensitive browser cookies remain in the local engagement database;
+the human-readable catalog records only their security attributes and context.
 
 The run database may contain incomplete or noisy observations. Only promotable facts move into `knowledge.db`; raw research queries are excluded. `test-progress.tsv` is especially useful for selecting a manual follow-up surface without redoing already-covered checks.
 
@@ -167,6 +188,8 @@ Never place fresh session tokens in a committed `prompt.md`, README, trace, or p
 - Repeated commands and malformed actions are controlled to prevent low-value loops.
 - WAF/Cloudflare-like blocking is treated as a signal to slow down, preserve evidence, and defer rather than to bypass protections.
 - Findings follow a ladder: signal -> hypothesis -> reproduced -> validated. A scanner result alone is not a confirmed vulnerability.
+- High-impact SQLi, XSS, and GraphQL attack tools require a structured hypothesis when engagement state is enabled; mapping tools remain available for low-impact discovery.
+- Remote discovery is model-directed; the deterministic preflight checks only local tool availability.
 
 ## Development Notes
 
