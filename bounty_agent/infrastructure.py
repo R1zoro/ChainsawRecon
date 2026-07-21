@@ -1,0 +1,494 @@
+"""Infrastructure and WAF detection for HTTP responses.
+
+Transforms the agent's understanding of HTTP errors from:
+    "403 → retry"
+into:
+    "403 → why? → Cloudflare challenge → needs browser → do passive work"
+
+Stores per-host infrastructure profiles so repeated detections are
+cached and the agent doesn't re-discover the same WAF on every request.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
+
+
+class InfrastructureProvider(Enum):
+    """Known infrastructure/CDN/WAF providers."""
+    CLOUDFLARE = "cloudflare"
+    CLOUDFRONT = "cloudfront"
+    AKAMAI = "akamai"
+    FASTLY = "fastly"
+    INCAPSULA = "incapsula"
+    CLOUDFLARE_WORKERS = "cloudflare_workers"
+    AWS_ELB = "aws_elb"
+    AWS_APIGW = "aws_api_gateway"
+    GOOGLE_CLOUD = "google_cloud"
+    AZURE = "azure"
+    GENERIC_WAF = "generic_waf"
+    APPLICATION = "application"
+    UNKNOWN = "unknown"
+
+
+class ChallengeType(Enum):
+    """Type of challenge or block encountered."""
+    NONE = "none"
+    JS_CHALLENGE = "js_challenge"          # Cloudflare JS challenge (5s wait)
+    MANAGED_CHALLENGE = "managed_challenge"  # Cloudflare managed challenge (interactive)
+    CAPTCHA = "captcha"                     # Cloudflare CAPTCHA
+    RATE_LIMIT = "rate_limit"               # 429 rate limiting
+    IP_BLOCK = "ip_block"                   # IP-level block
+    WAF_BLOCK = "waf_block"                # WAF rule match
+    ACCESS_DENIED = "access_denied"         # 403 from application
+    AUTH_REQUIRED = "auth_required"         # 401 from application
+    REDIRECT = "redirect"                   # 301/302/307
+    NOT_FOUND = "not_found"                 # 404
+    SERVER_ERROR = "server_error"           # 5xx
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class InfrastructureProfile:
+    """Profile of infrastructure detected for a host.
+
+    Once created, this profile is cached so subsequent requests to
+    the same host don't re-detect the infrastructure.
+    """
+    host: str
+    provider: InfrastructureProvider = InfrastructureProvider.UNKNOWN
+    challenge_type: ChallengeType = ChallengeType.UNKNOWN
+    detected_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    detection_count: int = 1
+    last_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    requires_browser: bool = False
+    requires_session: bool = False
+    passive_work_allowed: bool = True
+    retry_cooldown_seconds: int = 0
+    detection_evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dict for persistence."""
+        return {
+            "host": self.host,
+            "provider": self.provider.value,
+            "challenge_type": self.challenge_type.value,
+            "detected_at": self.detected_at,
+            "detection_count": self.detection_count,
+            "last_seen": self.last_seen,
+            "requires_browser": self.requires_browser,
+            "requires_session": self.requires_session,
+            "passive_work_allowed": self.passive_work_allowed,
+            "retry_cooldown_seconds": self.retry_cooldown_seconds,
+            "detection_evidence": self.detection_evidence,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> InfrastructureProfile:
+        """Deserialize from dict."""
+        return cls(
+            host=data["host"],
+            provider=InfrastructureProvider(data.get("provider", "unknown")),
+            challenge_type=ChallengeType(data.get("challenge_type", "unknown")),
+            detected_at=data.get("detected_at", datetime.now().isoformat()),
+            detection_count=data.get("detection_count", 1),
+            last_seen=data.get("last_seen", datetime.now().isoformat()),
+            requires_browser=data.get("requires_browser", False),
+            requires_session=data.get("requires_session", False),
+            passive_work_allowed=data.get("passive_work_allowed", True),
+            retry_cooldown_seconds=data.get("retry_cooldown_seconds", 0),
+            detection_evidence=data.get("detection_evidence", {}),
+        )
+
+
+# Cloudflare-specific detection patterns
+_CF_HEADERS = {"cf-ray", "cf-cache-status", "cf-mitigated", "cf-chl-bypass"}
+_CF_BODY_JS_CHALLENGE = re.compile(r"Just a moment\.\.\.|checking your browser", re.I)
+_CF_BODY_MANAGED_CHALLENGE = re.compile(r"managed challenge|challenge-platform", re.I)
+_CF_BODY_BLOCKED = re.compile(r"Sorry, you have been blocked|Attention Required|Your IP.*blocked", re.I)
+_CF_BODY_RATE_LIMIT = re.compile(r"rate limit|too many requests", re.I)
+
+# CloudFront-specific detection patterns
+_CFRONT_HEADERS = {"x-amz-cf-id", "x-amz-cf-pop", "x-cache"}
+_CFRONT_BODY_403 = re.compile(r"ERROR: The request could not be satisfied|Generated by cloudfront", re.I)
+
+# Incapsula-specific
+_INCAPSULA_HEADERS = {"incapsula", "x-iinfo", "x-cdn"}
+_INCAPSULA_BODY = re.compile(r"Incapsula|_Incapsula_Resource", re.I)
+
+# Akamai-specific
+_AKAMAI_HEADERS = {"x-akamai", "x-akamai-transformed"}
+
+# WAF detection from response body
+_WAF_BODY_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("cloudflare", re.compile(r"cloudflare|__cf_chl|cdn-cgi", re.I)),
+    ("cloudfront", re.compile(r"cloudfront|Generated by cloudfront", re.I)),
+    ("incapsula", re.compile(r"Incapsula|_Incapsula_Resource", re.I)),
+    ("akamai", re.compile(r"akamai|AkamaiGHost", re.I)),
+    ("sucuri", re.compile(r"sucuri|cloudproxy", re.I)),
+    ("blocked", re.compile(r"blocked|access denied|forbidden", re.I)),
+]
+
+# WAF header pattern detection
+_WAF_HEADER_PROVIDERS: List[Tuple[re.Pattern, InfrastructureProvider]] = [
+    (re.compile(r"cloudflare", re.I), InfrastructureProvider.CLOUDFLARE),
+    (re.compile(r"cloudfront", re.I), InfrastructureProvider.CLOUDFRONT),
+    (re.compile(r"akamai", re.I), InfrastructureProvider.AKAMAI),
+    (re.compile(r"incapsula", re.I), InfrastructureProvider.INCAPSULA),
+    (re.compile(r"fastly", re.I), InfrastructureProvider.FASTLY),
+    (re.compile(r"server:\s*cloudflare", re.I), InfrastructureProvider.CLOUDFLARE),
+    (re.compile(r"server:\s*amazon", re.I), InfrastructureProvider.AWS_ELB),
+]
+
+# Status codes that indicate infrastructure vs application responses
+_INFRASTRUCTURE_STATUS_CODES = {403, 429, 503, 520, 521, 522, 523, 524, 525, 526}
+_RETRYABLE_STATUS_CODES = {429, 503, 520, 524}  # Might succeed on backoff
+_TERMINAL_STATUS_CODES = {403, 521, 522, 523, 525, 526}  # Won't succeed without different approach
+
+
+def _extract_all_headers(headers_raw: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Normalize headers dict to lowercase keys."""
+    if not headers_raw:
+        return {}
+    return {str(k).lower(): str(v) for k, v in headers_raw.items()}
+
+
+def _has_cf_headers(headers: Dict[str, str]) -> bool:
+    """Check if headers contain Cloudflare signatures."""
+    overlap = _CF_HEADERS & set(headers.keys())
+    if overlap:
+        return True
+    return any("cloudflare" in v.lower() for k, v in headers.items() if k == "server")
+
+
+def _has_cf_body(body: str) -> bool:
+    """Check if response body contains Cloudflare challenge indicators."""
+    return bool(_CF_BODY_JS_CHALLENGE.search(body) or _CF_BODY_BLOCKED.search(body) or
+                _CF_BODY_MANAGED_CHALLENGE.search(body) or "cloudflare" in body.lower()[:200] or
+                "/cdn-cgi/" in body)
+
+
+def _detect_cf_challenge_type(body: str, headers: Dict[str, str]) -> ChallengeType:
+    """Determine the specific Cloudflare challenge type from body and headers."""
+    mitigated = headers.get("cf-mitigated", "")
+    if mitigated:
+        if "challenge" in mitigated.lower():
+            if "managed" in mitigated.lower():
+                return ChallengeType.MANAGED_CHALLENGE
+            return ChallengeType.JS_CHALLENGE
+        if "etier" in mitigated.lower() or "captcha" in mitigated.lower():
+            return ChallengeType.CAPTCHA
+
+    if _CF_BODY_MANAGED_CHALLENGE.search(body):
+        return ChallengeType.MANAGED_CHALLENGE
+    if _CF_BODY_JS_CHALLENGE.search(body):
+        return ChallengeType.JS_CHALLENGE
+    if _CF_BODY_BLOCKED.search(body):
+        return ChallengeType.IP_BLOCK
+    return ChallengeType.WAF_BLOCK
+
+
+def _detect_cloudfront(headers: Dict[str, str], body: str) -> Tuple[bool, ChallengeType]:
+    """Detect whether this is a CloudFront response."""
+    cfront_keys = _CFRONT_HEADERS & set(headers.keys())
+    if not cfront_keys and not _CFRONT_BODY_403.search(body):
+        return False, ChallengeType.UNKNOWN
+
+    # CloudFront 403 "Bad request" or "The request could not be satisfied"
+    if "bad request" in body.lower() and "generated by cloudfront" in body.lower():
+        return True, ChallengeType.ACCESS_DENIED
+    return True, ChallengeType.WAF_BLOCK
+
+
+def _detect_infrastructure_from_headers(headers: Dict[str, str]) -> Optional[InfrastructureProvider]:
+    """Detect infrastructure provider from response headers only."""
+    for pattern, provider in _WAF_HEADER_PROVIDERS:
+        for key, value in headers.items():
+            combined = f"{key}: {value}"
+            if pattern.search(combined):
+                return provider
+    return None
+
+
+def classify_response(
+    status_code: int,
+    headers: Optional[Dict[str, Any]] = None,
+    body: str = "",
+) -> InfrastructureProfile:
+    """Classify an HTTP response to determine infrastructure and challenge type.
+
+    Analyzes status code, response headers, and body content to determine:
+    - Is this infrastructure (WAF/CDN) or the actual application?
+    - What type of challenge/block was encountered?
+    - Does the agent need a browser to proceed?
+    - Is passive work still possible?
+
+    Args:
+        status_code: HTTP status code (e.g., 403, 429, 200).
+        headers: Response headers (case-insensitive, any format).
+        body: Response body text (first few KB is usually sufficient).
+
+    Returns:
+        An InfrastructureProfile describing the detection results.
+    """
+    host = ""
+    headers_normalized = _extract_all_headers(headers)
+
+    # Extract host from headers or body
+    host_header = headers_normalized.get("host", "")
+    if host_header:
+        host = host_header.split(":")[0]
+
+    provider = _detect_infrastructure_from_headers(headers_normalized)
+    challenge_type = ChallengeType.UNKNOWN
+    requires_browser = False
+    requires_session = False
+    passive_work_allowed = True
+    retry_cooldown = 0
+    evidence: Dict[str, Any] = {
+        "status_code": status_code,
+        "detection_source": [],
+    }
+
+    # === Status code classification ===
+    if status_code in (401,):
+        challenge_type = ChallengeType.AUTH_REQUIRED
+        requires_session = True
+        passive_work_allowed = False
+        evidence["detection_source"].append("status_401")
+
+    elif status_code in (301, 302, 303, 307, 308):
+        challenge_type = ChallengeType.REDIRECT
+        location = headers_normalized.get("location", "")
+        evidence["detection_source"].append("redirect")
+        evidence["redirect_target"] = location
+
+    elif status_code == 404:
+        challenge_type = ChallengeType.NOT_FOUND
+        evidence["detection_source"].append("status_404")
+
+    elif status_code in (500, 502, 503):
+        challenge_type = ChallengeType.SERVER_ERROR
+        if status_code == 503:
+            retry_cooldown = 30  # Might be temporary
+        evidence["detection_source"].append("status_5xx")
+
+    elif status_code == 429:
+        challenge_type = ChallengeType.RATE_LIMIT
+        retry_cooldown = 60
+        evidence["detection_source"].append("status_429")
+
+    # === Provider-specific detection (403s and blocked responses) ===
+    if status_code in _INFRASTRUCTURE_STATUS_CODES or status_code >= 400:
+
+        # 1. Cloudflare detection
+        if _has_cf_headers(headers_normalized) or _has_cf_body(body):
+            provider = InfrastructureProvider.CLOUDFLARE
+            challenge_type = _detect_cf_challenge_type(body, headers_normalized)
+            requires_browser = challenge_type in (ChallengeType.JS_CHALLENGE, ChallengeType.MANAGED_CHALLENGE, ChallengeType.CAPTCHA)
+            requires_session = challenge_type in (ChallengeType.CAPTCHA, ChallengeType.MANAGED_CHALLENGE)
+            retry_cooldown = 120 if challenge_type == ChallengeType.IP_BLOCK else 60
+            passive_work_allowed = not requires_browser  # Passive work OK with JS challenge
+            evidence["detection_source"].append("cloudflare_detected")
+            evidence["cf_mitigated"] = headers_normalized.get("cf-mitigated", "")
+            evidence["cf_ray"] = headers_normalized.get("cf-ray", "")
+
+        # 2. CloudFront detection
+        elif _detect_cloudfront(headers_normalized, body)[0]:
+            provider = InfrastructureProvider.CLOUDFRONT
+            challenge_type = _detect_cloudfront(headers_normalized, body)[1]
+            requires_session = False
+            passive_work_allowed = True  # CloudFront 403s are usually at the edge, app may still work
+            retry_cooldown = 60
+            evidence["detection_source"].append("cloudfront_detected")
+            evidence["cfront_id"] = headers_normalized.get("x-amz-cf-id", "")
+            evidence["cfront_pop"] = headers_normalized.get("x-amz-cf-pop", "")
+
+        # 3. Incapsula detection
+        if provider is None or provider == InfrastructureProvider.UNKNOWN:
+            inca_headers = _INCAPSULA_HEADERS & set(headers_normalized.keys())
+            if inca_headers or _INCAPSULA_BODY.search(body):
+                provider = InfrastructureProvider.INCAPSULA
+                challenge_type = ChallengeType.WAF_BLOCK
+                requires_browser = True
+                retry_cooldown = 60
+                evidence["detection_source"].append("incapsula_detected")
+
+        # 4. Generic application error (not infrastructure)
+        # Don't overwrite an already-detected challenge type (e.g., rate limit was set above)
+        if provider is None or provider == InfrastructureProvider.UNKNOWN:
+            provider = InfrastructureProvider.APPLICATION
+            if challenge_type == ChallengeType.UNKNOWN:
+                challenge_type = ChallengeType.ACCESS_DENIED
+            requires_session = True
+            passive_work_allowed = True
+            evidence["detection_source"].append("application_error")
+
+    # === Fallback for successful responses (200, etc.) ===
+    elif status_code >= 200 and status_code < 300:
+        if provider is None:
+            provider = InfrastructureProvider.APPLICATION
+        challenge_type = ChallengeType.NONE
+        passive_work_allowed = True
+
+    # === If we have a body but no headers, try to detect from body ===
+    if provider is None or provider == InfrastructureProvider.UNKNOWN:
+        if body:
+            for waf_name, pattern in _WAF_BODY_PATTERNS:
+                if pattern.search(body):
+                    if waf_name == "cloudflare":
+                        provider = InfrastructureProvider.CLOUDFLARE
+                    elif waf_name == "cloudfront":
+                        provider = InfrastructureProvider.CLOUDFRONT
+                    elif waf_name == "incapsula":
+                        provider = InfrastructureProvider.INCAPSULA
+                    challenge_type = ChallengeType.WAF_BLOCK
+                    evidence["detection_source"].append(f"body_{waf_name}")
+                    break
+
+    evidence["provider_detected"] = provider.value if provider else "unknown"
+    evidence["challenge_detected"] = challenge_type.value if challenge_type else "unknown"
+
+    return InfrastructureProfile(
+        host=host,
+        provider=provider or InfrastructureProvider.UNKNOWN,
+        challenge_type=challenge_type or ChallengeType.UNKNOWN,
+        detection_count=1,
+        requires_browser=requires_browser,
+        requires_session=requires_session,
+        passive_work_allowed=passive_work_allowed,
+        retry_cooldown_seconds=retry_cooldown,
+        detection_evidence=evidence,
+    )
+
+
+class InfrastructureStore:
+    """Persistent store for infrastructure profiles per host.
+
+    Caches detection results so the agent doesn't re-detect the same
+    infrastructure on every request. Enables the planner to make
+    strategy decisions based on known infrastructure without probing first.
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self._profiles: Dict[str, InfrastructureProfile] = {}
+        self._path = path
+        if path and path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        """Load profiles from disk."""
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            for host, profile_data in data.items():
+                self._profiles[host] = InfrastructureProfile.from_dict(profile_data)
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+
+    def _save(self) -> None:
+        """Save profiles to disk."""
+        if not self._path:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            data = {host: p.to_dict() for host, p in self._profiles.items()}
+            self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def get(self, host: str) -> Optional[InfrastructureProfile]:
+        """Get cached profile for a host."""
+        return self._profiles.get(host.lower())
+
+    def record(self, profile: InfrastructureProfile) -> None:
+        """Record or update an infrastructure profile for a host."""
+        host = profile.host.lower()
+        if not host:
+            return
+
+        if host in self._profiles:
+            existing = self._profiles[host]
+            existing.detection_count += 1
+            existing.last_seen = datetime.now().isoformat()
+            existing.retry_cooldown_seconds = max(existing.retry_cooldown_seconds, profile.retry_cooldown_seconds)
+            # Upgrade provider if more specific
+            if profile.provider != InfrastructureProvider.UNKNOWN and existing.provider == InfrastructureProvider.UNKNOWN:
+                existing.provider = profile.provider
+                existing.challenge_type = profile.challenge_type
+                existing.requires_browser = existing.requires_browser or profile.requires_browser
+                existing.requires_session = existing.requires_session or profile.requires_session
+                existing.passive_work_allowed = existing.passive_work_allowed and profile.passive_work_allowed
+        else:
+            self._profiles[host] = profile
+
+        self._save()
+
+    def is_blocked(self, host: str) -> bool:
+        """Check if a host is known to be infrastructure-blocked."""
+        profile = self.get(host)
+        if not profile:
+            return False
+        return profile.challenge_type not in (ChallengeType.NONE, ChallengeType.AUTH_REQUIRED, ChallengeType.NOT_FOUND)
+
+    def requires_browser(self, host: str) -> bool:
+        """Check if a host requires browser-based access."""
+        profile = self.get(host)
+        return profile.requires_browser if profile else False
+
+    def requires_session(self, host: str) -> bool:
+        """Check if a host requires authenticated session."""
+        profile = self.get(host)
+        return profile.requires_session if profile else False
+
+    def passive_work_allowed(self, host: str) -> bool:
+        """Check if passive work is possible on this host."""
+        profile = self.get(host)
+        return profile.passive_work_allowed if profile else True
+
+    def should_skip_retry(self, host: str) -> bool:
+        """Check if the agent should skip retrying active probes on this host."""
+        profile = self.get(host)
+        if not profile:
+            return False
+        # If we've detected a terminal challenge type, skip retries
+        return profile.challenge_type in (
+            ChallengeType.JS_CHALLENGE,
+            ChallengeType.MANAGED_CHALLENGE,
+            ChallengeType.CAPTCHA,
+            ChallengeType.IP_BLOCK,
+        )
+
+    def get_retry_cooldown(self, host: str) -> int:
+        """Get the retry cooldown in seconds for a host."""
+        profile = self.get(host)
+        return profile.retry_cooldown_seconds if profile else 0
+
+    def all_blocked_hosts(self) -> List[str]:
+        """Get all hosts currently marked as infrastructure-blocked."""
+        return [host for host, p in self._profiles.items() if self.is_blocked(host)]
+
+    def clear(self) -> None:
+        """Clear all cached profiles."""
+        self._profiles.clear()
+        if self._path and self._path.exists():
+            self._path.unlink()
+
+
+def extract_hosts_from_tool_output(stdout: str, stderr: str) -> Set[str]:
+    """Extract hostnames from tool output for infrastructure tracking."""
+    hosts: Set[str] = set()
+    combined = f"{stdout} {stderr}"
+    # Match common hostname patterns in tool output
+    for match in re.finditer(r"https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", combined):
+        hosts.add(match.group(1).lower())
+    for match in re.finditer(r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.(?:com|co\.uk|io|net|org|de|fr|nl|ch|at|be|pl|il|sk))\b", combined):
+        hosts.add(match.group(1).lower())
+    return hosts

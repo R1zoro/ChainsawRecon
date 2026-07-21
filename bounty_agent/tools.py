@@ -9,10 +9,12 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from .canonical_surface import normalize_url
 from .engagement_state import EngagementStateStore
+from .infrastructure import ChallengeType, InfrastructureStore, classify_response, extract_hosts_from_tool_output
 from .retrieval import RetrievalStore
 from .recon_db import (
     NullReconStore,
@@ -25,6 +27,7 @@ from .recon_db import (
 from .sandbox import SandboxRunner
 from .scope import ScopeGuard
 from .skills import get_skill
+from .strategy_memory import StrategyMemory
 from .trace import TraceLogger
 
 
@@ -84,6 +87,17 @@ class ToolRegistry:
         self.active_target = ""
         self.max_actions = max(0, max_actions)
         self.action_count = 0
+
+        self._infra_store: Optional[InfrastructureStore] = None
+        self._strategy_memory: Optional[StrategyMemory] = None
+
+    def set_infrastructure_store(self, store: InfrastructureStore) -> None:
+        """Attach infrastructure store for WAF/challenge awareness."""
+        self._infra_store = store
+
+    def set_strategy_memory(self, memory: StrategyMemory) -> None:
+        """Attach strategy memory for preventing retry loops."""
+        self._strategy_memory = memory
 
     def set_execution_context(self, *, objective_id: str | None = None, hypothesis_id: str | None = None,
                               target: str = "") -> None:
@@ -222,20 +236,91 @@ class ToolRegistry:
         self.rate_limiter.wait()
         result = self.runner.exec(command, timeout)
         self._add_discovered_hosts(result.stdout or "", result.stderr or "")
-        # IP block detection: if 403/429/Cloudflare detected, wait and retry
+
+        # Infrastructure-aware block detection using classify_response
         combined = (result.stdout or "") + " " + (result.stderr or "")
-        if result.exit_code != 0 and any(marker in combined.lower() for marker in ["403", "429", "cloudflare", "waf", "rate limit", "too many requests"]):
-            block_count = getattr(self, "_ip_block_count", 0) + 1
-            self._ip_block_count = block_count
-            if block_count <= 3:
-                wait_time = 60 * block_count  # 60s, 120s, 180s
-                self.trace.write("ip_block_detected", wait_seconds=wait_time, attempt=block_count)
-                time.sleep(wait_time)
-                # Retry once after waiting
-                result = self.runner.exec(command, timeout)
-                self._add_discovered_hosts(result.stdout or "", result.stderr or "")
+        exit_ok = result.exit_code == 0
+
+        # Only classify if the command had an error and looks like HTTP output
+        infra_classified = False
+        infra_profile = None
+        if not exit_ok and any(marker in combined.lower() for marker in ["403", "429", "cloudflare", "waf", "rate limit", "too many requests", "cloudfront", "attention required"]):
+            # Attempt to extract status code, headers, and body from tool output
+            status_code = 0
+            status_match = re.search(r"STATUS:\s*(\d{3})", combined)
+            if status_match:
+                status_code = int(status_match.group(1))
+            elif re.search(r"(403|429|503|520|521|522|523|524|525|526)", combined):
+                for code in [403, 429, 503, 520, 521, 522, 523, 524, 525, 526]:
+                    if str(code) in combined:
+                        status_code = code
+                        break
+
+            # Extract headers from stdout if present
+            headers_raw = {}
+            header_section = ""
+            header_match = re.search(r"HEADERS: (\{.*?\}|\[.*?\])", combined, re.DOTALL)
+            if header_match:
+                header_section = header_match.group(1)
+                try:
+                    headers_raw = json.loads(header_section)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # Extract body excerpt
+            body_match = re.search(r"BODY: (.+)", combined, re.DOTALL)
+            body_excerpt = body_match.group(1)[:2000] if body_match else ""
+            if not body_excerpt:
+                body_excerpt = combined[:2000]
+
+            # Use class-wide infrastructure store if available
+            try:
+                if status_code >= 400:
+                    infra_profile = classify_response(status_code, headers_raw or None, body_excerpt)
+                    infra_classified = True
+                    # Record in infrastructure store
+                    if hasattr(self, '_infra_store') and self._infra_store:
+                        self._infra_store.record(infra_profile)
+
+                    # Don't retry if the challenge is terminal (needs browser, IP blocked)
+                    if infra_profile.challenge_type in (
+                        ChallengeType.JS_CHALLENGE,
+                        ChallengeType.MANAGED_CHALLENGE,
+                        ChallengeType.IP_BLOCK,
+                    ):
+                        # No retry — just return the classified result
+                        self._ip_block_count = 0
+                        content = (
+                            f"exit_code={result.exit_code} timed_out={result.timed_out}\n"
+                            f"--- stdout ---\n{_truncate(result.stdout)}\n"
+                            f"--- stderr ---\n{_truncate(result.stderr)}\n"
+                            f"--- infrastructure ---\n"
+                            f"provider={infra_profile.provider.value}\n"
+                            f"challenge={infra_profile.challenge_type.value}\n"
+                            f"needs_browser={infra_profile.requires_browser}\n"
+                            f"needs_session={infra_profile.requires_session}\n"
+                        )
+                        return ToolResult(False, content, {"infra_detected": True, "infra_profile": infra_profile.to_dict()})
+            except Exception:
+                infra_classified = False
+
+            # Fallback: original retry logic for non-classified blocks
+            if not infra_classified:
+                block_count = getattr(self, "_ip_block_count", 0) + 1
+                self._ip_block_count = block_count
+                if block_count <= 3:
+                    wait_time = 60 * block_count  # 60s, 120s, 180s
+                    self.trace.write("ip_block_detected", wait_seconds=wait_time, attempt=block_count)
+                    time.sleep(wait_time)
+                    # Retry once after waiting
+                    result = self.runner.exec(command, timeout)
+                    self._add_discovered_hosts(result.stdout or "", result.stderr or "")
+            # Also update ip_block_count even if classified, to prevent infinite retries
+            elif infra_profile and infra_profile.retry_cooldown_seconds > 0:
+                setattr(self, "_ip_block_count", (getattr(self, "_ip_block_count", 0) + 1))
         else:
             self._ip_block_count = 0
+
         content = (
             f"exit_code={result.exit_code} timed_out={result.timed_out}\n"
             f"--- stdout ---\n{_truncate(result.stdout)}\n"

@@ -9,10 +9,13 @@ from pathlib import Path
 
 from .config import AgentSettings, ProgramScope
 from .browser_evidence import parse_har
+from .canonical_surface import CanonicalSurfaceManager
 from .engagement_state import EngagementStateStore, extract_hosts
+from .infrastructure import InfrastructureStore
 from .llm import ChatMessage, LLMClient, NullLLMClient, OpenAICompatibleClient
 from .mapping import MappingCoordinator
 from .prompts import build_system_prompt, deterministic_recon_plan
+from .strategy_memory import StrategyMemory
 from .report import write_engagement_report, write_report
 from .retrieval import NullRetrievalStore, RetrievalStore
 from .recon_db import NullReconStore, ReconStore, promote_run_facts
@@ -61,6 +64,15 @@ class BountyAgent:
         self.priority_targets = self._sanitize_target_list(self.priority_targets)
         self.pending_targets = self._prioritize_targets(self.pending_targets)
         self.runner = self._build_runner()
+
+        # Infrastructure store for WAF/challenge awareness (create before tools)
+        infra_path = self.workspace / "infrastructure.json"
+        self.infrastructure_store = InfrastructureStore(infra_path)
+
+        # Strategy memory for preventing retry loops (create before tools)
+        strategy_path = self.workspace / "strategy_memory.json"
+        self.strategy_memory = StrategyMemory(strategy_path)
+
         self.tools = ToolRegistry(
             self.runner,
             self.scope_guard,
@@ -75,7 +87,33 @@ class BountyAgent:
             run_id=self.run_dir.name,
             max_actions=settings.max_steps,
         )
+        # Attach infrastructure-aware stores to tools for WAF classification
+        self.tools.set_infrastructure_store(self.infrastructure_store)
+        self.tools.set_strategy_memory(self.strategy_memory)
+
+        # Canonical surface manager for target queue deduplication
+        self.canonical_surface_mgr = CanonicalSurfaceManager()
+        # Apply canonical dedup to initial targets (strips CF tokens, normalizes)
+        self.session_targets = self._deduplicate_targets(self.session_targets)
+        self.initial_targets = self._deduplicate_targets(self.initial_targets)
+        self.pending_targets = self._deduplicate_targets(self.pending_targets)
+        self.priority_targets = self._deduplicate_targets(self.priority_targets)
+
         self.llm = self._build_llm()
+
+    def _deduplicate_targets(self, targets: list[str]) -> list[str]:
+        """Deduplicate a target list using the canonical surface manager."""
+        if not targets:
+            return targets
+        # Register all (preserves original for tracking) and return canonical URLs
+        canonical = []
+        seen = set()
+        for t in targets:
+            surface = self.canonical_surface_mgr.register(t)
+            if surface.surface_key not in seen:
+                seen.add(surface.surface_key)
+                canonical.append(surface.canonical_url)
+        return canonical
 
     def run(self) -> Path:
         try:
