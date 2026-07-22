@@ -242,14 +242,178 @@ class EngagementStateStore:
         self.conn.close()
 
 
+# Invalid host tokens that appear when shell/tool text is misparsed as a host
+_INVALID_HOST_TOKENS: frozenset[str] = frozenset(
+    {
+        "nuclei",
+        "dalfox",
+        "sqlmap",
+        "httpx",
+        "katana",
+        "ffuf",
+        "gobuster",
+        "feroxbuster",
+        "dirsearch",
+        "nmap",
+        "nikto",
+        "whatweb",
+        "wafw00f",
+        "arjun",
+        "inql",
+        "clairvoyance",
+        "grapeql",
+        "commix",
+        "xsstrike",
+        "trufflehog",
+        "curl",
+        "wget",
+        "bash",
+        "sh",
+        "python",
+        "python3",
+        "node",
+        "npm",
+        "true",
+        "false",
+        "null",
+        "none",
+        "undefined",
+        "local",
+        "host",
+        "localhost",
+    }
+)
+
+# Host suffixes that indicate infrastructure-only (CDN/analytics/SaaS) targets
+_NOISE_HOST_SUFFIXES: tuple[str, ...] = (
+    "cloudfront.net",
+    "tealiumiq.com",
+    "tiqcdn.com",
+    "demdex.net",
+    "doubleclick.net",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "gstatic.com",
+    "googleapis.com",
+    "segment.com",
+    "mixpanel.com",
+    "intercom.io",
+    "zendesk.com",
+    "crisp.chat",
+    "hotjar.com",
+    "fullstory.com",
+    "heap.io",
+    "amplitude.com",
+    "auth0.com",
+    "okta.com",
+    "jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "unpkg.com",
+    "npmjs.com",
+    "github.com",
+    "githubusercontent.com",
+    "stackoverflow.com",
+    "medium.com",
+    "snyk.io",
+    "cve.mitre.org",
+    "nvd.nist.gov",
+    "cvedetails.com",
+    "bugcrowd.com",
+    "hackerone.com",
+    "yeswehack.com",
+    "linkedin.com",
+    "twitter.com",
+    "facebook.com",
+    "instagram.com",
+    "bing.com",
+    "google.com",
+    "google.co.in",
+    "google.co.uk",
+    "builder.io",
+    "bugherd.com",
+    "brightcove.net",
+    "brightcove.com",
+    "irmau.com",
+    "mutinycdn.com",
+    "cookiebot.com",
+    "evil.com",
+)
+
+# Host prefixes that are almost always infrastructure-only
+_NOISE_HOST_PREFIXES: tuple[str, ...] = (
+    "analytics.",
+    "cdn.",
+    "assets.",
+    "static.",
+    "gdpr.",
+    "tags.",
+    "metrics.",
+    "smetrics.",
+    "pixel.",
+    "pixels.",
+    "tracking.",
+    "telemetry.",
+    "beacon.",
+)
+
+# Markers that indicate a value is a shell command, not a host
+_INVALID_HOST_MARKERS: tuple[str, ...] = (
+    " ",
+    "\t",
+    "for t in",
+    "command -v",
+    "verify_",
+    "create_hypothesis",
+    "create_verifier",
+    "create_objective",
+    "cd ",
+    "&&",
+    "||",
+    ";",
+    "|",
+    "$(",
+    "${",
+    "`",
+)
+
+
+def _is_noise_host(host: str) -> bool:
+    """Filter out CDN/analytics, private IPs, tool-name garbage, and invalid hosts."""
+    if not host:
+        return True
+    lowered = host.lower().strip().strip(".")
+    if not lowered:
+        return True
+    if lowered in _INVALID_HOST_TOKENS:
+        return True
+    if any(marker in lowered for marker in _INVALID_HOST_MARKERS):
+        return True
+    if "." not in lowered:
+        return True
+    if "/" in lowered or "\\" in lowered:
+        return True
+    if lowered.startswith(("192.168.", "10.", "127.", "169.254.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")):
+        return True
+    if ".uat." in f".{lowered}." or lowered.startswith("uat.") or lowered.endswith(".uat"):
+        return True
+    if any(lowered == suffix or lowered.endswith("." + suffix) for suffix in _NOISE_HOST_SUFFIXES):
+        return True
+    if any(lowered.startswith(prefix) for prefix in _NOISE_HOST_PREFIXES):
+        return True
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+", lowered):
+        return True
+    return False
+
+
 def extract_hosts(text: str) -> set[str]:
+    """Extract candidate hosts from text, rejecting noise, tool names, and commands."""
     hosts: set[str] = set()
     for value in re.findall(
         r"https?://[^\s'\"<>]+|(?<![A-Za-z0-9.-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?![A-Za-z0-9.-])",
         text,
     ):
         host = urlparse(value).hostname if "://" in value else value.strip().lower()
-        if host and host not in {"localhost", "host", "example.com"}:
+        if host and not _is_noise_host(host):
             hosts.add(host.lower())
     return hosts
 

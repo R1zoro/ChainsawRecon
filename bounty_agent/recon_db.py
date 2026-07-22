@@ -597,7 +597,7 @@ def build_attack_results_from_action_result(
                 auth_context=surface.auth_context,
                 outcome=outcome,
                 source=source,
-                evidence=_short(content),
+                evidence=_summarize_evidence(content),
                 tags=tuple(_attack_tags(text, name, outcome, attack_type)),
                 meta={
                     "surface_type": surface.surface_type,
@@ -618,12 +618,46 @@ def build_attack_results_from_action_result(
                 auth_context="verified",
                 outcome="confirmed",
                 source=source,
-                evidence=_short(" ".join(str(action.get(k, "")) for k in ("request", "response", "evidence"))),
+                evidence=_summarize_evidence(" ".join(str(action.get(k, "")) for k in ("request", "response", "evidence"))),
                 tags=("finding",),
                 meta={"severity": action.get("severity", "")},
             )
         )
     return results
+
+
+def _summarize_evidence(content: str) -> str:
+    """Extract compact, response-focused evidence from command output.
+
+    Pulls HTTP status code, content-type, and a short body excerpt (<=200 chars),
+    stripping the command line itself so reports show results, not commands.
+    """
+    if not content:
+        return ""
+    text = content.strip()
+    # Drop a leading command echo line if present (e.g. "$ curl ..." or "command: ...")
+    text = re.sub(r"^(?:command:|cmd:|\$\s).*?\n", "", text, flags=re.I)
+    status = ""
+    status_match = re.search(r"(?:status[:\s]+|HTTP/\d(?:\.\d)?\s+)(\d{3})\b", text, re.I)
+    if not status_match:
+        status_match = re.search(r"\b(401|403|404|429|500|502|503)\b", text)
+    if status_match:
+        status = f"HTTP {status_match.group(1)}"
+    ct_match = re.search(r"content-type[:\s]+([^\s,;]+)", text, re.I)
+    content_type = ct_match.group(1) if ct_match else ""
+    body = ""
+    body_match = re.search(r"body[:\s]+(.+)", text, re.DOTALL | re.I)
+    if body_match:
+        body = body_match.group(1).strip()[:200]
+    if not body:
+        # Use a compact excerpt of the response, excluding the command echo
+        lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith(("command", "cmd", "$"))]
+        if lines:
+            body = " ".join(lines)[:200]
+    parts = [p for p in (status, content_type, body) if p]
+    if not parts:
+        return _short(text, 200)
+    return " | ".join(parts)
 
 
 def promote_run_facts(run_store: ReconStore, engagement_store: ReconStore, run_id: str) -> int:
@@ -723,19 +757,274 @@ _BUILTIN_EXCLUDED_HOSTS: set[str] = {
     "127.0.0.1",
     "localhost",
     "host",
+    "evil.com",
+    "example.com",
+    "example.org",
+    "example.net",
+    "test.com",
+    "localhost.localdomain",
 }
+
+# Suffixes for CDN/analytics/SaaS infrastructure that should not become surfaces/targets
+_NOISE_HOST_SUFFIXES: tuple[str, ...] = (
+    "cloudfront.net",
+    "tealiumiq.com",
+    "tiqcdn.com",
+    "demdex.net",
+    "doubleclick.net",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "gstatic.com",
+    "googleapis.com",
+    "googlevideo.com",
+    "segment.com",
+    "segment.io",
+    "mixpanel.com",
+    "intercom.io",
+    "zendesk.com",
+    "crisp.chat",
+    "hotjar.com",
+    "fullstory.com",
+    "heap.io",
+    "heap.com",
+    "amplitude.com",
+    "auth0.com",
+    "okta.com",
+    "pingidentity.com",
+    "duosecurity.com",
+    "jsdelivr.net",
+    "cdnjs.cloudflare.com",
+    "unpkg.com",
+    "npmjs.com",
+    "github.com",
+    "githubusercontent.com",
+    "stackoverflow.com",
+    "stackexchange.com",
+    "medium.com",
+    "snyk.io",
+    "cve.mitre.org",
+    "nvd.nist.gov",
+    "cvedetails.com",
+    "bugcrowd.com",
+    "hackerone.com",
+    "yeswehack.com",
+    "linkedin.com",
+    "twitter.com",
+    "facebook.com",
+    "instagram.com",
+    "bing.com",
+    "google.com",
+    "google.co.in",
+    "google.co.uk",
+    "builder.io",
+    "bugherd.com",
+    "brightcove.net",
+    "brightcove.com",
+    "irmau.com",
+    "mutinycdn.com",
+    "cookiebot.com",
+    "newrelic.com",
+    "nr-data.net",
+    "sentry.io",
+    "datadoghq.com",
+    "cloudflare.com",
+    "cloudflareinsights.com",
+    "akamaihd.net",
+    "akamaized.net",
+    "fastly.net",
+    "edgekey.net",
+    "edgesuite.net",
+)
+
+# Host prefixes that are almost always infrastructure-only
+_NOISE_HOST_PREFIXES: tuple[str, ...] = (
+    "analytics.",
+    "cdn.",
+    "assets.",
+    "static.",
+    "gdpr.",
+    "tags.",
+    "metrics.",
+    "smetrics.",
+    "pixel.",
+    "pixels.",
+    "tracking.",
+    "telemetry.",
+    "beacon.",
+)
+
+# Bare tokens that appear when shell/tool text is misparsed as a host
+_INVALID_HOST_TOKENS: frozenset[str] = frozenset(
+    {
+        "nuclei",
+        "dalfox",
+        "sqlmap",
+        "httpx",
+        "katana",
+        "ffuf",
+        "gobuster",
+        "feroxbuster",
+        "dirsearch",
+        "nmap",
+        "nikto",
+        "whatweb",
+        "wafw00f",
+        "arjun",
+        "inql",
+        "clairvoyance",
+        "grapeql",
+        "commix",
+        "xsstrike",
+        "trufflehog",
+        "curl",
+        "wget",
+        "bash",
+        "sh",
+        "python",
+        "python3",
+        "node",
+        "npm",
+        "true",
+        "false",
+        "null",
+        "none",
+        "undefined",
+        "local",
+        "host",
+        "localhost",
+    }
+)
+
+_INVALID_HOST_MARKERS: tuple[str, ...] = (
+    " ",
+    "\t",
+    "for t in",
+    "command -v",
+    "verify_",
+    "create_hypothesis",
+    "create_verifier",
+    "create_objective",
+    "cd ",
+    "&&",
+    "||",
+    ";",
+    "|",
+    "$(",
+    "${",
+    "`",
+)
+
+
+def is_noise_host(host: str) -> bool:
+    """Public alias for noise/infrastructure host filtering."""
+    return _is_noise_host(host)
 
 
 def _is_noise_host(host: str) -> bool:
-    """Filter out known third-party CDN/analytics and localhost noise hosts."""
+    """Filter out CDN/analytics, private IPs, tool-name garbage, and invalid hosts."""
     if not host:
         return True
-    lowered = host.lower().strip(".")
-    if lowered in _BUILTIN_EXCLUDED_HOSTS:
+    lowered = host.lower().strip().strip(".")
+    if not lowered:
         return True
-    if lowered.startswith(("192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")):
+    if lowered in _BUILTIN_EXCLUDED_HOSTS or lowered in _INVALID_HOST_TOKENS:
+        return True
+    if any(marker in lowered for marker in _INVALID_HOST_MARKERS):
+        return True
+    # Reject single-label hosts and bare tool/command tokens
+    if "." not in lowered:
+        return True
+    if "/" in lowered or "\\" in lowered:
+        return True
+    # Private / link-local ranges
+    if lowered.startswith(
+        (
+            "192.168.",
+            "10.",
+            "127.",
+            "169.254.",
+            "172.16.",
+            "172.17.",
+            "172.18.",
+            "172.19.",
+            "172.20.",
+            "172.21.",
+            "172.22.",
+            "172.23.",
+            "172.24.",
+            "172.25.",
+            "172.26.",
+            "172.27.",
+            "172.28.",
+            "172.29.",
+            "172.30.",
+            "172.31.",
+        )
+    ):
+        return True
+    # UAT / non-prod labels often unreachable and out of productive scope
+    if ".uat." in f".{lowered}." or lowered.startswith("uat.") or lowered.endswith(".uat"):
+        return True
+    if any(lowered == suffix or lowered.endswith("." + suffix) for suffix in _NOISE_HOST_SUFFIXES):
+        return True
+    if any(lowered.startswith(prefix) for prefix in _NOISE_HOST_PREFIXES):
+        return True
+    # Must look like a domain (labels of alnum/hyphen)
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+", lowered):
         return True
     return False
+
+
+def is_valid_surface_url(url: str) -> bool:
+    """Public alias for URL sanitization used by surfaces/facts/queue builders."""
+    return _is_valid_surface_url(url)
+
+
+def _is_valid_surface_url(url: str) -> bool:
+    """Reject truncated, regex-pattern, placeholder, or tool-command URLs."""
+    if not url or len(url) < 10:
+        return False
+    cleaned = url.strip()
+    if not cleaned.startswith(("http://", "https://")):
+        return False
+    # Regex / template / shell metacharacters indicate truncated or invented URLs
+    if any(ch in cleaned for ch in ("{", "}", "[", "]", "^", "$", "|", "+", "\\", "`", "<", ">")):
+        return False
+    if cleaned.endswith(("{", "[", "/", "?", "&", "=", "#")):
+        return False
+    lowered = cleaned.lower()
+    host = (urlparse(cleaned).hostname or "").lower()
+    path = urlparse(cleaned).path.lower()
+    # Reject URLs where a tool name appears in the host or as a path segment
+    tool_names = ("nuclei", "dalfox", "sqlmap", "httpx", "katana", "ffuf", "gobuster", "dirsearch", "nikto", "whatweb", "wafw00f")
+    if any(tool in host for tool in tool_names):
+        return False
+    if any(f"/{tool}" in path or f"/{tool}/" in path or path == f"/{tool}" for tool in tool_names):
+        return False
+    # Reject URLs containing shell/command markers or template patterns
+    if any(
+        marker in lowered
+        for marker in (
+            "command -v",
+            "for t in",
+            "verify_",
+            "create_hypothesis",
+            "create_verifier",
+            "create_objective",
+        )
+    ):
+        return False
+    # Reject URLs with regex/template metacharacters (already checked above) and fuzz/payload paths
+    if "fuzz" in path or "payload" in path:
+        return False
+    if not host or _is_noise_host(host):
+        return False
+    # Require a plausible TLD (at least 2 alpha chars)
+    if not re.search(r"\.[a-z]{2,}$", host.lower()) and not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
+        return False
+    return True
 
 
 def _surface_fingerprint(surface_key: str, surface_type: str, auth_context: str) -> str:
@@ -954,15 +1243,35 @@ def _extract_urls(text: str) -> list[str]:
     urls: list[str] = []
     for value in re.findall(r"https?://[^\s\"'<>]+", text):
         cleaned = value.rstrip(".,);]}")
+        if not _is_valid_surface_url(cleaned):
+            continue
         if cleaned not in urls:
             urls.append(cleaned)
     return urls[:200]
 
 
 def _path_pattern(path: str) -> str:
+    """Normalize path segments into stable patterns.
+
+    Collapses numeric ids, long hex runs, and full UUIDs (with or without
+    hyphens) into /{id} / {hex} / {uuid} so that 150 per-resource UUID variants
+    collapse to a single surface instead of polluting the target queue.
+    """
     path = path or "/"
+    # Full UUIDs (8-4-4-4-12, with or without surrounding hyphens) -> {uuid}
+    path = re.sub(
+        r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)",
+        "/{uuid}",
+        path,
+        flags=re.I,
+    )
+    # Bare 32-char hex (no hyphens) -> {uuid}
+    path = re.sub(r"/[0-9a-f]{32}(?=/|$)", "/{uuid}", path, flags=re.I)
+    # Numeric ids -> {id}
     path = re.sub(r"/[0-9]+(?=/|$)", "/{id}", path)
-    return re.sub(r"/[a-f0-9]{8,}(?=/|$)", "/{hex}", path, flags=re.I)
+    # Remaining long hex runs -> {hex}
+    path = re.sub(r"/[a-f0-9]{8,}(?=/|$)", "/{hex}", path, flags=re.I)
+    return path
 
 
 def _present_tools(content: str) -> list[str]:

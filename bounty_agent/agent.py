@@ -901,10 +901,49 @@ class BountyAgent:
         self.pending_targets = self._prioritize_targets(self.pending_targets)
         return additions
 
+    def _is_infrastructure_only_host(self, host: str) -> bool:
+        """Reject CDN/analytics/SaaS/UAT hosts that are never productive targets."""
+        if not host:
+            return True
+        lowered = host.lower().strip().strip(".")
+        if not lowered:
+            return True
+        if lowered.startswith(("192.168.", "10.", "127.", "169.254.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")):
+            return True
+        infra_suffixes = (
+            "cloudfront.net", "tealiumiq.com", "tiqcdn.com", "demdex.net", "doubleclick.net",
+            "google-analytics.com", "googletagmanager.com", "gstatic.com", "googleapis.com",
+            "googlevideo.com", "segment.com", "mixpanel.com", "intercom.io", "zendesk.com",
+            "crisp.chat", "hotjar.com", "fullstory.com", "heap.io", "amplitude.com",
+            "auth0.com", "okta.com", "jsdelivr.net", "cdnjs.cloudflare.com", "unpkg.com",
+            "npmjs.com", "github.com", "githubusercontent.com", "stackoverflow.com",
+            "medium.com", "snyk.io", "cve.mitre.org", "nvd.nist.gov", "cvedetails.com",
+            "bugcrowd.com", "hackerone.com", "yeswehack.com", "linkedin.com", "twitter.com",
+            "facebook.com", "instagram.com", "bing.com", "google.com", "google.co.in",
+            "google.co.uk", "builder.io", "bugherd.com", "brightcove.net", "brightcove.com",
+            "irmau.com", "mutinycdn.com", "cookiebot.com", "evil.com", "example.com",
+            "example.org", "example.net", "test.com", "cloudflare.com", "akamaihd.net",
+            "akamaized.net", "fastly.net", "edgekey.net", "edgesuite.net", "newrelic.com",
+            "nr-data.net", "sentry.io", "datadoghq.com", "cloudflareinsights.com",
+        )
+        if any(lowered == s or lowered.endswith("." + s) for s in infra_suffixes):
+            return True
+        infra_prefixes = (
+            "analytics.", "cdn.", "assets.", "static.", "gdpr.", "tags.", "metrics.",
+            "smetrics.", "pixel.", "pixels.", "tracking.", "telemetry.", "beacon.",
+        )
+        if any(lowered.startswith(p) for p in infra_prefixes):
+            return True
+        if ".uat." in f".{lowered}." or lowered.startswith("uat.") or lowered.endswith(".uat"):
+            return True
+        return False
+
     def _collect_discovered_targets(self) -> list[str]:
         candidates: list[str] = []
         for fact in self.run_recon.facts():
             if fact.kind == "host":
+                if self._is_infrastructure_only_host(fact.value):
+                    continue
                 normalized = self._normalize_discovered_target(fact.value)
                 if normalized:
                     candidates.append(normalized)
@@ -915,9 +954,10 @@ class BountyAgent:
                     candidates.append(normalized)
         for surface in self._merged_surfaces():
             if self._is_interesting_surface(surface):
-                normalized = self._normalize_discovered_target(surface.host)
-                if normalized:
-                    candidates.append(normalized)
+                if not self._is_infrastructure_only_host(surface.host):
+                    normalized = self._normalize_discovered_target(surface.host)
+                    if normalized:
+                        candidates.append(normalized)
             url = str((surface.meta or {}).get("url", "")).strip()
             if url and self._is_interesting_surface(surface):
                 normalized = self._normalize_discovered_target(url)

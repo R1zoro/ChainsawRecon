@@ -377,20 +377,23 @@ class ToolRegistry:
     def _write_file(self, action: dict[str, Any]) -> ToolResult:
         path = str(action.get("path", "")).strip()
         if not path:
-            return ToolResult(False, "Missing file path.")
+            return ToolResult(False, "Missing file path. Include 'path' key with the file path.")
         repeat_result = self._check_repeated_write(path)
         if repeat_result:
             return repeat_result
-        if "content" not in action:
+        # Accept 'content' as the primary field; also accept 'data' for flexibility
+        content = action.get("content") or action.get("data")
+        if content is None:
             guidance = _artifact_contract_guidance(path or "output.txt")
             return ToolResult(
                 False,
                 "write_file requires a 'content' field with the file body. "
-                "Include the full file text in the JSON action itself, not just the path.\n"
+                "(The 'data' field is also accepted.) "
+                "Include the full file text as a string in the JSON action itself.\n"
                 f"Repair guidance:\n{guidance}",
                 {"write_rejected": True, "path": path, "reason": "missing_content_field"},
             )
-        content = str(action.get("content", ""))
+        content = str(content)
         empty_reason = _reject_empty_workspace_write(path, content)
         if empty_reason:
             guidance = _artifact_contract_guidance(path)
@@ -1098,33 +1101,24 @@ def _validate_command_safety(command: str) -> ToolResult | None:
     if "command -v" in lowered:
         return None
     scanner_rate_hints = {
-        "ffuf": [" -rate ", " -t 1", " -t 2", " -t 3", " -t 4", " -t 5"],
-        "nuclei": [" -rl ", " -rate-limit ", " -c 1", " -concurrency 1", " -c 2", " -concurrency 2"],
-        "httpx": [" -rl ", " -rate-limit ", " -threads 1", " -threads 2", " -threads 3", " -threads 4", " -threads 5"],
-        "katana": [" -rl ", " -rate-limit ", " -c 1", " -concurrency 1", " -c 2", " -concurrency 2"],
-        "gobuster": [" -t 1", " -t 2", " -t 3", " -t 4", " -t 5", " --delay "],
-        "dirsearch": [" --max-rate ", " -t 1", " -t 2", " -t 3", " -t 4", " -t 5"],
-        "sqlmap": [" --delay=", " --threads=1", " --safe-url", " --batch"],
+        "ffuf": [" -rate", " --rate", " -t 1", " -t 2", " -t 3", " -t 4", " -t 5"],
+        "nuclei": [" -rl ", " -rate-limit", " -rate", " --rate", " -c ", " -concurrency", " --concurrency", " -t 1", " -t 2"],
+        "httpx": [" -rl ", " -rate-limit", " -rate", " --rate", " -threads", " --threads", " -c ", " -t "],
+        "katana": [" -rl ", " -rate-limit", " -rate", " --rate", " -c ", " -concurrency", " --concurrency", " -t "],
+        "gobuster": [" -t ", " --delay ", " --rate "],
+        "dirsearch": [" --max-rate ", " -t ", " --rate "],
+        "sqlmap": [" --delay=", " --threads=", " --safe-url", " --batch"],
     }
-    # Check each pipe segment separately for rate flags
-    # Allow if ANY segment has rate flags (not all segments need them)
-    segments = lowered.split("|")
-    has_any_rate_flag = any(
-        any(hint in f" {seg.strip()} " for hint in hints)
-        for seg in segments
-        for hints in scanner_rate_hints.values()
-    )
-    if has_any_rate_flag:
-        return None
-    for segment in segments:
-        seg_padded = f" {segment.strip()} "
-        for tool, required_any in scanner_rate_hints.items():
-            if re.search(rf"(^|[;&]\s*){tool}\b|\s{tool}\b", segment) and not any(hint in seg_padded for hint in required_any):
+    # Accept if ANY rate/concurrency/t thread flag is present in the command
+    command_padded = f" {lowered} "
+    for tool, hints in scanner_rate_hints.items():
+        if re.search(rf"(^|[;&]\s*){tool}\b|\s{tool}\b", lowered):
+            if not any(hint in command_padded for hint in hints):
                 return ToolResult(
                     False,
                     (
                         f"{tool} command blocked because it lacks explicit low-rate/concurrency controls. "
-                        "Add the tool's rate, delay, or low-thread flags according to the program policy."
+                        "Add flags like --rate 1, --concurrency 1, -t 1, or --batch."
                     ),
                     {"rate_guard_blocked": True, "tool": tool},
                 )

@@ -1,203 +1,195 @@
 # ChainsawRecon
 
-ChainsawRecon is a scope-aware, local-LLM bug-bounty reconnaissance and validation agent. It runs approved security tooling inside a Docker sandbox, keeps an auditable trace of every model decision and command, and turns useful observations into durable engagement knowledge.
+**ChainsawRecon** is an autonomous, scope-aware AI penetration testing and security assessment agent. It orchestrates security tools inside an isolated Docker sandbox, builds a stateful world model of web applications and APIs, and executes hypothesis-driven experiments with concrete evidence validation.
 
-It is designed to assist authorized testing only. The program scope and rules in an engagement are the source of truth.
+Designed for authorized penetration testing, security audits, and defensive surface assessment, ChainsawRecon bridges high-level AI reasoning with deterministic, auditable execution.
 
-## What It Does
+---
 
-- Starts from an engagement rather than a single URL, so all declared in-scope assets can enter a shared target queue.
-- Moves through mapping, recon, and attack work while retaining evidence and coverage state across targets.
-- Uses a local OpenAI-compatible model server such as Ollama; the model proposes compact JSON actions and never receives host-shell access.
-- Executes approved tools in one Docker sandbox per run with scope checks, command-rate limits, and artifact validation.
-- Maintains two layers of memory: a disposable run database and a curated engagement database promoted after the run.
-- Writes compact reports, a validation queue, and reusable asset catalogs for both future runs and manual testing.
-- Supports API, GraphQL, JavaScript, source-map, authentication-surface, and conventional web reconnaissance workflows.
+## 🌟 Key Features
 
-Read the detailed system description in [architecture.md](architecture.md).
+* **Stateful World Model & Engagement Memory:** Maintains persistent relational state (organizations, applications, services, routes, endpoints, auth contexts, technologies) across test runs rather than treating each target in isolation.
+* **Hypothesis Lifecycle & Objective-Driven Work:** Moves beyond tool-centric output. Replaces raw scanner outputs with structured hypothesis tracking (`observed` $\rightarrow$ `suspected` $\rightarrow$ `evidence_required` $\rightarrow$ `experiment_planned` $\rightarrow$ `reproduced` $\rightarrow$ `validated`/`rejected`).
+* **Isolated Sandbox Execution:** All command execution occurs inside a locked-down Docker container. The LLM never has host-shell access or direct system access.
+* **Scope Guard & Rate Control:** Strict pre-execution scope verification for every single outbound tool request, with configurable rate limits and request spacing.
+* **Multi-Modal Evidence Capture:** Imports and normalizes HTTP requests/responses, HAR browser captures, technology playbooks, and static source-code analysis into canonical, replayable evidence items.
+* **Independent Validation Engine:** Findings follow an evidence ladder and must pass independent replay and differential control testing before classification.
+* **Human-Readable Catalogs & Machine-Readable State:** Generates both SQLite/JSON knowledge graphs for AI reasoning and clean Markdown/TSV catalogs for manual testing and reporting.
 
-## Prerequisites
+---
 
-- Python 3.10+
-- Docker Desktop running
-- Ollama running locally, with a compatible model already pulled
-- An authorized engagement folder created from `engagements/_template`
+## 🛠️ Architecture & How It Works
 
-Build or rebuild the Docker image whenever `sandbox/Dockerfile.sandbox` changes:
+ChainsawRecon operates across four structured layers:
 
-```powershell
-docker build --pull --no-cache -f sandbox/Dockerfile.sandbox -t bounty-sandbox:latest .
+1. **AI Orchestration & Reasoning Layer:** The Coordinator model receives target scope, current world model state, coverage gaps, and active security objectives. It selects structured JSON actions rather than executing unverified shell commands.
+2. **Worker & Strategy Layer:** Bounded execution flows handle specialized tasks (Target Mapping, Technology Analysis, API/GraphQL Surface Probing, Auth Context Evaluation, and Result Validation).
+3. **Tool & Sandbox Execution Layer:** Executes approved tools (`httpx`, `katana`, `nuclei`, `ffuf`, `dalfox`, `sqlmap`, `inql`, `clairvoyance`, etc.) inside a sandboxed environment managed by a strict `ScopeGuard`.
+4. **Data & Knowledge Memory Layer:** Dual-database design featuring a disposable **Run Store** (`recon.db`) for transient trial data and a persistent **Engagement Store** (`knowledge.db`) for verified cross-run intelligence and target topology.
+
+---
+
+## 📋 Prerequisites
+
+* **OS:** Linux, macOS, or Windows (PowerShell/WSL2)
+* **Python:** 3.10 or higher
+* **Docker:** Docker Desktop or Docker Engine running locally
+* **Local LLM Server (Optional / Recommended):** Ollama, vLLM, LM Studio, or any OpenAI-compatible API endpoint.
+* **Git**
+
+---
+
+## 🚀 Quick Start & Setup Guide
+
+### 1. Clone the Repository & Setup Python Environment
+
+```bash
+git clone https://github.com/your-org/ChainsawRecon.git
+cd ChainsawRecon
+
+# Create and activate virtual environment
+python -m venv .venv
+
+# On Linux/macOS:
+source .venv/bin/activate
+# On Windows (PowerShell):
+# .venv\Scripts\Activate.ps1
+
+# Install dependencies in editable mode
+pip install -e .
 ```
 
-The default `--docker-image bounty-sandbox` resolves to the same `:latest` tag, so no CLI change is required. The first build can take a while because Kali packages, Go tools, and Python tools are installed from upstream sources.
+### 2. Build the Docker Execution Sandbox
 
-Optionally confirm that the key commands are present after the build:
+The security tools run inside a dedicated Docker container (`testing-sandbox`). Build the image locally:
 
-```powershell
-docker run --rm bounty-sandbox:latest bash -lc "command -v httpx nuclei katana inql clairvoyance grapeql feroxbuster dalfox"
+```bash
+docker build --pull --no-cache -f sandbox/Dockerfile.sandbox -t testing-sandbox:latest .
 ```
 
-Some optional Python packages are intentionally non-fatal in the Dockerfile because upstream package/CLI names can change. A missing command in this check means that tool should not be selected until the image recipe is adjusted and rebuilt.
+> **Note:** The initial build installs security utilities, Go binaries, and web runtime tools (e.g., `httpx`, `katana`, `nuclei`, `ffuf`, `dalfox`, `sqlmap`, `inql`). This may take a few minutes.
 
-## Create an Engagement
+Verify sandbox tool installation:
 
-```powershell
-Copy-Item -Recurse engagements\_template engagements\acme
+```bash
+docker run --rm bounty-sandbox:latest bash -lc "command -v httpx nuclei katana inql feroxbuster dalfox"
 ```
 
-Populate the engagement before executing anything:
+### 3. Start Your Local LLM Provider (e.g., Ollama)
 
-```text
-engagements/acme/
-  program/
-    scope.json          # machine-readable scope and rate limits
-    in-scope.txt        # optional additional in-scope assets
-    out-of-scope.txt    # exclusions
-    rules.md            # program rules and constraints
-    prompt.md           # concise program-specific testing context
-    secrets.env         # optional local-only auth material; do not commit
-    priority-targets.txt # optional endpoints to deep-test first
-  manual/               # operator notes and report drafts
-  agent/                # generated database, asset catalog, reports, and runs
+Ensure your LLM provider is running locally and serving an OpenAI-compatible API endpoint:
+
+```bash
+# Example with Ollama:
+ollama serve
+# Pull your preferred model (e.g., Qwen2.5-Coder, Mistral, Llama-3, etc.)
+ollama pull qwen2.5-coder:14b
 ```
 
-Keep credentials, cookies, reports, and target data out of public commits unless the program explicitly permits disclosure.
+---
 
-## Run the Agent
+## 📁 Setting Up an Engagement Workspace
 
-Your current command shape remains valid. `--target` is optional and should normally be omitted when the engagement already contains scope and seed assets.
+ChainsawRecon organizes assessment data into engagement directories.
+
+### 1. Initialize an Engagement Directory
 
 ```powershell
-python -m bounty_agent.cli `
-  --engagement engagements\<engagement-name> `
-  --mode attack `
-  --provider ollama `
-  --model ollama/chrisdiochavez/ANINOGPT-PILIPINAS-ATAKE:latestv3 `
-  --llm-base-url http://localhost:11434/v1 `
-  --llm-api-key ollama `
-  --runner docker `
-  --docker-image bounty-sandbox `
-  --execute `
-  --max-steps 1500 `
+# Copy template directory
+Copy-Item -Recurse engagements\_template engagements\corporate-audit
+```
+
+### 2. Configure Scope and Rules
+
+Populate the program definition files inside `engagements/corporate-audit/program/`:
+
+* `scope.json`: Machine-readable target domains, CIDRs, and rate limits.
+* `in-scope.txt`: List of authorized target URLs and hostnames.
+* `out-of-scope.txt`: Excluded IP addresses or domains.
+* `rules.md`: Assessment rules, testing windows, and operational constraints.
+* `prompt.md`: High-level security goals or application context for the agent.
+* `secrets.env`: *(Optional)* Auth tokens or test credentials. Keep git-ignored.
+* `priority-targets.txt`: *(Optional)* High-value routes/APIs to assess first.
+
+---
+
+## 💻 Usage & CLI Reference
+
+Run ChainsawRecon against an initialized engagement:
+
+```bash
+python -m bounty_agent.cli \
+  --engagement engagements/corporate-audit \
+  --mode attack \
+  --provider ollama \
+  --model ollama/qwen3.5:4b \
+  --llm-base-url http://localhost:11434/v1 \
+  --llm-api-key ollama \
+  --runner docker \
+  --docker-image testing-sandbox \
+  --execute \
+  --max-steps 1000 \
   --max-commands-per-minute 40
 ```
 
-For a safe planning pass, replace `--execute` with `--dry-run`. Do not use both.
+### Modes of Operation
 
-To enrich an authorized engagement with evidence already collected locally,
-append `--source-dir <local-source-tree>` and/or one or more `--har-file
-<browser-capture.har>` arguments. These inputs are mapped locally; HAR requests
-are not replayed merely because they are imported.
+| Mode | Description | Primary Focus |
+|---|---|---|
+| `mapping` | Asset discovery & target mapping. | Discovers hosts, routes, technologies, JS bundles, and endpoints. No intrusive testing. |
+| `recon` | Active fingerprinting & surface analysis. | Low-rate surface probing, header inspection, and framework classification. |
+| `attack` | Hypothesis generation & evidence-led testing. | Executes safe, structured security experiments based on discovered surfaces. |
+| `auto` | Self-directed phase transition. | Automatically moves from mapping $\rightarrow$ recon $\rightarrow$ attack based on state coverage. |
+| `assistant` | Operator-assisted interactive mode. | Allows explicit external search queries and operator guidance. |
 
-### Modes
+### Key CLI Flags
 
-| Mode | Use |
-|---|---|
-| `mapping` | Build or refresh the asset and surface map. No broad attack work. |
-| `recon` | Perform low-rate discovery and fingerprinting against mapped targets. |
-| `attack` | Runs mapping preflight when necessary, then performs evidence-led verification. |
-| `auto` | Selects a safe next phase from existing mapping and engagement memory. |
-| `assistant` | Operator-led helper mode. Internet search is allowed only here and only when explicitly requested. |
+* `--engagement <path>`: *(Required)* Path to the target engagement folder.
+* `--mode <mapping|recon|attack|auto|assistant>`: Execution mode (default: `auto`).
+* `--execute`: Enables live tool execution inside the sandbox container.
+* `--dry-run`: Runs the planner in simulation mode without executing external commands.
+* `--provider <ollama|openai|custom>`: LLM provider backend type.
+* `--model <model_name>`: Model identifier specified in your provider backend.
+* `--llm-base-url <url>`: API endpoint URL (e.g., `http://localhost:11434/v1`).
+* `--max-steps <int>`: Global step/action budget for the session.
+* `--max-commands-per-minute <int>`: Enforces rate throttling for outbound commands.
+* `--har-file <path.har>`: *(Optional)* Import network traffic captures into the engagement evidence model.
+* `--source-dir <path>`: *(Optional)* Import static source code directory for route and sink analysis.
 
-Autonomous mapping, recon, attack, and auto modes do not use web/GitHub/public-vulnerability searches. They rely on program-provided scope, observed responses, local tools, and stored engagement evidence.
+---
 
-## How a Run Works
+## 🔒 Safety Controls & Execution Boundary
 
-1. The CLI loads program scope, exclusions, saved mapping state, and the target queue.
-2. The agent opens one run database and the engagement knowledge database.
-3. It starts one long-lived Docker sandbox for the run.
-4. Deterministic, low-rate startup checks collect baseline information before model-directed work.
-5. The model receives a compact retrieval context, current target, coverage gaps, and only the highest-value prior facts.
-6. The model emits one JSON action. The agent validates scope, rate limits, repeats, command safety, and artifact quality before executing it.
-7. Results become trace events, run facts, surface records, and test-coverage records. New high-value in-scope targets can join the same run queue.
-8. On completion, promotable facts are curated into engagement memory and the reports/catalogs are regenerated.
+1. **Docker Isolation:** Tools run inside a container with dropped capabilities, non-root execution, and CPU/RAM limits.
+2. **ScopeGuard Enforcement:** Every domain or IP target is verified against `scope.json` before any action executes.
+3. **No Unsanitised Shell Access:** The LLM issues strict JSON-formatted actions (`run_tool`, `write_file`, `http_request`, `finish`), which are parsed and validated deterministically before execution.
+4. **Evidence Ladder:** A raw tool hit never creates a finding directly. It generates an `observation`, which creates a `hypothesis`, requiring an `experiment`, raw `evidence`, and independent `reproduction`.
+5. **WAF & Failure Awareness:** Cloudflare or rate-limiting responses trigger automatic back-off, evidence preservation, and task deferral rather than noisy brute-force attempts.
 
-The global `--max-steps` budget is shared across the entire queue. A target change does not grant a new budget. As the remaining budget becomes small, the agent should focus on highest-value coverage, validation, and reporting rather than open-ended queue expansion.
+---
 
-## Outputs
+## 📊 Artifacts & Outputs
 
-Each run lives under `engagements/<name>/agent/runs/<timestamp>-<seed>/`:
-
-```text
-trace.jsonl             # append-only audit log of model responses and tool results
-session.state.json      # run status, global progress, queue, and artifact locations
-mapping-state.json      # durable structured target map
-report.md               # concise run report
-validation-queue.json   # hypotheses needing confirmation or reproduction
-priority-followups.md   # operator-oriented next actions
-interesting-leads.md    # non-validated leads, kept separate from findings
-auth-surfaces.md        # authentication-relevant surfaces
-workspace/              # validated scripts, evidence, and tool outputs
-recon.db                # disposable run-local database
-```
-
-The engagement directory accumulates curated memory and reusable catalogs:
+After execution, all session records are saved under `engagements/<name>/agent/`:
 
 ```text
-agent/knowledge.db           # curated cross-run recon memory
-agent/knowledge/             # structured objectives, hypotheses, evidence, action accounting, tool manifest
-agent/engagement-report.md   # consolidated readable engagement picture
-agent/catalogs/              # human-friendly shared inventories and architecture summary
-agent/assets/
-  all-surfaces.txt
-  live-hosts.txt
-  urls.txt
-  api-endpoints.txt
-  graphql-endpoints.txt
-  js-bundles.txt
-  source-maps.txt
-  docs-sdk-endpoints.txt
-  auth-surfaces.txt
-  test-progress.tsv
+engagements/<name>/agent/
+├── knowledge.db              # Curated cross-run persistent relational database
+├── engagement-report.md      # Comprehensive executive & technical report
+├── catalogs/                 # Operational human-readable catalogs
+│   ├── architecture.md       # Target topology, services, and tech stack map
+│   ├── routes.json           # Discovered application endpoints and HTTP methods
+│   ├── technologies.json     # Detected software stacks & component playbooks
+│   └── world-model.json      # Exported machine-readable knowledge graph
+└── runs/<timestamp>/         # Execution artifacts per session
+    ├── trace.jsonl           # Complete audit log of every LLM decision & command
+    ├── report.md             # Per-run technical summary
+    ├── session.state.json    # Run status, metrics, and step accounting
+    └── workspace/            # Raw tool outputs, evidence items, and HTTP logs
 ```
 
-`agent/knowledge/` is the machine-readable Phase 1 source of truth. It records
-security objectives, hypotheses, evidence references, executed actions, typed
-artifacts, and a verified tool manifest. `agent/catalogs/` is regenerated from
-that state and contains practical files such as `subdomains-subfinder.txt`,
-`subdomains-sublist3r.txt`, `live-subdomains.txt`, `api-endpoints.txt`,
-`graphql-endpoints.txt`, `js-bundles.txt`, `architecture.md`, and
-`testing-progress.tsv` for manual work and future runs.
+---
 
-Phase 2 adds `world-model.json`, `technologies.json`, and `routes.json` to the
-catalogs. `architecture.md` becomes an evidence-led topology spanning services,
-routes, technology observations, source assets, browser captures, and session
-contexts. Sensitive browser cookies remain in the local engagement database;
-the human-readable catalog records only their security attributes and context.
+## 📜 License & Compliance
 
-The run database may contain incomplete or noisy observations. Only promotable facts move into `knowledge.db`; raw research queries are excluded. `test-progress.tsv` is especially useful for selecting a manual follow-up surface without redoing already-covered checks.
-
-## Tooling
-
-The Docker image includes a practical set of discovery, API/GraphQL, and validation tools, including `httpx`, `katana`, `nuclei`, `subfinder`, `dnsx`, `naabu`, `ffuf`, `feroxbuster`, `gobuster`, `dirsearch`, `sqlmap`, `dalfox`, `wafw00f`, `inql`, `clairvoyance`, `grapeql`, `arjun`, `graphql-cop`, `gau`, `waybackurls`, `assetfinder`, and `trufflehog` where available.
-
-Tool availability is checked at run startup. A tool being named in the repository does not guarantee its upstream package installed successfully; use the post-build check above if a specific tool matters to an engagement.
-
-## Authentication
-
-The agent can use operator-supplied authentication context, but autonomous modes do not create accounts or run arbitrary login automation. Prefer a local, uncommitted auth file or Docker env file with the minimum necessary cookies/headers. The agent can record observed authentication surfaces and compare authenticated versus unauthenticated responses when valid context is supplied.
-
-Never place fresh session tokens in a committed `prompt.md`, README, trace, or public issue.
-
-## Safety and Scope
-
-- `--execute` is required before commands run; otherwise actions are traced as dry-run plans.
-- Every tool request is scope-checked before it reaches Docker.
-- The sandbox is the execution boundary; the model cannot directly execute commands on the host.
-- Rate limits and command spacing are configurable in the engagement scope and CLI.
-- Repeated commands and malformed actions are controlled to prevent low-value loops.
-- WAF/Cloudflare-like blocking is treated as a signal to slow down, preserve evidence, and defer rather than to bypass protections.
-- Findings follow a ladder: signal -> hypothesis -> reproduced -> validated. A scanner result alone is not a confirmed vulnerability.
-- High-impact SQLi, XSS, and GraphQL attack tools require a structured hypothesis when engagement state is enabled; mapping tools remain available for low-impact discovery.
-- Remote discovery is model-directed; the deterministic preflight checks only local tool availability.
-
-## Development Notes
-
-- Use `rg` for code searches and exclude `runs/`, `__pycache__/`, virtual environments, caches, and large traces unless a specific investigation needs a small excerpt.
-- Preserve traces as audit data. Improve reports and structured stores rather than rewriting historical trace files.
-- Rebuild `bounty-sandbox` after changing the Dockerfile. Rebuild is unnecessary after Python-only agent changes.
-- Review [architecture.md](architecture.md) before making workflow changes: queue, memory, evidence, and reporting are deliberately separate concerns.
-
-## License and Responsible Use
-
-Use ChainsawRecon only against systems for which you have explicit authorization and within the applicable program rules.
+ChainsawRecon is designed exclusively for authorized security testing, defensive posture assessment, and educational research. Users are responsible for obtaining explicit authorization from asset owners before initiating any security assessment.
