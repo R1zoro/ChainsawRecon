@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .agent import BountyAgent
+from .cleaner import CleanerPass
 from .config import AgentSettings, ProgramScope, load_env_file
 
 
@@ -57,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--docker-env-file", type=Path, help="Optional env file passed into the Docker sandbox.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and trace planned actions without execution.")
     parser.add_argument("--execute", action="store_true", help="Actually run approved commands. Default is dry-run.")
+    parser.add_argument("--clean", action="store_true", help="Run the cleaner pass: audit curated engagement assets and write cleaner-report.md.")
+    parser.add_argument("--clean-apply", action="store_true", help="Same as --clean but also attempt to apply corrections.")
     return parser
 
 
@@ -121,6 +124,14 @@ def main(argv: list[str] | None = None) -> int:
         source_code_path=args.source_dir,
         har_paths=tuple(args.har_file),
     )
+    if args.clean or args.clean_apply:
+        if not args.engagement:
+            raise SystemExit("--clean requires --engagement.")
+        cleaner = CleanerPass(args.engagement, apply=args.clean_apply)
+        report = cleaner.run()
+        print(f"Cleaner report: {report}")
+        return 0
+
     agent = BountyAgent(scope, primary_target, settings, runs_dir)
     run_dir = agent.run()
     print(f"Run complete: {run_dir}")

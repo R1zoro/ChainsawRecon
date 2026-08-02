@@ -7,6 +7,8 @@ import re
 import tempfile
 from pathlib import Path
 
+from .auth_context import AuthContext
+from .artifact_store import ArtifactStore
 from .config import AgentSettings, ProgramScope
 from .browser_evidence import parse_har
 from .canonical_surface import CanonicalSurfaceManager
@@ -25,7 +27,7 @@ from .tools import ToolRegistry
 from .trace import TraceLogger
 from .source_analysis import analyze_source_tree
 from .technologies import detect_technology_observations, get_playbook
-from .world_model import Relationship, Route, Session, SourceAsset as WorldSourceAsset, Technology, WorldModel, host_from_url, stable_id
+from .world_model import Relationship, Route, Session, SourceAsset as WorldSourceAsset, Technology, WorldModel, _is_valid_service_host, host_from_url, stable_id
 
 
 class BountyAgent:
@@ -43,6 +45,19 @@ class BountyAgent:
         self.run_dir = settings.session_run_dir or (runs_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{_slug(target)}")
         self.workspace = self.run_dir / "workspace"
         self.trace = TraceLogger(self.run_dir / "trace.jsonl")
+        self.artifact_store = ArtifactStore(self.workspace)
+        # Load structured auth context (per-target cookie groups, HAR evidence)
+        self.auth_context: AuthContext | None = None
+        if settings.auth_context_path and settings.auth_context_path.exists():
+            try:
+                self.auth_context = AuthContext.load(settings.auth_context_path)
+                self.trace.write("auth_context_loaded", path=str(settings.auth_context_path), targets=list(self.auth_context.targets.keys()))
+                # Merge auth-bearing targets into priority targets so they get re-tested
+                for auth_target in self.auth_context.target_urls():
+                    if auth_target not in self.priority_targets:
+                        self.priority_targets.append(auth_target)
+            except Exception as exc:
+                self.trace.write("auth_context_load_failed", error=f"{type(exc).__name__}: {exc}")
         self.retrieval = self._build_retrieval_store()
         self.run_recon = self._build_run_recon_store()
         self.engagement_recon = self._build_engagement_recon_store()
@@ -62,7 +77,17 @@ class BountyAgent:
         self.initial_targets = self._sanitize_target_list(self.initial_targets)
         self.pending_targets = self._sanitize_target_list(self.pending_targets)
         self.priority_targets = self._sanitize_target_list(self.priority_targets)
+        # Limit to a representative subset so we don't burn steps on 83 trivial targets
+        self._capped_targets: list[str] | None = None
+        self._tool_presence_done = False
         self.pending_targets = self._prioritize_targets(self.pending_targets)
+        if len(self.pending_targets) > 5:
+            first = self.pending_targets[:1]
+            rest = [t for t in self.pending_targets if t not in first]
+            import random; random.shuffle(rest)
+            self.pending_targets = first + rest[:4]
+            self._capped_targets = list(dict.fromkeys(self.pending_targets))
+            self.trace.write("target_queue_capped", original=len(self.pending_targets) + len(rest), capped=len(self.pending_targets))
         self.runner = self._build_runner()
 
         # Infrastructure store for WAF/challenge awareness (create before tools)
@@ -84,12 +109,15 @@ class BountyAgent:
             max_repeated_commands=settings.max_repeated_commands,
             allow_search=settings.mode == "assistant",
             state_store=self.engagement_state,
+            artifact_store=self.artifact_store,
             run_id=self.run_dir.name,
             max_actions=settings.max_steps,
         )
         # Attach infrastructure-aware stores to tools for WAF classification
         self.tools.set_infrastructure_store(self.infrastructure_store)
         self.tools.set_strategy_memory(self.strategy_memory)
+        if self.auth_context:
+            self.tools.set_auth_context(self.auth_context)
 
         # Canonical surface manager for target queue deduplication
         self.canonical_surface_mgr = CanonicalSurfaceManager()
@@ -139,6 +167,8 @@ class BountyAgent:
             if self.session_step_count >= self.settings.max_steps:
                 self.trace.write("session_step_budget_exhausted", used=self.session_step_count, limit=self.settings.max_steps)
                 break
+            # Re-evaluate mode each target so mapping→attack escalation works
+            effective_mode = self._resolve_effective_mode()
             index = len(self.completed_targets) + 1
             current_target = self.pending_targets.pop(0)
             self.target = current_target
@@ -180,19 +210,21 @@ class BountyAgent:
                 ChatMessage("user", f"Begin with safe recon for queue target {index}: {current_target}. Pending queue size after this target: {len(self.pending_targets)}. Record only findings with concrete evidence."),
             ]
 
-            # Capability inventory is local-only. Every remote request is selected by the model.
-            for action in deterministic_recon_plan(current_target):
-                if self.settings.dry_run:
-                    self.trace.write("dry_run_action", action=action)
-                    result_content = f"Dry run: would execute {action.get('command')}"
-                    result_ok = True
-                else:
-                    result = self.tools.execute(action)
-                    result_content = result.content
-                    result_ok = result.ok
-                    self.session_step_count = self.tools.action_count
-                self.retrieval.add(index, action, result_content, {"type": action.get("action"), "phase": "startup", "target": current_target})
-                messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
+            # Capability inventory is local-only. Skip after first successful run.
+            if not self._tool_presence_done:
+                for action in deterministic_recon_plan(current_target):
+                    if self.settings.dry_run:
+                        self.trace.write("dry_run_action", action=action)
+                        result_content = f"Dry run: would execute {action.get('command')}"
+                        result_ok = True
+                    else:
+                        result = self.tools.execute(action)
+                        result_content = result.content
+                        result_ok = result.ok
+                        self.session_step_count = self.tools.action_count
+                    self.retrieval.add(index, action, result_content, {"type": action.get("action"), "phase": "startup", "target": current_target})
+                    messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
+                self._tool_presence_done = True
             summary = ""
             if self._should_run_mapping_preflight(effective_mode):
                 self.trace.write("mode_preflight", mode=effective_mode, action="mapping", target=current_target)
@@ -248,6 +280,9 @@ class BountyAgent:
         action_counts: dict[str, int] = {}
         local_step = 0
         consecutive_timeouts = 0
+        consecutive_failures = 0
+        last_failed_action = ""
+        same_action_failures = 0
         # Write the early-stop control file on first entry
         self._write_stop_control_file(0)
         while self.session_step_count < self.settings.max_steps:
@@ -332,7 +367,7 @@ class BountyAgent:
                     rejected_reason = "The summary claims a vulnerability or finding, but no finding passed evidence validation."
                 if rejected_reason:
                     finish_rejections += 1
-                    if finish_rejections >= 3:
+                    if finish_rejections >= 5:
                         return f"Deferred current target after repeated premature finish attempts. {rejected_reason}"
                     messages.append(ChatMessage("assistant", json.dumps(action)))
                     messages.append(
@@ -362,9 +397,52 @@ class BountyAgent:
                 self.session_step_count = self.tools.action_count
                 if result.meta.get("repeat_blocked"):
                     repeat_blocks += 1
+                if "Unsupported action:" in result_content:
+                    valid_actions = (
+                        "bash, read_file, write_file, list_files, list_artifacts, search_artifact, read_artifact_slice, use_skill, record_finding, "
+                        "create_objective, create_hypothesis, record_evidence, save_artifact, "
+                        "create_verifier, sqlmap, dalfox, nuclei, httpx, katana, ffuf, finish"
+                    )
+                    result_content += f"\n[SYSTEM NOTICE] '{action_name}' is not a valid action name. Valid actions are: {valid_actions}. Use one of these in your JSON object."
             self.retrieval.add(step, action, result_content, {"type": action.get("action")})
             messages.append(ChatMessage("assistant", json.dumps(action)))
             messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
+
+            # ── Consecutive failure breaker ────────────────────────────────
+            if not result_ok:
+                consecutive_failures += 1
+                if action_name == last_failed_action:
+                    same_action_failures += 1
+                else:
+                    same_action_failures = 1
+                last_failed_action = action_name
+
+                # If the same action failed 8+ times consecutively, force a strategy switch
+                if same_action_failures >= 8:
+                    self.trace.write("consecutive_failure_breaker", action=action_name, count=same_action_failures, step=step)
+                    messages.append(
+                        ChatMessage(
+                            "user",
+                            f"STRATEGY OVERRIDE: The action '{action_name}' has failed {same_action_failures} consecutive times. "
+                            "Do not attempt this action again. Switch to a completely different approach: "
+                            "use a different tool, write a Python script, or finish with what you have."
+                        )
+                    )
+                    same_action_failures = 0  # Reset to prevent repeated messages
+
+                # If total consecutive failures exceed 12, force finish
+                if consecutive_failures >= 12:
+                    self.trace.write("consecutive_failure_limit", count=consecutive_failures, step=step)
+                    return (
+                        f"Deferred current target after {consecutive_failures} consecutive tool failures. "
+                        f"Last failed action: {action_name}. Review trace and choose a different strategy."
+                    )
+            else:
+                consecutive_failures = 0
+                same_action_failures = 0
+                last_failed_action = ""
+            # ── End consecutive failure breaker ────────────────────────────
+
             # Summarize old messages every 50 steps to prevent context bloat
             if len(messages) > 100 and local_step % 50 == 0:
                 # Keep first 4 system messages + last 50 tool results
@@ -387,6 +465,11 @@ class BountyAgent:
         }
         skill_result = self.tools.execute(skill_action)
         self._append_tool_feedback(messages, skill_action, skill_result)
+
+        if not skill_result.ok:
+            reason = str(skill_result.content).splitlines()[0] if skill_result.content else "skill blocked"
+            self.trace.write("mapping_preflight_aborted", reason=reason, meta=skill_result.meta)
+            return f"Mapping skipped because {reason}. Continuing to enumerate targets directly."
 
         map_content = self._build_target_map_content()
         write_action = {
@@ -423,7 +506,7 @@ class BountyAgent:
     def _should_run_mapping_preflight(self, effective_mode: str | None = None) -> bool:
         mode = (effective_mode or self._resolve_effective_mode()).lower()
         if mode == "mapping":
-            return True
+            return not self._load_mapping_state()
         if mode in {"recon", "attack"}:
             mapping_state = self._load_mapping_state()
             if mapping_state and mapping_state.get("targets"):
@@ -552,6 +635,18 @@ class BountyAgent:
         return "\n".join(lines)
 
     def _build_auth_context_prompt(self) -> str:
+        # If structured auth context is loaded, show per-target cookie groups
+        if self.auth_context:
+            section = self.auth_context.build_prompt_section(self.target)
+            if section:
+                lines = [
+                    "Structured authenticated context with per-target cookie groups is available.",
+                    "Use it carefully for authenticated checks, compare unauthenticated and authenticated behavior, and avoid treating normal logged-in access as a finding.",
+                    "",
+                    section,
+                ]
+                return "\n".join(lines)
+        # Fallback to the flat auth-context.txt file
         staged = self.workspace / "auth-context.txt"
         if not staged.exists():
             return "Authenticated context: none supplied. If auth-only surfaces are discovered, keep notes for a future authenticated run."
@@ -713,6 +808,8 @@ class BountyAgent:
                         auth_context=request.auth_context, source="har-import",
                     )
                     host = host_from_url(request.url)
+                    if not host or not _is_valid_service_host(host):
+                        continue
                     app_id, services = self.world_model.ensure_topology([host])
                     path = _path_from_url(request.url)
                     route = Route(stable_id("route", services[host], request.method, path), services[host], host, path,
@@ -773,7 +870,7 @@ class BountyAgent:
         self.world_model.ingest_surfaces(surfaces, source="recon")
         for observation in [*self.engagement_recon.observations(200), *self.run_recon.observations(200)]:
             host = host_from_url(observation.target) or host_from_url(self.target)
-            if not host:
+            if not host or not _is_valid_service_host(host):
                 continue
             app_id, services = self.world_model.ensure_topology([host])
             for item in detect_technology_observations({}, observation.summary, observation.target):
@@ -994,6 +1091,12 @@ class BountyAgent:
     def _sanitize_discovered_url(self, value: str) -> str | None:
         cleaned = value.strip()
         if any(marker in cleaned for marker in ("*", "FUZZ")):
+            return None
+        # Reject URLs with trailing garbage like colons, commas, brackets
+        if re.search(r"[:,\[\]{}()]$", cleaned):
+            return None
+        # Reject URLs with obvious malformation like double protocols
+        if cleaned.count("://") > 1:
             return None
         cleaned = re.sub(r"/(?:robots\.txt|sitemap\.xml)(?:/|$)", "/", cleaned, flags=re.I)
         # Fix malformed URLs like "http:/example.com" (single colon) but preserve valid "://"

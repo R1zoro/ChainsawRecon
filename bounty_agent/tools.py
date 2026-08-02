@@ -8,10 +8,14 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
+import shlex
 import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from .artifact_store import ArtifactStore, artifact_manifest
+from .auth_context import AuthContext
+from .browser_worker import BROWSER_WORKER_SCRIPT
 from .canonical_surface import normalize_url
 from .engagement_state import EngagementStateStore
 from .infrastructure import ChallengeType, InfrastructureStore, classify_response, extract_hosts_from_tool_output
@@ -63,6 +67,7 @@ class ToolRegistry:
         max_repeated_commands: int = 2,
         allow_search: bool = False,
         state_store: EngagementStateStore | None = None,
+        artifact_store: ArtifactStore | None = None,
         run_id: str = "",
         max_actions: int = 0,
     ) -> None:
@@ -78,9 +83,13 @@ class ToolRegistry:
         self.allow_search = allow_search
         self.command_counts: dict[str, int] = {}
         self.skill_counts: dict[str, int] = {}
+        self.skill_blocked: set[str] = set()
+        self.write_blocked_paths: set[str] = set()
         self.finding_fingerprints: set[str] = set()
+        self.tool_presence_count = 0
         self._tool_presence_cache: dict[str, bool] = {}
         self.state_store = state_store
+        self.artifact_store = artifact_store
         self.run_id = run_id
         self.active_objective_id: str | None = None
         self.active_hypothesis_id: str | None = None
@@ -90,6 +99,7 @@ class ToolRegistry:
 
         self._infra_store: Optional[InfrastructureStore] = None
         self._strategy_memory: Optional[StrategyMemory] = None
+        self._auth_context: Optional[AuthContext] = None
 
     def set_infrastructure_store(self, store: InfrastructureStore) -> None:
         """Attach infrastructure store for WAF/challenge awareness."""
@@ -98,6 +108,10 @@ class ToolRegistry:
     def set_strategy_memory(self, memory: StrategyMemory) -> None:
         """Attach strategy memory for preventing retry loops."""
         self._strategy_memory = memory
+
+    def set_auth_context(self, auth_context: AuthContext) -> None:
+        """Attach structured auth context for cookie injection."""
+        self._auth_context = auth_context
 
     def set_execution_context(self, *, objective_id: str | None = None, hypothesis_id: str | None = None,
                               target: str = "") -> None:
@@ -146,6 +160,18 @@ class ToolRegistry:
                 )
             elif name == "read_file":
                 result = self._read_file(action)
+            elif name == "browser_map":
+                result = self._browser_map(action)
+            elif name == "list_artifacts":
+                result = self._list_artifacts(action)
+            elif name == "search_artifact":
+                result = self._search_artifact(action)
+            elif name == "read_artifact_slice":
+                result = self._read_artifact_slice(action)
+            elif name == "read_artifact_context":
+                result = self._read_artifact_context(action)
+            elif name == "summarize_artifact":
+                result = self._summarize_artifact(action)
             elif name == "write_file":
                 result = self._write_file(action)
             elif name == "list_files":
@@ -187,6 +213,13 @@ class ToolRegistry:
                 self.run_id, action, result.ok, result.content, target=target,
                 objective_id=objective_id, hypothesis_id=hypothesis_id, meta=result.meta,
             )
+            artifact_id = str(result.meta.get("artifact_id") or "")
+            artifact_path = str(result.meta.get("artifact_absolute_path") or result.meta.get("artifact_path") or "")
+            if artifact_id and artifact_path:
+                self.state_store.save_artifact(
+                    "evidence", Path(artifact_path), result.content.splitlines()[0] if result.content else "Captured evidence artifact",
+                    source=f"run:{self.run_id}", meta={"artifact_id": artifact_id, **result.meta},
+                )
             if "=present" in result.content or "=missing" in result.content:
                 self.state_store.record_tool_inventory(result.content, source=f"run:{self.run_id}")
         except Exception as exc:
@@ -221,13 +254,53 @@ class ToolRegistry:
         timeout = int(action.get("timeout_seconds", self.runner.settings.command_timeout_seconds))
         if not command:
             return ToolResult(False, "Missing command.")
+
         safety_result = _validate_command_safety(command)
         if safety_result:
             return safety_result
 
+        # Block login/credential commands when no auth context is supplied
+        if not self._auth_context and _is_login_or_credential_command(command):
+            return ToolResult(
+                False,
+                "Login/credential commands are blocked because no auth context was supplied. "
+                "Do not attempt to create accounts or guess credentials. "
+                "Use observed public endpoints and supplied auth context only.",
+                {"login_blocked": True, "reason": "no_auth_context"},
+            )
+
         repeat_result = self._check_repeated_command(command)
         if repeat_result:
             return repeat_result
+        if _is_baseline_recon_command(command):
+            self.tool_presence_count += 1
+            if self.tool_presence_count > 2:
+                return ToolResult(
+                    False,
+                    "Baseline tool-presence inventory blocked after 2 runs. "
+                    "Use the existing inventory and move to discovery, fingerprinting, or a bounded verification script.",
+                    {"tool_presence_blocked": True, "count": self.tool_presence_count},
+                )
+
+        # Cookie group injection from structured auth context
+        auth_group = action.get("auth_group", "")
+        if auth_group and self._auth_context:
+            cookie_header = self._auth_context.cookie_header_for_group(self.active_target, auth_group)
+            extra_headers = self._auth_context.extra_headers_for_group(self.active_target, auth_group)
+            # Inject cookie into curl-like commands
+            if cookie_header and ("curl" in command or "httpx" in command):
+                if "-H" not in command:
+                    cmd_cookies = f" -H 'Cookie: {cookie_header}'"
+                    command += cmd_cookies
+                for hdr_name, hdr_value in extra_headers.items():
+                    if hdr_name.lower() not in ("cookie", "authorization"):
+                        command += f" -H '{hdr_name}: {hdr_value}'"
+            elif cookie_header and ("--cookie" not in command):
+                # For httpx/katana/nuclei, use the --header or -H approach
+                if "httpx" in command:
+                    command = command.replace("httpx", f"httpx -H 'Cookie: {cookie_header}'", 1)
+                elif "katana" in command:
+                    command = command.replace("katana", f"katana -H 'Cookie: {cookie_header}'", 1)
 
         scope = self.scope_guard.validate_command(command)
         if not scope.allowed:
@@ -321,12 +394,27 @@ class ToolRegistry:
         else:
             self._ip_block_count = 0
 
+        artifact_meta, artifact_line = self._capture_command_artifact(command, result)
         content = (
-            f"exit_code={result.exit_code} timed_out={result.timed_out}\n"
-            f"--- stdout ---\n{_truncate(result.stdout)}\n"
-            f"--- stderr ---\n{_truncate(result.stderr)}"
+            f"exit_code={result.exit_code} timed_out={result.timed_out}{artifact_line}\n"
+            f"--- stdout preview ---\n{_truncate(result.stdout, 3000)}\n"
+            f"--- stderr preview ---\n{_truncate(result.stderr, 1500)}\n"
+            "Use search_artifact or read_artifact_slice with artifact_id for additional evidence."
         )
-        return ToolResult(result.exit_code == 0, content)
+        return ToolResult(result.exit_code == 0, content, artifact_meta)
+
+    def _capture_command_artifact(self, command: str, result: Any) -> tuple[dict[str, Any], str]:
+        if not self.artifact_store or not (result.stdout or result.stderr):
+            return {}, ""
+        record = self.artifact_store.capture_command(
+            command, result.stdout or "", result.stderr or "", exit_code=result.exit_code,
+            timed_out=result.timed_out,
+        )
+        return {
+            "artifact_id": record.artifact_id,
+            "artifact_path": record.path,
+            "artifact_absolute_path": str(self.artifact_store.workspace / record.path),
+        }, "\nRaw output preserved: " + artifact_manifest(record)
 
     def _tool_action(self, action: dict[str, Any]) -> ToolResult:
         name = str(action.get("action", "")).strip()
@@ -372,15 +460,192 @@ class ToolRegistry:
 
     def _read_file(self, action: dict[str, Any]) -> ToolResult:
         path = str(action.get("path", ""))
-        return ToolResult(True, self.runner.read_file(path))
+        content = self.runner.read_file(path)
+        if not self.artifact_store or len(content) <= 3000:
+            return ToolResult(True, content)
+        record = self.artifact_store.capture_text(
+            "workspace_file", content, source="read_file", summary=f"Workspace file {path}",
+            meta={"workspace_path": path},
+        )
+        return ToolResult(
+            True,
+            f"Read {path}. Large content preserved: {artifact_manifest(record)}\n"
+            f"--- preview ---\n{content[:2500]}\nUse artifact retrieval for the remaining content.",
+            {"artifact_id": record.artifact_id, "artifact_path": record.path, "artifact_absolute_path": str(self.artifact_store.workspace / record.path)},
+        )
+
+    def _browser_map(self, action: dict[str, Any]) -> ToolResult:
+        """Run a bounded, same-origin public browser mapping pass."""
+        url = str(action.get("url") or action.get("target") or "").strip()
+        decision = self.scope_guard.validate_target(url)
+        if not decision.allowed:
+            return ToolResult(False, f"Scope blocked browser_map: {decision.reason}")
+        digest = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:12]
+        script_path = ".chainsaw_browser_worker.py"
+        output_path = f"browser/capture-{digest}.json"
+        screenshot_dir = f"browser/screenshots-{digest}"
+        self.runner.write_file(script_path, BROWSER_WORKER_SCRIPT)
+        import sys
+        if self.runner.__class__.__name__ == "DockerSandboxRunner":
+            python_bin = "/opt/venv/bin/python3"
+        else:
+            python_bin = sys.executable
+        command = (
+            f"{python_bin} {shlex.quote(script_path)} --url {shlex.quote(url)} --output {shlex.quote(output_path)} "
+            f"--max-pages {max(1, min(int(action.get('max_pages', 5)), 20))} "
+            f"--max-depth {max(0, min(int(action.get('max_depth', 1)), 3))} "
+            f"--timeout-ms {max(3_000, min(int(action.get('timeout_ms', 20_000)), 60_000))} "
+            f"--screenshot-dir {shlex.quote(screenshot_dir)}"
+        )
+        result = self._bash({"action": "bash", "command": command, "timeout_seconds": action.get("timeout_seconds", 120)})
+        if not result.ok:
+            return result
+        try:
+            capture_text = self.runner.read_file(output_path)
+            capture = json.loads(capture_text)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return ToolResult(False, f"browser_map produced no readable capture: {type(exc).__name__}: {exc}", result.meta)
+        artifact_meta = dict(result.meta)
+        if self.artifact_store:
+            record = self.artifact_store.capture_text(
+                "browser_capture", capture_text, source="browser_map", summary=_browser_capture_summary(capture),
+                meta={"url": url, "workspace_capture": output_path, "screenshots": capture.get("screenshots", [])}, suffix=".json",
+            )
+            artifact_meta.update({"artifact_id": record.artifact_id, "artifact_path": record.path, "artifact_absolute_path": str(self.artifact_store.workspace / record.path)})
+        self._record_browser_surfaces(capture, source="browser_map")
+        forms = capture.get("forms", [])[:12]
+        form_lines = [
+            f"- {item.get('method', 'GET')} {item.get('action', '')} inputs="
+            + ", ".join(str(control.get("name") or control.get("type")) for control in item.get("inputs", [])[:15])
+            for item in forms
+        ]
+        content = (
+            f"Browser map complete: {_browser_capture_summary(capture)}\n"
+            f"capture_path={output_path}\n"
+            + ("Forms:\n" + "\n".join(form_lines) if form_lines else "Forms: none observed.")
+            + (f"\nFull browser capture preserved as artifact_id={artifact_meta.get('artifact_id')}." if artifact_meta.get("artifact_id") else "")
+        )
+        return ToolResult(True, content, artifact_meta)
+
+    def _record_browser_surfaces(self, capture: dict[str, Any], *, source: str) -> None:
+        for page in capture.get("pages", []):
+            url = str(page.get("final_url") or page.get("url") or "")
+            parsed = urlparse(url)
+            if not parsed.hostname:
+                continue
+            self.recon_store.upsert_surface(SurfaceRecord(
+                url, parsed.hostname.lower(), parsed.path or "/", "web", source,
+                tags=("browser",), meta={"title": page.get("title", ""), "status": page.get("status")},
+            ))
+        for form in capture.get("forms", []):
+            action_url = str(form.get("action") or form.get("page_url") or "")
+            parsed = urlparse(action_url)
+            if not parsed.hostname:
+                continue
+            controls = form.get("inputs", [])
+            self.recon_store.upsert_surface(SurfaceRecord(
+                action_url, parsed.hostname.lower(), parsed.path or "/", "web", source,
+                tags=("browser", "form", "parameter"), meta={"method": form.get("method", "GET"), "inputs": controls[:40]},
+            ))
+        for request in capture.get("network", []):
+            url = str(request.get("url") or "")
+            parsed = urlparse(url)
+            if not parsed.hostname:
+                continue
+            path = parsed.path or "/"
+            kind = "graphql" if "graphql" in path.lower() else "api" if "/api/" in path.lower() else "web"
+            self.recon_store.upsert_surface(SurfaceRecord(
+                url, parsed.hostname.lower(), path, kind, source, tags=("browser", "network"),
+                meta={"method": request.get("method", "GET"), "resource_type": request.get("resource_type", "")},
+            ))
+
+    def _list_artifacts(self, action: dict[str, Any]) -> ToolResult:
+        if not self.artifact_store:
+            return ToolResult(False, "Artifact evidence store is unavailable for this runner.")
+        records = self.artifact_store.list_artifacts(
+            kind=str(action.get("kind", "")).strip(), limit=int(action.get("limit", 20)),
+        )
+        return ToolResult(
+            True,
+            "\n".join(artifact_manifest(record) for record in records) if records else "No matching artifacts.",
+        )
+
+    def _search_artifact(self, action: dict[str, Any]) -> ToolResult:
+        if not self.artifact_store:
+            return ToolResult(False, "Artifact evidence store is unavailable for this runner.")
+        try:
+            record, matches = self.artifact_store.search(
+                str(action.get("artifact_id", "")).strip(), str(action.get("query", "")).strip(),
+                max_matches=int(action.get("max_matches", 20)), context_lines=int(action.get("context_lines", 1)),
+                regex=bool(action.get("regex", False)),
+            )
+        except (ValueError, FileNotFoundError, OSError, re.error) as exc:
+            return ToolResult(False, f"Artifact search failed: {type(exc).__name__}: {exc}")
+        if not matches:
+            return ToolResult(True, f"No matches in {artifact_manifest(record)}", {"artifact_id": record.artifact_id})
+        lines = [artifact_manifest(record), f"matches={len(matches)}"]
+        for match in matches:
+            lines.append(f"--- lines {match['start_line']}-{match['end_line']} (match {match['line']}) ---\n{match['preview']}")
+        return ToolResult(True, "\n".join(lines), {"artifact_id": record.artifact_id, "matches": matches})
+
+    def _read_artifact_context(self, action: dict[str, Any]) -> ToolResult:
+        if not self.artifact_store:
+            return ToolResult(False, "Artifact evidence store is unavailable for this runner.")
+        try:
+            record, slices = self.artifact_store.read_context(
+                str(action.get("artifact_id", "")).strip(),
+                query=str(action.get("query", "")).strip(),
+                max_matches=int(action.get("max_matches", 8)),
+                context_lines=int(action.get("context_lines", 3)),
+                regex=bool(action.get("regex", False)),
+            )
+        except (ValueError, FileNotFoundError, OSError, re.error) as exc:
+            return ToolResult(False, f"Artifact context read failed: {type(exc).__name__}: {exc}")
+        if not slices:
+            return ToolResult(True, f"No contextual matches in {artifact_manifest(record)}", {"artifact_id": record.artifact_id})
+        lines = [artifact_manifest(record), f"context_matches={len(slices)}"]
+        for slice_obj in slices:
+            lines.append(f"--- lines {slice_obj['start_line']}-{slice_obj['end_line']} ---\n{slice_obj['preview']}")
+        return ToolResult(True, "\n".join(lines), {"artifact_id": record.artifact_id, "context_matches": slices})
+
+    def _summarize_artifact(self, action: dict[str, Any]) -> ToolResult:
+        if not self.artifact_store:
+            return ToolResult(False, "Artifact evidence store is unavailable for this runner.")
+        try:
+            summary = self.artifact_store.summarize(
+                str(action.get("artifact_id", "")).strip(),
+                max_chars=int(action.get("max_chars", 4000)),
+            )
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            return ToolResult(False, f"Artifact summary failed: {type(exc).__name__}: {exc}")
+        return ToolResult(True, summary, {"artifact_id": summary.get("artifact_id")})
+
+    def _read_artifact_slice(self, action: dict[str, Any]) -> ToolResult:
+        if not self.artifact_store:
+            return ToolResult(False, "Artifact evidence store is unavailable for this runner.")
+        try:
+            end_value = action.get("end_line")
+            record, content, start, end = self.artifact_store.read_lines(
+                str(action.get("artifact_id", "")).strip(), int(action.get("start_line", 1)),
+                int(end_value) if end_value is not None else None,
+            )
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            return ToolResult(False, f"Artifact read failed: {type(exc).__name__}: {exc}")
+        return ToolResult(
+            True, f"{artifact_manifest(record)}\n--- lines {start}-{end} ---\n{content}",
+            {"artifact_id": record.artifact_id},
+        )
 
     def _write_file(self, action: dict[str, Any]) -> ToolResult:
         path = str(action.get("path", "")).strip()
         if not path:
             return ToolResult(False, "Missing file path. Include 'path' key with the file path.")
+        blocked = self._check_write_blocklist(path)
+        if blocked:
+            return blocked
         repeat_result = self._check_repeated_write(path)
         if repeat_result:
-            return repeat_result
+            return blocked or repeat_result
         # Accept 'content' as the primary field; also accept 'data' for flexibility
         content = action.get("content") or action.get("data")
         if content is None:
@@ -496,11 +761,22 @@ class ToolRegistry:
             )
         return ToolResult(True, f"Created verifier {path} for {method} {target}.", {"path": path})
 
+    def _check_write_blocklist(self, path: str) -> ToolResult | None:
+        if path not in self.write_blocked_paths:
+            return None
+        return ToolResult(
+            False,
+            f"write_file for {path} is unavailable because prior attempts were repeatedly blocked.\n"
+            "Use bash with cat/tee, or write a different artifact path.",
+            {"write_blocked": True, "path": path, "blocked": True},
+        )
+
     def _check_repeated_write(self, path: str) -> ToolResult | None:
         count = self.command_counts.get(f"_write_{path}", 0) + 1
         self.command_counts[f"_write_{path}"] = count
         if count <= 2:
             return None
+        self.write_blocked_paths.add(path)
         return ToolResult(
             False,
             f"write_file for {path} blocked after {count} attempts.\n"
@@ -521,6 +797,9 @@ class ToolRegistry:
                 "public_research is assistant-only. Use fingerprinting, surface discovery, or validation from observed target evidence.",
                 {"skill_disabled": True},
             )
+        blocked = self._check_skill_blocklist(name, action)
+        if blocked:
+            return blocked
         repeat_result = self._check_repeated_skill(action)
         if repeat_result:
             return repeat_result
@@ -583,6 +862,18 @@ class ToolRegistry:
         self.findings.append(finding)
         return ToolResult(True, f"Recorded finding: {finding.title}")
 
+    def _check_skill_blocklist(self, name: str, action: dict[str, Any]) -> ToolResult | None:
+        if not name:
+            return None
+        normalized = name.strip().lower()
+        if normalized not in self.skill_blocked:
+            return None
+        return ToolResult(
+            False,
+            f"Skill '{name}' is currently unavailable because a prior request was blocked. Switch to a different skill, write a Python verification script, or finish.",
+            {"skill_blocked": True, "skill": normalized},
+        )
+
     def _check_repeated_skill(self, action: dict[str, Any]) -> ToolResult | None:
         name = str(action.get("name", "")).strip().lower()
         objective = str(action.get("objective", "")).strip().lower()
@@ -592,6 +883,7 @@ class ToolRegistry:
         self.skill_counts[fingerprint] = count
         if count <= 2:
             return None
+        self.skill_blocked.add(name)
         return ToolResult(
             False,
             (
@@ -730,6 +1022,9 @@ def _requires_hypothesis(action: dict[str, Any]) -> bool:
     if name != "bash":
         return False
     command = str(action.get("command", "")).lower()
+    # Exempt tool presence checks and for-loop tool inventories — these are harmless startup actions
+    if "command -v" in command or "for t in" in command:
+        return False
     return any(re.search(rf"(^|[;&|\s]){re.escape(tool)}\b", command) for tool in _HYPOTHESIS_REQUIRED_TOOLS)
 
 
@@ -830,6 +1125,14 @@ def _truncate(value: str, limit: int = 12000) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + f"\n...[truncated {len(value) - limit} chars]"
+
+
+def _browser_capture_summary(capture: dict[str, Any]) -> str:
+    return (
+        f"pages={len(capture.get('pages', []))}; forms={len(capture.get('forms', []))}; "
+        f"scripts={len(capture.get('scripts', []))}; network_requests={len(capture.get('network', []))}; "
+        f"screenshots={len(capture.get('screenshots', []))}; errors={len(capture.get('errors', []))}"
+    )
 
 
 def _command_fingerprint(command: str) -> str:
@@ -1207,3 +1510,17 @@ def _is_baseline_recon_command(command: str) -> bool:
     if "command -v" in lowered and "for t in" in lowered:
         return True
     return False
+
+
+def _is_login_or_credential_command(command: str) -> bool:
+    """Detect login, registration, password, or session automation attempts."""
+    lowered = command.lower()
+    login_markers = [
+        "login", "signin", "sign-in", "sign_in",
+        "register", "signup", "sign-up", "sign_up",
+        "password", "passwd", "pass_word",
+        "credential", "auth_token", "authentication",
+        "session cookie", "obtain.*session", "obtain.*auth",
+        "test@example.com", "test123",
+    ]
+    return any(marker in lowered for marker in login_markers)

@@ -1,0 +1,18 @@
+{
+  "artifact_id": "ART-1b1635e3e7320829",
+  "kind": "command_output",
+  "path": "artifacts/raw/ART-1b1635e3e7320829-command_output.txt",
+  "created_at": "2026-07-26T21:02:40.495381+00:00",
+  "size_bytes": 121,
+  "line_count": 13,
+  "sha256": "1b1635e3e7320829e03dd1b86bdfb9bde62a6a4e157e64460581ce6267c4a8d9",
+  "summary": "Command exit=0 timeout=False; stdout=40 chars stderr=0 chars.",
+  "source": "bash",
+  "meta": {
+    "command": "example",
+    "exit_code": 0,
+    "timed_out": false,
+    "stdout_chars": 40,
+    "stderr_chars": 0
+  }
+}

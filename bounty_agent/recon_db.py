@@ -98,7 +98,8 @@ class ReconStore:
                 status TEXT NOT NULL,
                 tags TEXT NOT NULL,
                 meta TEXT NOT NULL,
-                fingerprint TEXT NOT NULL UNIQUE
+                fingerprint TEXT NOT NULL UNIQUE,
+                last_seen TEXT NOT NULL
             )
             """
         )
@@ -116,7 +117,8 @@ class ReconStore:
                 auth_context TEXT NOT NULL,
                 tags TEXT NOT NULL,
                 meta TEXT NOT NULL,
-                fingerprint TEXT NOT NULL UNIQUE
+                fingerprint TEXT NOT NULL UNIQUE,
+                last_seen TEXT NOT NULL
             )
             """
         )
@@ -133,7 +135,8 @@ class ReconStore:
                 evidence TEXT NOT NULL,
                 tags TEXT NOT NULL,
                 meta TEXT NOT NULL,
-                fingerprint TEXT NOT NULL UNIQUE
+                fingerprint TEXT NOT NULL UNIQUE,
+                last_seen TEXT NOT NULL
             )
             """
         )
@@ -153,6 +156,19 @@ class ReconStore:
         self.conn.execute("CREATE TABLE IF NOT EXISTS browser_captures(id TEXT PRIMARY KEY, path TEXT NOT NULL, title TEXT NOT NULL, source TEXT NOT NULL, meta TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(path))")
         self.conn.execute("CREATE TABLE IF NOT EXISTS browser_requests(id TEXT PRIMARY KEY, capture_id TEXT NOT NULL, method TEXT NOT NULL, url TEXT NOT NULL, request_headers TEXT NOT NULL, request_body TEXT NOT NULL, response_status INTEGER, response_headers TEXT NOT NULL, response_body_excerpt TEXT NOT NULL, auth_context TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(capture_id, method, url, request_body))")
         self.conn.execute("CREATE TABLE IF NOT EXISTS world_routes(id TEXT PRIMARY KEY, service_id TEXT NOT NULL, host TEXT NOT NULL, path TEXT NOT NULL, method TEXT NOT NULL, auth_required TEXT NOT NULL, source TEXT NOT NULL, meta TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(service_id, path, method))")
+        # Part 3: deterministic extraction artifacts + input surfaces
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS extracted_artifacts(id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, artifact_id TEXT, url TEXT, path TEXT, content_excerpt TEXT NOT NULL, meta TEXT NOT NULL, created_at TEXT NOT NULL)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS input_surfaces(id TEXT PRIMARY KEY, surface_key TEXT NOT NULL, host TEXT NOT NULL, path_pattern TEXT NOT NULL, surface_type TEXT NOT NULL, input_kind TEXT NOT NULL, name TEXT, param_source TEXT NOT NULL, auth_context TEXT NOT NULL, source TEXT NOT NULL, meta TEXT NOT NULL, created_at TEXT NOT NULL)
+            """
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_extracted_source ON extracted_artifacts(source)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_input_surface ON input_surfaces(surface_key, input_kind)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_kind_key ON facts(kind, key)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_target ON observations(target)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_surfaces_type ON surfaces(surface_type)")
@@ -190,12 +206,13 @@ class ReconStore:
 
     def upsert_fact(self, fact: ReconFact) -> None:
         fingerprint = _fact_fingerprint(fact.kind, fact.key, fact.value)
+        now = _now()
         self.conn.execute(
             """
             INSERT INTO facts(
-                created_at, kind, key, value, confidence, source, evidence, status, tags, meta, fingerprint
+                created_at, kind, key, value, confidence, source, evidence, status, tags, meta, fingerprint, last_seen
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(fingerprint) DO UPDATE SET
                 created_at=excluded.created_at,
                 confidence=excluded.confidence,
@@ -203,10 +220,11 @@ class ReconStore:
                 evidence=excluded.evidence,
                 status=excluded.status,
                 tags=excluded.tags,
-                meta=excluded.meta
+                meta=excluded.meta,
+                last_seen=excluded.last_seen
             """,
             (
-                _now(),
+                now,
                 fact.kind,
                 fact.key,
                 fact.value,
@@ -217,6 +235,7 @@ class ReconStore:
                 _json(fact.tags),
                 _json(fact.meta or {}),
                 fingerprint,
+                now,
             ),
         )
         self.conn.commit()
@@ -256,28 +275,31 @@ class ReconStore:
         return {f"{kind}:{status}": count for kind, status, count in rows}
 
     def upsert_surface(self, record: SurfaceRecord) -> None:
-        fingerprint = _surface_fingerprint(record.surface_key, record.surface_type, record.auth_context)
+        normalized_key = _normalize_surface_key(record.surface_key)
+        fingerprint = _surface_fingerprint(normalized_key, record.surface_type, record.auth_context)
+        now = _now()
         self.conn.execute(
             """
             INSERT INTO surfaces(
                 created_at, surface_key, host, path_pattern, surface_type, source, confidence, auth_context,
-                tags, meta, fingerprint
+                tags, meta, fingerprint, last_seen
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(fingerprint) DO UPDATE SET
                 created_at=excluded.created_at,
+                surface_key=excluded.surface_key,
+                host=excluded.host,
+                path_pattern=excluded.path_pattern,
                 source=excluded.source,
                 confidence=excluded.confidence,
                 auth_context=excluded.auth_context,
                 tags=excluded.tags,
                 meta=excluded.meta,
-                host=excluded.host,
-                path_pattern=excluded.path_pattern,
-                surface_type=excluded.surface_type
+                last_seen=excluded.last_seen
             """,
             (
-                _now(),
-                record.surface_key,
+                now,
+                normalized_key,
                 record.host,
                 record.path_pattern,
                 record.surface_type,
@@ -287,28 +309,31 @@ class ReconStore:
                 _json(record.tags),
                 _json(record.meta or {}),
                 fingerprint,
+                now,
             ),
         )
         self.conn.commit()
 
     def upsert_attack_result(self, record: AttackResult) -> None:
         fingerprint = _attack_fingerprint(record.surface_key, record.attack_type, record.auth_context, record.outcome)
+        now = _now()
         self.conn.execute(
             """
             INSERT INTO attacks(
-                created_at, surface_key, attack_type, auth_context, outcome, source, evidence, tags, meta, fingerprint
+                created_at, surface_key, attack_type, auth_context, outcome, source, evidence, tags, meta, fingerprint, last_seen
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(fingerprint) DO UPDATE SET
                 created_at=excluded.created_at,
                 source=excluded.source,
                 evidence=excluded.evidence,
                 tags=excluded.tags,
                 meta=excluded.meta,
-                outcome=excluded.outcome
+                outcome=excluded.outcome,
+                last_seen=excluded.last_seen
             """,
             (
-                _now(),
+                now,
                 record.surface_key,
                 record.attack_type,
                 record.auth_context,
@@ -318,17 +343,26 @@ class ReconStore:
                 _json(record.tags),
                 _json(record.meta or {}),
                 fingerprint,
+                now,
             ),
         )
         self.conn.commit()
 
-    def surfaces(self) -> list[SurfaceRecord]:
-        rows = self.conn.execute(
-            """
+    def surfaces(self, *, min_confidence: str | None = None, max_age_days: int | None = None) -> list[SurfaceRecord]:
+        query = """
             SELECT surface_key, host, path_pattern, surface_type, source, confidence, auth_context, tags, meta
-            FROM surfaces ORDER BY surface_type, host, path_pattern
-            """
-        ).fetchall()
+            FROM surfaces
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if min_confidence:
+            clauses.append("confidence = ?")
+            params.append(min_confidence)
+        if max_age_days is not None:
+            clauses.append("last_seen >= datetime('now', ?)")
+            params.append(f"-{max_age_days} days")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.conn.execute(f"{query}{where} ORDER BY surface_type, host, path_pattern", params).fetchall()
         return [
             SurfaceRecord(
                 surface_key=row[0],
@@ -344,13 +378,17 @@ class ReconStore:
             for row in rows
         ]
 
-    def attack_results(self) -> list[AttackResult]:
-        rows = self.conn.execute(
-            """
+    def attack_results(self, *, max_age_days: int | None = None) -> list[AttackResult]:
+        query = """
             SELECT surface_key, attack_type, auth_context, outcome, source, evidence, tags, meta
-            FROM attacks ORDER BY attack_type, surface_key
-            """
-        ).fetchall()
+            FROM attacks
+        """
+        params: list[Any] = []
+        if max_age_days is not None:
+            query += " WHERE last_seen >= datetime('now', ?)"
+            params.append(f"-{max_age_days} days")
+        query += " ORDER BY attack_type, surface_key"
+        rows = self.conn.execute(query, params).fetchall()
         return [
             AttackResult(
                 surface_key=row[0],
@@ -372,12 +410,14 @@ class ReconStore:
         surface_types: dict[str, int] = {}
         for surface in surfaces:
             surface_types[surface.surface_type] = surface_types.get(surface.surface_type, 0) + 1
+        input_lanes = input_surface_lanes(self)
         return {
             "surface_count": len(surfaces),
             "attack_count": len(attacks),
             "surface_types": surface_types,
             "tested_combinations": len(tested),
             "next_tasks": suggest_next_tasks(surfaces, attacks, limit=8),
+            "input_surface_lanes": input_lanes,
         }
 
     def close(self) -> None:
@@ -725,6 +765,33 @@ def suggest_next_tasks(
     return tasks
 
 
+def input_surface_lanes(store: ReconStore | None = None) -> dict[str, Any]:
+    if not store:
+        return {"counts": {}, "missing": [], "tested": 0}
+    try:
+        rows = store.conn.execute(
+            "SELECT surface_key, input_kind, name, auth_context, source FROM input_surfaces"
+        ).fetchall()
+    except Exception:
+        return {"counts": {}, "missing": [], "tested": 0}
+    by_surface: dict[str, dict[str, set[str]]] = {}
+    for surface_key, input_kind, name, auth_context, source in rows:
+        by_surface.setdefault(surface_key, {}).setdefault(input_kind, set()).add(name or "")
+    needed: list[str] = []
+    tested = 0
+    for surface_key, kinds in by_surface.items():
+        if "url_param" in kinds and "form_field" not in kinds:
+            needed.append(f"{surface_key} missing form_field input surface")
+        elif "form_field" in kinds and "url_param" not in kinds:
+            needed.append(f"{surface_key} missing url_param input surface")
+        tested += sum(len(v) for v in kinds.values())
+    counts: dict[str, int] = {}
+    for kinds in by_surface.values():
+        for kind in kinds:
+            counts[kind] = counts.get(kind, 0) + len(kinds[kind])
+    return {"counts": counts, "missing": needed[:8], "tested": tested}
+
+
 def _promotable_fact(fact: ReconFact, run_id: str) -> ReconFact | None:
     if fact.kind in {"finding", "tool"} and fact.confidence in {"confirmed", "observed"}:
         return _with_source(fact, run_id, "confirmed")
@@ -1027,10 +1094,15 @@ def _is_valid_surface_url(url: str) -> bool:
     return True
 
 
+def _normalize_surface_key(surface_key: str) -> str:
+    """Normalize a surface key to collapse trailing-slash and backslash variants."""
+    return surface_key.lower().rstrip("\\/").replace("\\", "")
+
+
 def _surface_fingerprint(surface_key: str, surface_type: str, auth_context: str) -> str:
     # Deduplicate by surface_key (host+path) only, not by auth_context
     # This prevents the same URL from appearing 3 times (public, authenticated, auth)
-    normalized_key = surface_key.lower().rstrip("\\/").replace("\\", "")
+    normalized_key = _normalize_surface_key(surface_key)
     data = "\n".join([normalized_key, surface_type.lower()])
     return hashlib.sha256(data.encode("utf-8", errors="replace")).hexdigest()[:32]
 

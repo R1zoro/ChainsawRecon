@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
-from .recon_db import ReconStore, SurfaceRecord
+from .recon_db import ReconStore, SurfaceRecord, is_noise_host
 
 
 @dataclass(frozen=True)
@@ -140,7 +140,7 @@ class WorldModel:
         self.store.conn.commit()
 
     def ensure_topology(self, hosts: Iterable[str]) -> tuple[str, dict[str, str]]:
-        host_values = sorted({item.lower() for item in hosts if item})
+        host_values = sorted({item.lower() for item in hosts if item and _is_valid_service_host(item)})
         org_id = stable_id("org", self.program_name)
         self.store.conn.execute(
             """INSERT INTO organizations(id,name,domain,industry,created_at) VALUES (?,?,?,?,?)
@@ -167,7 +167,7 @@ class WorldModel:
         return app_id, services
 
     def ingest_surfaces(self, surfaces: Iterable[SurfaceRecord], *, source: str = "recon") -> None:
-        materialized = [item for item in surfaces if item.host and item.host != "local"]
+        materialized = [item for item in surfaces if item.host and item.host != "local" and _is_valid_service_host(item.host)]
         if not materialized:
             return
         app_id, services = self.ensure_topology(item.host for item in materialized)
@@ -317,6 +317,7 @@ class WorldModel:
     def write_catalogs(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
         summary = self.architecture_summary()
+        _guard_catalog_sanity(summary)
         (root / "world-model.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         lines = [f"# Engagement Architecture: {self.program_name}", "", "## Applications", ""]
         for app in summary["applications"]:
@@ -344,6 +345,72 @@ def stable_id(prefix: str, *parts: str) -> str:
 def host_from_url(value: str) -> str:
     parsed = urlparse(value if "://" in value else f"https://{value}")
     return (parsed.hostname or "").lower()
+
+
+def _is_valid_service_host(value: str) -> bool:
+    """Reject non-host garbage that would otherwise pollute the world model.
+
+    The world model's ``ensure_topology`` is the choke point where raw
+    observation targets (tool names, python script filenames, shell command
+    fragments, workspace file names) can be misparsed as hosts.  This guard
+    filters those out before a service row is created.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return False
+    # Reject obvious non-hosts: whitespace, shell metacharacters, paths, scripts
+    if any(marker in cleaned for marker in (" ", "\t", "/", "\\", ":", "|", "&", ";", "$", "`", "(", ")", "{", "}", "[", "]", "<", ">", "=", "'", '"')):
+        return False
+    # Reject bare tool/command tokens and workspace file names
+    if cleaned in _INVALID_SERVICE_TOKENS:
+        return False
+    if cleaned.endswith((".py", ".txt", ".md", ".json", ".sh", ".js", ".map")):
+        return False
+    # Reject single-label hosts (no dot) — real hosts have a registrable domain
+    if "." not in cleaned:
+        return False
+    # Reject private / link-local IP ranges and localhost
+    if is_noise_host(cleaned):
+        return False
+    return True
+
+
+# Bare tokens that are never valid service hosts (tool names, action names, files)
+_INVALID_SERVICE_TOKENS: frozenset[str] = frozenset(
+    {
+        "ffuf", "httpx", "nuclei", "katana", "subfinder", "dnsx", "naabu", "gobuster",
+        "dirsearch", "nikto", "sqlmap", "wafw00f", "xsstrike", "gitjacker", "inql",
+        "clairvoyance", "grapeql", "arjun", "feroxbuster", "dalfox", "crtsh", "curl",
+        "wget", "python", "python3", "node", "npm", "bash", "sh", "workspace",
+        "browser_map", "create_hypothesis", "create_verifier", "create_objective",
+        "read_artifact_slice", "read_file", "write_file", "list_files", "use_skill",
+        "record_finding", "record_evidence", "save_artifact", "search", "finish",
+        "target_mapping", "surface_discovery", "sign_in_required_pattern",
+        "auth-context.txt", "target-map.md", "stop_signal.json", "allowed_hosts.txt",
+        "local", "localhost", "host", "true", "false", "null", "none", "undefined",
+    }
+)
+
+
+def _guard_catalog_sanity(summary: dict[str, Any]) -> None:
+    """Raise if the catalog summary contains obvious garbage that would bloat the context window."""
+    bad_hosts = [
+        svc["host"]
+        for svc in summary.get("services", [])
+        if not isinstance(svc.get("host"), str)
+        or not svc["host"]
+        or svc["host"] in _INVALID_SERVICE_TOKENS
+        or any(marker in svc["host"].lower() for marker in (" ", "\t", "/", "\\", ":", "|", "&", ";", "$", "`", "(", ")", "{", "}", "[", "]", "<", ">", "=", "'", '"'))
+        or svc["host"].lower().endswith((".py", ".txt", ".md", ".json", ".sh", ".js", ".map"))
+        or "." not in svc["host"].lower()
+    ]
+    if bad_hosts:
+        raise RuntimeError(
+            "Catalog sanity check failed: the following service hosts look like garbage and would bloat the context window: "
+            + ", ".join(repr(host) for host in bad_hosts[:20])
+        )
 
 
 def _registrable_domain(host: str) -> str | None:

@@ -1,0 +1,12 @@
+COMMAND:
+example
+
+EXIT_CODE: 0
+TIMED_OUT: False
+
+--- STDOUT ---
+first
+GraphQL endpoint /api/graphql
+last
+
+--- STDERR ---

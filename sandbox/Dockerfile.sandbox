@@ -1,4 +1,4 @@
-FROM kalilinux/kali-rolling
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV GOPROXY=https://proxy.golang.org,direct
@@ -27,10 +27,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sed \
     wget \
     whois \
-    feroxbuster \
-    commix \
     && rm -rf /var/lib/apt/lists/*
-
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 libcairo2 \
+    libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libglib2.0-0 \
+    libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 \
+    libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 \
+    libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release xdg-utils \
+    libjpeg-turbo8 libpng16-16 libwebp7 libwebpdemux2 libwebpmux3 \
+    libavcodec58 libavformat58 libavutil56 libswresample3 \
+    libxshmfence1 && rm -rf /var/lib/apt/lists/*
 RUN apt-get update \
     && for pkg in gobuster dirsearch nikto sqlmap wafw00f xsstrike; do \
         apt-get install -y --no-install-recommends "$pkg" || true; \
@@ -64,8 +70,10 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install pyjwt \
     && /opt/venv/bin/pip install requests[socks] \
     && /opt/venv/bin/pip install beautifulsoup4 \
+    && /opt/venv/bin/pip install playwright \
     && /opt/venv/bin/pip install lxml \
     && /opt/venv/bin/pip install colorama
+RUN /opt/venv/bin/playwright install --with-deps
 
 ENV PATH="/opt/venv/bin:${PATH}"
 
