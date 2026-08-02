@@ -113,6 +113,14 @@ class ToolRegistry:
         """Attach structured auth context for cookie injection."""
         self._auth_context = auth_context
 
+    def set_endpoint_tracker(self, tracker: Any) -> None:
+        """Attach the Milestone 2 endpoint exhaustion tracker."""
+        self._endpoint_tracker = tracker
+
+    def set_auth_gate_classifier(self, classifier: Any) -> None:
+        """Attach the Milestone 2 auth-gate classifier."""
+        self._auth_gate_classifier = classifier
+
     def set_execution_context(self, *, objective_id: str | None = None, hypothesis_id: str | None = None,
                               target: str = "") -> None:
         """Attach all subsequent actions to the current security objective."""
@@ -244,6 +252,7 @@ class ToolRegistry:
                 self.recon_store.upsert_surface(surface)
             for attack in build_attack_results_from_action_result(action, result.ok, result.content, source):
                 self.recon_store.upsert_attack_result(attack)
+                self._record_surface_outcome(attack)
             for fact in build_facts_from_action_result(action, result.ok, result.content, source):
                 self.recon_store.upsert_fact(fact)
         except Exception as exc:
@@ -272,6 +281,15 @@ class ToolRegistry:
         repeat_result = self._check_repeated_command(command)
         if repeat_result:
             return repeat_result
+        # Milestone 2: ban bulk-python endpoint scanning anti-pattern
+        if is_bulk_python_scan(command):
+            return ToolResult(
+                False,
+                "Bulk per-target python scanning is blocked. Write a single-purpose "
+                "verifier for one endpoint, or use a dedicated tool "
+                "(httpx, katana, sqlmap, dalfox).",
+                {"bulk_python_blocked": True},
+            )
         if _is_baseline_recon_command(command):
             self.tool_presence_count += 1
             if self.tool_presence_count > 2:
@@ -918,6 +936,25 @@ class ToolRegistry:
             {"repeat_blocked": True, "repeat_count": count, "fingerprint": fingerprint},
         )
 
+    def _record_surface_outcome(self, attack: AttackResult) -> None:
+        try:
+            if hasattr(self, "_endpoint_tracker") and self._endpoint_tracker:
+                from .endpoint_tracker import SurfaceOutcome
+                self._endpoint_tracker.record(SurfaceOutcome(
+                    surface_key=attack.surface_key,
+                    host=attack.surface_key.split("/")[0] if "/" in attack.surface_key else attack.surface_key,
+                    path="/" + "/".join(attack.surface_key.split("/")[1:]) if "/" in attack.surface_key else "/",
+                    outcome=attack.outcome,
+                    auth_context=attack.auth_context,
+                ))
+            if hasattr(self, "_auth_gate_classifier") and self._auth_gate_classifier and attack.auth_context == "public":
+                combined = " ".join([attack.evidence, attack.surface_key]).lower()
+                new_auth = self._auth_gate_classifier.classify(combined, "", attack.auth_context)
+                if new_auth == "auth_gate":
+                    attack.auth_context = "auth_gate"
+        except Exception:
+            pass
+
     def _add_discovered_hosts(self, stdout: str, stderr: str) -> None:
         try:
             discovered = list(self.scope_guard._extract_hosts(stdout + "\n" + stderr))
@@ -1375,6 +1412,94 @@ def _render_verifier(target: str, method: str, headers: object, body: object) ->
         "print('HEADERS:', json.dumps(dict(response.headers), sort_keys=True))\n"
         "print('BODY:', response.text[:2000])\n"
     )
+
+
+
+
+# --- Milestone 2: Tool-first policy & 7-Question Gate ---
+
+
+_SURFACE_TYPE_TO_TOOL = {
+    "graphql": ["inql", "clairvoyance"],
+    "api": ["httpx", "katana"],
+    "js": ["katana", "httpx"],
+    "auth": ["httpx", "wafw00f"],
+    "upload": ["httpx"],
+    "redirect": ["httpx"],
+    "version": ["httpx", "whatweb"],
+    "web": ["httpx", "katana"],
+}
+
+
+def recommended_tool_for_surface(surface_type: str) -> list[str]:
+    """Deterministic surface-type -> tool mapping for the tool-first policy."""
+    return list(_SURFACE_TYPE_TO_TOOL.get(surface_type, ["httpx"]))
+
+
+def is_bulk_python_scan(command: str) -> bool:
+    """Detect the 'write one python script that scans 100 endpoints' anti-pattern."""
+    if "python" not in command.lower():
+        return False
+    if "range(" in command or "for " in command:
+        if "requests" in command or "urllib" in command or "httpx" in command:
+            return True
+    return False
+
+
+_QUESTION_GATE = [
+    "1. In-scope: Is the asset explicitly within the engagement program scope?",
+    "2. Reproducible: Is there an exact request + response pair that anyone can replay?",
+    "3. Real impact: Does the evidence demonstrate unauthorized access, data exposure, or security control bypass (not just unexpected behavior)?",
+    "4. Not auth-gate: Is this a true bypass or cross-tenant access, not merely a login wall or expected 401/403?",
+    "5. Business relevance: Does this affect user data, tenant isolation, or a core application function?",
+    "6. VRT severity: Does this map to a VRT category at Low or above?",
+    "7. POE complete: Is the full Proof of Exploit (request, response, and why-interesting) present and complete?",
+]
+
+
+def evaluate_finding_7q(finding: Finding) -> tuple[str, list[str]]:
+    """Run the 7-Question Gate on a finding candidate.
+
+    Returns (rung, failed_reasons). rung is 'validated' if all questions pass,
+    otherwise 'candidate' with the list of failing questions.
+    """
+    evidence_text = " ".join([
+        finding.title, finding.request, finding.response, finding.evidence, finding.impact,
+    ]).lower()
+    failures: list[str] = []
+    if not finding.asset.strip():
+        failures.append("1. cannot verify scope without an asset field")
+    if not finding.request.strip() or not finding.response.strip():
+        failures.append("2. missing exact request or response")
+    impact_lower = finding.impact.strip().lower()
+    if not impact_lower or impact_lower in {"none", "n/a", "no impact", "unknown"}:
+        failures.append("3. no concrete security impact described")
+    impact_markers = [
+        "unauthorized", "cross-tenant", "idor", "bypass", "schema", "__schema",
+        "stack trace", "injection", "sensitive data", "leaked", "exposed",
+    ]
+    if not any(term in evidence_text for term in impact_markers):
+        failures.append("3. evidence does not show unauthorized access or data exposure")
+    auth_gate_terms = [
+        "login", "sign in", "authentication required", "please log in",
+        "401 unauthorized", "403 forbidden", "access challenge",
+    ]
+    bypass_terms = ["bypass", "cross-tenant", "still returned", "after bypass"]
+    if any(term in evidence_text for term in auth_gate_terms):
+        if not any(term in evidence_text for term in bypass_terms):
+            failures.append("4. appears to be an auth-gate, not a verified bypass")
+    if finding.severity.strip().lower() in {"", "unknown", "info", "informational"}:
+        failures.append("6. severity not specified or informational")
+    weak_markers = [
+        "content_length", "tool result summary", "command not found",
+        "syntax error", "httpx: not found", "timed out", "timeout",
+    ]
+    if any(marker in evidence_text for marker in weak_markers):
+        failures.append("7. evidence contains weak markers (summaries, timeouts, tool errors)")
+    if not failures:
+        return ("validated", [])
+    return ("candidate", failures)
+
 
 
 def _validate_command_safety(command: str) -> ToolResult | None:

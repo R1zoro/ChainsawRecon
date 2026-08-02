@@ -18,10 +18,10 @@
 ## Milestone 2 — Deterministic Hunt Engine
 **Goal:** Fix python-everything, garbage findings, and single-endpoint stickiness.
 
-- [ ] **M2.1 Tool-first policy** — surface-type → deterministic tool mapping (GraphQL→inql/clairvoyance, SQLi→sqlmap, XSS→dalfox, params→arjun, CVE→nuclei, subdomains→subfinder). Model writes Python only to verify a tool signal; bulk-python "100-endpoint" pattern banned.
-- [ ] **M2.2 Endpoint-exhaustion & rotation** — `EndpointExhaustionTracker` counts new evidence per (host,path); N steps of repeated 403/404/auth-gate → inject `ENDPOINT EXHAUSTED` and reprioritize queue.
-- [ ] **M2.3 Auth-gate awareness** — `sign_in_required`/login-wall classified as `auth_gate`, never `interesting`; pivot to authenticated surfaces only if auth.txt exists.
-- [ ] **M2.4 Evidence ladder hardening — 7-Question Gate** — replace heuristic `_classify_finding_rung` with structured gate (in-scope, reproducible, real impact, not auth-gate, business relevance, VRT severity, evidence complete).
+- [x] **M2.1 Tool-first policy** — `recommended_tool_for_surface()` maps surface type → deterministic tool; `is_bulk_python_scan()` bans the "100-endpoint python curl loop" anti-pattern; model writes Python only to verify a single tool signal.
+- [x] **M2.2 Endpoint-exhaustion & rotation** — `EndpointExhaustionTracker` counts negative outcomes per (host,path); after 3 repeated 403/404/auth-gate → inject `ENDPOINT EXHAUSTED` and prune from active queue; wired into `ToolRegistry._record_recon_state` and agent target loop.
+- [x] **M2.3 Auth-gate awareness** — `AuthGateClassifier` classifies login-wall/sign_in_required as `auth_gate`, never `interesting`; wired into `ToolRegistry._record_surface_outcome`.
+- [x] **M2.4 Evidence ladder hardening — 7-Question Gate** — `_classify_finding_rung` replaced with `evaluate_finding_7q()` implementing the structured 7-question gate.
 
 ---
 

@@ -22,6 +22,7 @@ from .report import write_engagement_report, write_report
 from .retrieval import NullRetrievalStore, RetrievalStore
 from .recon_db import NullReconStore, ReconStore, promote_run_facts
 from .sandbox import DockerSandboxRunner, LocalWorkspaceRunner
+from .endpoint_tracker import AuthGateClassifier, EndpointExhaustionTracker, SurfaceOutcome
 from .scope import ScopeGuard
 from .tools import ToolRegistry
 from .trace import TraceLogger
@@ -98,6 +99,13 @@ class BountyAgent:
         strategy_path = self.workspace / "strategy_memory.json"
         self.strategy_memory = StrategyMemory(strategy_path)
 
+        # Milestone 2: deterministic hunt engine trackers
+        self.endpoint_tracker = EndpointExhaustionTracker()
+        self.auth_gate_classifier = AuthGateClassifier()
+        # Pass trackers into ToolRegistry for wiring
+        _endpoint_tracker = self.endpoint_tracker
+        _auth_gate_classifier = self.auth_gate_classifier
+
         self.tools = ToolRegistry(
             self.runner,
             self.scope_guard,
@@ -118,6 +126,10 @@ class BountyAgent:
         self.tools.set_strategy_memory(self.strategy_memory)
         if self.auth_context:
             self.tools.set_auth_context(self.auth_context)
+        # Milestone 2: wire endpoint exhaustion + auth-gate classifiers into tools
+        self.tools.set_endpoint_tracker(_endpoint_tracker)
+        self.tools.set_auth_gate_classifier(_auth_gate_classifier)
+
 
         # Canonical surface manager for target queue deduplication
         self.canonical_surface_mgr = CanonicalSurfaceManager()
@@ -130,17 +142,22 @@ class BountyAgent:
         self.llm = self._build_llm()
 
     def _deduplicate_targets(self, targets: list[str]) -> list[str]:
-        """Deduplicate a target list using the canonical surface manager."""
+        """Deduplicate a target list using the canonical surface manager.
+
+        Preserves the original URL format of the first-seen variant so that
+        canonical normalization (www stripping, protocol) does not mutate
+        operator-supplied target strings. Deduplication is based on the
+        surface_key so CF-token variants still merge.
+        """
         if not targets:
             return targets
-        # Register all (preserves original for tracking) and return canonical URLs
         canonical = []
         seen = set()
         for t in targets:
             surface = self.canonical_surface_mgr.register(t)
             if surface.surface_key not in seen:
                 seen.add(surface.surface_key)
-                canonical.append(surface.canonical_url)
+                canonical.append(t)
         return canonical
 
     def run(self) -> Path:
@@ -241,6 +258,20 @@ class BountyAgent:
             discovered = self._extend_pending_targets_from_recon()
             if discovered:
                 self.trace.write("queue_extended", source_target=current_target, discovered=discovered)
+            # Milestone 2: record attack outcomes for endpoint exhaustion + auth-gate tracking
+            _split = lambda sk: (sk.split("/")[0] if "/" in sk else sk,
+                                 "/" + "/".join(sk.split("/")[1:]) if "/" in sk else "/")
+            for attack in self.run_recon.attack_results():
+                host, path = _split(attack.surface_key)
+                self.endpoint_tracker.record(
+                    SurfaceOutcome(
+                        surface_key=attack.surface_key,
+                        host=host,
+                        path=path,
+                        outcome=attack.outcome,
+                        auth_context=attack.auth_context,
+                    )
+                )
             self._refresh_session_queue()
             self._persist_session_state(effective_mode)
 
@@ -1292,6 +1323,20 @@ class BountyAgent:
             hints.append(
                 "Docs surfaces exist. Use docs_sdk_analysis logic: extract SDK names, sample endpoints, auth headers, and operation names from documentation before broad new probing."
             )
+        # Milestone 2: endpoint exhaustion pruning signal
+        exhausted = [svc for svc in self.run_recon.surfaces() if self.endpoint_tracker.is_exhausted(svc.host, svc.path_pattern)]
+        if exhausted:
+            hints.append(
+                f"{len(exhausted)} endpoints are marked ENDPOINT EXHAUSTED from repeated negative outcomes. "
+                "Remove them from the active probe queue and pursue a different attack surface or surface class."
+            )
+        # Milestone 2: tool-first policy reminder
+        tool_hint = (
+            "Tool-first policy: prefer dedicated security tools over generic Python curl loops. "
+            "For GraphQL use inql/clairvoyance, for params use arjun, for CVEs use nuclei, "
+            "for subdomains use subfinder. Python scripts should verify ONE tool signal, not scan 100 endpoints."
+        )
+        hints.append(tool_hint)
         if not hints:
             return []
         return [ChatMessage("system", "\n".join(hints))]
