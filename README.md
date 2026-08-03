@@ -14,6 +14,8 @@ Designed for authorized penetration testing, security audits, and defensive surf
 * **Scope Guard & Rate Control:** Strict pre-execution scope verification for every single outbound tool request, with configurable rate limits and request spacing.
 * **Multi-Modal Evidence Capture:** Imports and normalizes HTTP requests/responses, HAR browser captures, technology playbooks, and static source-code analysis into canonical, replayable evidence items.
 * **Independent Validation Engine:** Findings follow an evidence ladder and must pass independent replay and differential control testing before classification.
+* **Deterministic Hunt Engine (M2):** Tool-first policy steers the model to dedicated security tools over generic Python loops; endpoint-exhaustion tracking prunes dead endpoints; auth-gate awareness prevents login walls from being reported as findings; a 7-Question Gate validates every finding candidate.
+* **Knowledge & Tradecraft (M3):** Per-vuln-class skill packs (IDOR, SSRF, XSS, SQLi, upload, OAuth, race, GraphQL authz) auto-load based on discovered surfaces; a report-writing skill produces submission-grade write-ups; deterministic OSV/Tavily research probes replace HTML scraping.
 * **Human-Readable Catalogs & Machine-Readable State:** Generates both SQLite/JSON knowledge graphs for AI reasoning and clean Markdown/TSV catalogs for manual testing and reporting.
 
 ---
@@ -75,7 +77,29 @@ Verify sandbox tool installation:
 docker run --rm bounty-sandbox:latest bash -lc "command -v httpx nuclei katana inql feroxbuster dalfox"
 ```
 
-### 3. Start Your Local LLM Provider (e.g., Ollama)
+### 3. Configure API Keys (`.env`)
+
+Copy the template and add your keys. The CLI loads `.env` from the project root at startup:
+
+```bash
+cp .env.example .env
+```
+
+Add the following to `.env`:
+
+```bash
+# LLM provider (Ollama or Groq)
+OLLAMA_API_KEY=ollama
+# or GROQ_API_KEY=gsk_your_key_here
+
+# Tavily search (optional, for M3.4 research skill)
+# Get a free key at https://tavily.com
+TAVILY_API_KEY=tvly-your-key-here
+```
+
+> **Tavily key location:** The `TAVILY_API_KEY` goes in the root `.env` file. The `research` tool action reads it via `os.environ.get("TAVILY_API_KEY")` at runtime. Without it, Tavily search returns a clear "unavailable" message and the agent falls back to the keyless OSV API.
+
+### 4. Start Your Local LLM Provider (e.g., Ollama)
 
 Ensure your LLM provider is running locally and serving an OpenAI-compatible API endpoint:
 

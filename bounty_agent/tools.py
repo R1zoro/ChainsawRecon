@@ -28,6 +28,7 @@ from .recon_db import (
     build_facts_from_action_result,
     build_surfaces_from_action_result,
 )
+from .research import research_probe
 from .sandbox import SandboxRunner
 from .scope import ScopeGuard
 from .skills import get_skill
@@ -186,6 +187,8 @@ class ToolRegistry:
                 result = self._list_files(action)
             elif name == "use_skill":
                 result = self._use_skill(action)
+            elif name == "research":
+                result = self._research(action)
             elif name == "record_finding":
                 result = self._record_finding(action)
             elif name == "create_objective":
@@ -833,6 +836,11 @@ class ToolRegistry:
             prefix.append(f"Current context: {context}")
         guidance = "\n\n".join(prefix + [skill.full()])
         return ToolResult(True, guidance, {"skill": skill.name})
+
+    def _research(self, action: dict[str, Any]) -> ToolResult:
+        """Milestone 3.4: deterministic research probes (OSV / Tavily)."""
+        ok, content, meta = research_probe(action)
+        return ToolResult(ok, content, meta)
 
     def _record_finding(self, action: dict[str, Any]) -> ToolResult:
         if self.state_store and not (action.get("hypothesis_id") or self.active_hypothesis_id):

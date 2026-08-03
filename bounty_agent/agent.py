@@ -1463,6 +1463,48 @@ class BountyAgent:
         query = " ".join([last_user.strip(), last_assistant.strip()]).strip()
         return query[:1400]
 
+    def _build_auto_skill_prompt(self) -> str:
+        """Milestone 3.5: recon-aware auto-selection of tradecraft skills.
+
+        Maps discovered surfaces to the skill pack that should be applied,
+        so the model does not need an explicit use_skill call to get the
+        right tradecraft for a surface class.
+        """
+        from .skills import get_skill
+
+        surface_to_skill: dict[str, str] = {
+            "graphql": "graphql_authz",
+            "api": "sqli_tester",
+            "redirect": "ssrf_tester",
+            "upload": "file_upload_tester",
+            "auth": "oauth_tester",
+            "web": "xss_tester",
+        }
+        selected: list[str] = []
+        try:
+            for surface in self.engagement_recon.surfaces():
+                surface_type = str(getattr(surface, "surface_type", "")).lower()
+                skill_name = surface_to_skill.get(surface_type)
+                if not skill_name:
+                    continue
+                tags = set(getattr(surface, "tags", ()) or ())
+                if surface_type == "api" and "parameter" not in tags:
+                    continue
+                if surface_type == "web" and "parameter" not in tags:
+                    continue
+                if skill_name not in selected:
+                    selected.append(skill_name)
+        except Exception:
+            return ""
+        if not selected:
+            return ""
+        lines = ["AUTO-SELECTED TRADECRAFT (apply these skill packs to the discovered surfaces):"]
+        for skill_name in selected:
+            skill = get_skill(skill_name)
+            if skill:
+                lines.append(skill.compact())
+        return "\n".join(lines)
+
     def _prepare_llm_messages(
         self,
         messages: list[ChatMessage],
@@ -1473,7 +1515,9 @@ class BountyAgent:
         system_messages = [msg for msg in messages if msg.role == "system"]
         convo_messages = [msg for msg in messages if msg.role != "system"]
         trimmed_convo = convo_messages[-12:]
-        return system_messages + memory_snippet + coverage_snippet + progress_hint + trimmed_convo
+        auto_skill = self._build_auto_skill_prompt()
+        auto_skill_snippet = [ChatMessage("system", auto_skill)] if auto_skill else []
+        return system_messages + auto_skill_snippet + memory_snippet + coverage_snippet + progress_hint + trimmed_convo
 
     def _build_llm(self) -> LLMClient:
         if not self.settings.model:

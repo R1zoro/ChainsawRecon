@@ -28,11 +28,11 @@
 ## Milestone 3 — Knowledge & Tradecraft
 **Goal:** Give the model the answer patterns (the 4k-star lesson).
 
-- [ ] **M3.1 Tradecraft skill packs** — per-vuln-class packs (IDOR, SSRF, XSS, SQLi, file-upload, OAuth, JWT, race) with detection patterns, payloads, bypass tables, chain templates. Auto-load by discovered surface topic.
-- [ ] **M3.2 GraphQL tradecraft pack** — introspection templates, field-level authz checks, batching, mutation-authz payloads from disclosed reports.
-- [ ] **M3.3 Report-writing skill** — H1/Bugcrowd/Intigriti templates, VRT-aware severity, impact-first framing, POE completeness. `engagement-report.md` becomes submission-grade.
-- [ ] **M3.4 Search & CVE skill** — OSV API (deterministic, no key) for (product, ecosystem, version) → CVEs; Tavily JSON for general research. Never scrape HTML.
-- [ ] **M3.5 Recon-aware auto-selection** — reuse `_required_attack_families_for_surface`: discovered GraphQL → auto-inject GraphQL skill + tool list, no `use_skill` call needed.
+- [x] **M3.1 Tradecraft skill packs** — added `ssrf_tester`, `xss_tester`, `sqli_tester`, `file_upload_tester`, `oauth_tester`, `race_tester` to `skills.py` (IDOR/JWT/session already existed).
+- [x] **M3.2 GraphQL tradecraft pack** — added `graphql_authz` skill: field-level authz, batching, mutation-authz, introspection leakage.
+- [x] **M3.3 Report-writing skill** — added `report_writing` skill: VRT-aware severity, impact-first framing, POE completeness, platform templates.
+- [x] **M3.4 Search & CVE skill** — new `research.py`: OSV API (keyless, deterministic) + Tavily JSON; wired as `research` tool action in `tools.py`. Never scrapes HTML.
+- [x] **M3.5 Recon-aware auto-selection** — `_build_auto_skill_prompt()` in `agent.py` maps discovered surfaces → skill packs and injects them into `_prepare_llm_messages`; no `use_skill` call needed.
 
 ---
 

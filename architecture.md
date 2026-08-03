@@ -15,20 +15,20 @@ flowchart LR
     O["Authorized Operator\n(Scope, Rules, Credentials)"] --> E["Engagement Workspace\n(program/scope.json, rules.md)"]
     O --> CLI["CLI Controller\n(bounty_agent.cli)"]
     CLI --> Core["BountyAgent Core Engine"]
-    
+
     subgraph Execution Boundary
         Core <--> LLM["Local LLM Server\n(Ollama / vLLM / OpenAI API)"]
         Core --> Guard["ScopeGuard & Validator\n(Rate limits, URL check, JSON filter)"]
         Guard --> Runner["Docker Sandbox Runner\n(Local Workspace / Container)"]
         Runner --> Tools["Sandboxed Tools\n(httpx, katana, nuclei, ffuf, etc.)"]
     end
-    
+
     subgraph Data & Memory Boundary
         Core --> RunDB["Run-Local DB (recon.db)\nTransient observations"]
         Core --> EngDB["Engagement DB (knowledge.db)\nCurated persistent memory"]
         Core --> WorldDB["World Model & State Stores\n(world_model.py, engagement_state.py)"]
     end
-    
+
     RunDB --> Report["Per-Run Report & Trace\n(report.md, trace.jsonl)"]
     EngDB --> Catalogs["Human Catalogs & Architecture Map\n(architecture.md, routes.json)"]
 ```
@@ -136,7 +136,7 @@ sequenceDiagram
     CLI->>Agent: Instantiate BountyAgent(scope, target, settings)
     Agent->>State: Initialize ReconStore, WorldModel, EngagementStateStore
     Agent->>Tools: Initialize ToolRegistry with ScopeGuard & SandboxRunner
-    
+
     loop Target Queue Processing
         Agent->>Scope: Validate Target URL against scope.json
         alt Target Allowed
@@ -197,7 +197,7 @@ stateDiagram-v2
     Experiment_Planned --> Experiment_Attempted: Experiment executed in sandbox
     Experiment_Attempted --> Reproduced: Issue consistently reproduced
     Reproduced --> Validated: Independent control & differential test passed
-    
+
     Experiment_Attempted --> Rejected: Behavior verified as safe
     Experiment_Attempted --> Deferred: Blocked by WAF / Low priority
     Experiment_Attempted --> Blocked: Out of scope or high risk
@@ -251,6 +251,33 @@ ChainsawRecon implements a strict **two-tier memory architecture**:
 
 1. **`recon.db` (Run Database):** Disposable database instantiated for a single execution session. Stores raw tool outputs, temporary logs, and transient observations.
 2. **`knowledge.db` (Engagement Database):** Permanent, curated database across all runs of an engagement. Only high-confidence, verified facts (live hosts, endpoints, technology playbooks, validated findings) are promoted into `knowledge.db`.
+
+---
+
+## 7b. Deterministic Hunt Engine & Tradecraft (M2/M3)
+
+Two milestone layers harden the reasoning loop so the model stops producing garbage findings and starts applying real tradecraft.
+
+### Deterministic Hunt Engine (M2)
+
+| Module | File | Responsibility |
+|---|---|---|
+| Tool-first policy | `tools.py` | `recommended_tool_for_surface()` maps surface type → deterministic tool; `is_bulk_python_scan()` bans the "100-endpoint Python loop" anti-pattern. |
+| Endpoint exhaustion | `endpoint_tracker.py` | `EndpointExhaustionTracker` counts negative outcomes per (host,path); after 3 repeated 403/404/auth-gate it injects `ENDPOINT EXHAUSTED` and prunes the endpoint from the active queue. |
+| Auth-gate awareness | `endpoint_tracker.py` | `AuthGateClassifier` classifies login walls / `sign_in_required` as `auth_gate` — never `interesting` or `confirmed`. |
+| 7-Question Gate | `tools.py` | `evaluate_finding_7q()` replaces heuristic rung classification with a structured gate: in-scope, reproducible, real impact, not auth-gate, business relevance, VRT severity, POE complete. |
+
+### Knowledge & Tradecraft (M3)
+
+| Module | File | Responsibility |
+|---|---|---|
+| Tradecraft skill packs | `skills.py` | Per-vuln-class `AgentSkill`s: `ssrf_tester`, `xss_tester`, `sqli_tester`, `file_upload_tester`, `oauth_tester`, `race_tester`, plus existing IDOR/JWT/session packs. |
+| GraphQL authz pack | `skills.py` | `graphql_authz`: field-level authz, batching/alias bypass, mutation-authz, introspection leakage. |
+| Report-writing skill | `skills.py` | `report_writing`: VRT-aware severity, impact-first framing, POE completeness, platform templates. |
+| Deterministic research | `research.py` | OSV API (keyless CVE lookup) + Tavily JSON search; exposed as the `research` tool action. Never scrapes HTML. |
+| Recon-aware auto-selection | `agent.py` | `_build_auto_skill_prompt()` maps discovered surfaces → skill packs and injects them into `_prepare_llm_messages`; no `use_skill` call needed. |
+
+**Tavily key:** `TAVILY_API_KEY` lives in the root `.env` (loaded by `cli.py` via `load_env_file`). Without it, Tavily returns a clear "unavailable" message and the agent falls back to the keyless OSV API.
 
 ---
 
