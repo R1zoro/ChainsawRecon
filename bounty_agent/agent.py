@@ -23,6 +23,7 @@ from .retrieval import NullRetrievalStore, RetrievalStore
 from .recon_db import NullReconStore, ReconStore, promote_run_facts
 from .sandbox import DockerSandboxRunner, LocalWorkspaceRunner
 from .endpoint_tracker import AuthGateClassifier, EndpointExhaustionTracker, SurfaceOutcome
+from .controls import DynamicRateLimiter, GeminiAdjudicator, RateLimitProbe, get_cleanup_registry
 from .scope import ScopeGuard
 from .tools import ToolRegistry
 from .trace import TraceLogger
@@ -123,6 +124,24 @@ class BountyAgent:
         )
         # Attach infrastructure-aware stores to tools for WAF classification
         self.tools.set_infrastructure_store(self.infrastructure_store)
+        # Milestone 4.1: dynamic rate-limit maintenance (probe + backoff)
+        self.dynamic_rate_limiter = DynamicRateLimiter(settings.max_commands_per_minute, self.trace)
+        self.tools.rate_limiter.attach_dynamic(self.dynamic_rate_limiter)
+        self.rate_limit_probe = RateLimitProbe(self.trace, settings.command_delay_seconds)
+        # Milestone 4.2: cross-model adjudicator (Gemini) if GEMINI_API_KEY set
+        import os as _os
+        self.adjudicator = GeminiAdjudicator(api_key=_os.environ.get('GEMINI_API_KEY', ''), trace=self.trace)
+        if self.adjudicator.available():
+            self.tools.set_adjudicator(self.adjudicator)
+            self.trace.write('adjudicator_enabled', model=self.adjudicator.model)
+        # Milestone 4.3: auto-register cleanup for runner + stores on exit/crash
+        cleanup = get_cleanup_registry()
+        cleanup.register('runner.close', lambda: self.runner.close() if hasattr(self, 'runner') else None)
+        cleanup.register('retrieval.close', lambda: self.retrieval.close() if hasattr(self, 'retrieval') else None)
+        cleanup.register('run_recon.close', lambda: self.run_recon.close() if hasattr(self, 'run_recon') else None)
+        cleanup.register('engagement_recon.close', lambda: self.engagement_recon.close() if hasattr(self, 'engagement_recon') else None)
+        cleanup.register('engagement_state.close', lambda: self.engagement_state.close() if hasattr(self, 'engagement_state') else None)
+        self.trace.write('cleanup_registered', count=len(cleanup))
         self.tools.set_strategy_memory(self.strategy_memory)
         if self.auth_context:
             self.tools.set_auth_context(self.auth_context)
@@ -160,7 +179,9 @@ class BountyAgent:
                 canonical.append(t)
         return canonical
 
-    def run(self) -> Path:
+    def run(self, scorecard: Any | None = None) -> Path:
+        if scorecard is not None:
+            self.tools.set_scorecard(scorecard)
         try:
             return self._run()
         finally:
@@ -169,6 +190,44 @@ class BountyAgent:
             self.run_recon.close()
             self.engagement_recon.close()
             self.engagement_state.close()
+
+    def _choose_rate_limit_probe_url(self) -> str | None:
+        candidates = [self.target] + list(self.session_targets) + list(self.scope.allowed_urls)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            normalized = self._normalize_probe_url(candidate)
+            if not normalized:
+                continue
+            decision = self.scope_guard.validate_target(normalized)
+            if decision.allowed:
+                return normalized
+        return None
+
+    def _normalize_probe_url(self, value: str) -> str | None:
+        value = value.strip()
+        if not value:
+            return None
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        if value.startswith("//"):
+            return f"https:{value}"
+        if self.scope_guard._is_ip(value) or self.scope_guard._is_domain(value):
+            return f"https://{value}"
+        return None
+
+    def _probe_rate_limit(self) -> None:
+        probe_url = self._choose_rate_limit_probe_url()
+        if not probe_url:
+            self.trace.write("rate_limit_probe_skipped", reason="no_probe_url")
+            return
+        self.trace.write("rate_limit_probe_start", url=probe_url)
+        discovered = self.rate_limit_probe.probe(probe_url)
+        if discovered is None:
+            self.trace.write("rate_limit_probe_failed", url=probe_url)
+            return
+        self.dynamic_rate_limiter.set_effective_limit(discovered)
+        self.trace.write("rate_limit_probe_completed", url=probe_url, discovered_limit=discovered)
 
     def _run(self) -> Path:
         self.trace.write("session_start", targets=self.session_targets, runner=self.settings.runner)
@@ -179,6 +238,7 @@ class BountyAgent:
         self._sync_world_model()
         self._refresh_session_queue()
         self._persist_session_state(effective_mode)
+        self._probe_rate_limit()
 
         while self.pending_targets:
             if self.session_step_count >= self.settings.max_steps:
@@ -696,6 +756,33 @@ class BountyAgent:
         ]
         if len(content) > len(preview):
             lines.append(f"...truncated {len(content) - len(preview)} chars")
+        # Also include any operator-provided HTTP skeletons found under workspace/auth-skeletons
+        try:
+            skel_dir = self.workspace / "auth-skeletons"
+            if skel_dir.exists() and skel_dir.is_dir():
+                # Prefer skeletons matching the current target's registrable domain first
+                target_host = host_from_url(self.target) or ""
+                def registrable(h: str) -> str:
+                    parts = (h or "").split('.')
+                    return ".".join(parts[-2:]) if len(parts) >= 2 else h
+
+                preferred = registrable(target_host)
+                files = sorted(skel_dir.glob("*.http"), key=lambda p: 0 if preferred and preferred in p.name else 1)
+                if files:
+                    lines.append("")
+                    lines.append("Operator-provided HTTP skeletons available (use as templates for headers/cookies):")
+                    for f in files[:4]:
+                        try:
+                            text = f.read_text(encoding="utf-8", errors="replace").strip()
+                        except OSError:
+                            continue
+                        preview_s = text[:800].replace('\n', '\\n')
+                        name = f.name
+                        lines.append(f"- {name}: {preview_s}{'... [truncated]' if len(text) > 800 else ''}")
+                    lines.append("When generating verifiers, prefer these skeletons as starting templates and try minimal header permutations to determine required auth headers.")
+        except Exception:
+            # best-effort; never fail prompt construction
+            pass
         return "\n".join(lines)
 
     def _build_target_map_content(self) -> str:

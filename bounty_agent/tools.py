@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import time
+from types import SimpleNamespace
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -17,6 +18,7 @@ from .artifact_store import ArtifactStore, artifact_manifest
 from .auth_context import AuthContext
 from .browser_worker import BROWSER_WORKER_SCRIPT
 from .canonical_surface import normalize_url
+from .controls import DynamicRateLimiter, GeminiAdjudicator
 from .engagement_state import EngagementStateStore
 from .infrastructure import ChallengeType, InfrastructureStore, classify_response, extract_hosts_from_tool_output
 from .retrieval import RetrievalStore
@@ -101,6 +103,8 @@ class ToolRegistry:
         self._infra_store: Optional[InfrastructureStore] = None
         self._strategy_memory: Optional[StrategyMemory] = None
         self._auth_context: Optional[AuthContext] = None
+        self._adjudicator: Any = None
+        self.scorecard: Any | None = None
 
     def set_infrastructure_store(self, store: InfrastructureStore) -> None:
         """Attach infrastructure store for WAF/challenge awareness."""
@@ -121,6 +125,14 @@ class ToolRegistry:
     def set_auth_gate_classifier(self, classifier: Any) -> None:
         """Attach the Milestone 2 auth-gate classifier."""
         self._auth_gate_classifier = classifier
+
+    def set_adjudicator(self, adjudicator: Any) -> None:
+        """Attach the Milestone 4.2 cross-model adjudicator."""
+        self._adjudicator = adjudicator
+
+    def set_scorecard(self, scorecard: Any | None) -> None:
+        """Attach an optional benchmark scorecard for live measurement."""
+        self.scorecard = scorecard
 
     def set_execution_context(self, *, objective_id: str | None = None, hypothesis_id: str | None = None,
                               target: str = "") -> None:
@@ -211,6 +223,7 @@ class ToolRegistry:
         self.history.append((action, result))
         self._record_recon_state(action, result)
         self._record_phase_one_state(action, result)
+        self._record_scorecard_event(action, result)
         return result
 
     def _record_phase_one_state(self, action: dict[str, Any], result: ToolResult) -> None:
@@ -303,12 +316,24 @@ class ToolRegistry:
                     {"tool_presence_blocked": True, "count": self.tool_presence_count},
                 )
 
-        # Cookie group injection from structured auth context
-        auth_group = action.get("auth_group", "")
-        if auth_group and self._auth_context:
-            cookie_header = self._auth_context.cookie_header_for_group(self.active_target, auth_group)
-            extra_headers = self._auth_context.extra_headers_for_group(self.active_target, auth_group)
-            # Inject cookie into curl-like commands
+        # Cookie group injection from structured auth context.
+        # Prefer an explicit auth_group when supplied, but also fall back to a
+        # matching target entry so authenticated probes still reuse cookies even
+        # when the model does not spell out the group.
+        if self._auth_context:
+            auth_group = str(action.get("auth_group", "") or "").strip()
+            target_for_auth = self.active_target or _action_target(action) or ""
+            cookie_header = ""
+            extra_headers = {}
+            if auth_group:
+                cookie_header = self._auth_context.cookie_header_for_group(target_for_auth, auth_group)
+                extra_headers = self._auth_context.extra_headers_for_group(target_for_auth, auth_group)
+            elif target_for_auth:
+                matched = self._auth_context._find_target(target_for_auth)
+                if matched and matched.cookie_groups:
+                    first_group = matched.cookie_groups[0]
+                    cookie_header = self._auth_context.cookie_header_for_group(target_for_auth, first_group.group_id)
+                    extra_headers = self._auth_context.extra_headers_for_group(target_for_auth, first_group.group_id)
             if cookie_header and ("curl" in command or "httpx" in command):
                 if "-H" not in command:
                     cmd_cookies = f" -H 'Cookie: {cookie_header}'"
@@ -317,7 +342,6 @@ class ToolRegistry:
                     if hdr_name.lower() not in ("cookie", "authorization"):
                         command += f" -H '{hdr_name}: {hdr_value}'"
             elif cookie_header and ("--cookie" not in command):
-                # For httpx/katana/nuclei, use the --header or -H approach
                 if "httpx" in command:
                     command = command.replace("httpx", f"httpx -H 'Cookie: {cookie_header}'", 1)
                 elif "katana" in command:
@@ -331,9 +355,16 @@ class ToolRegistry:
         result = self.runner.exec(command, timeout)
         self._add_discovered_hosts(result.stdout or "", result.stderr or "")
 
-        # Infrastructure-aware block detection using classify_response
+        # Milestone 4.1: record rate-limit hits for dynamic backoff
         combined = (result.stdout or "") + " " + (result.stderr or "")
         exit_ok = result.exit_code == 0
+        if not exit_ok and re.search(r"\b(429|403)\b", combined):
+            dynamic = getattr(self.rate_limiter, "_dynamic", None)
+            if dynamic is not None:
+                dynamic.record_rate_limit_hit()
+            result.meta["rate_limit_hit"] = True
+
+        # Infrastructure-aware block detection using classify_response
 
         # Only classify if the command had an error and looks like HTTP output
         infra_classified = False
@@ -884,6 +915,21 @@ class ToolRegistry:
                 {"duplicate": True},
             )
 
+        # Milestone 4.2: cross-model adjudication before recording
+        if self._adjudicator is not None:
+            try:
+                adjudication = self._adjudicator.adjudicate(finding)
+                if adjudication.get("verdict") != "validated":
+                    reasons = "; ".join(adjudication.get("reasons", []))
+                    return ToolResult(
+                        False,
+                        f"Finding rejected by cross-model adjudicator ({adjudication.get('model', 'unknown')}): {reasons}. "
+                        "Save it as evidence or notes until a second model validates it.",
+                        {"finding_rejected": True, "adjudicator": True, "reasons": adjudication.get("reasons", [])},
+                    )
+            except Exception as exc:
+                self.trace.write("adjudicator_error", error=f"{type(exc).__name__}: {exc}")
+
         self.finding_fingerprints.add(fingerprint)
         self.findings.append(finding)
         return ToolResult(True, f"Recorded finding: {finding.title}")
@@ -943,6 +989,44 @@ class ToolRegistry:
             ),
             {"repeat_blocked": True, "repeat_count": count, "fingerprint": fingerprint},
         )
+
+    def _record_scorecard_event(self, action: dict[str, Any], result: ToolResult) -> None:
+        if not self.scorecard:
+            return
+        name = str(action.get("action", ""))
+        if name == "record_finding":
+            if result.meta.get("finding_rejected"):
+                detail = str(result.content)[:2000]
+                self.scorecard.record(SimpleNamespace(
+                    phase="m4_adjud",
+                    name="finding_rejected",
+                    passed=True,
+                    detail=detail,
+                    metric="finding_rejected",
+                    value=None,
+                ))
+            elif result.ok:
+                self.scorecard.record_finding({
+                    "title": str(action.get("title", "Untitled finding")),
+                    "evidence": str(action.get("evidence", "")),
+                })
+                self.scorecard.record(SimpleNamespace(
+                    phase="m4_adjud",
+                    name="finding_recorded",
+                    passed=True,
+                    detail=str(action.get("title", ""))[:2000],
+                    metric="finding_recorded",
+                    value=1.0,
+                ))
+        elif name == "bash" and result.meta.get("rate_limit_hit"):
+            self.scorecard.record(SimpleNamespace(
+                phase="m4_rate",
+                name="rate_limit_hit",
+                passed=False,
+                detail=str(action.get("command", ""))[:2000],
+                metric="rate_limit_hit",
+                value=1.0,
+            ))
 
     def _record_surface_outcome(self, attack: AttackResult) -> None:
         try:
@@ -1004,9 +1088,20 @@ class CommandRateLimiter:
         self.min_interval = 60.0 / max_commands_per_minute if max_commands_per_minute > 0 else 0.0
         self.trace = trace
         self._last_command_at = 0.0
+        # Milestone 4.1: dynamic rate-limit maintenance
+        self._dynamic: DynamicRateLimiter | None = None
+
+    def attach_dynamic(self, dynamic: DynamicRateLimiter) -> None:
+        """Attach a dynamic rate limiter that maintains below the real limit."""
+        self._dynamic = dynamic
 
     def wait(self) -> None:
-        required_delay = max(self.delay_seconds, self.min_interval)
+        # Use the dynamic effective limit if attached (M4.1)
+        if self._dynamic is not None:
+            dynamic_interval = self._dynamic.min_interval_seconds()
+            required_delay = max(self.delay_seconds, dynamic_interval)
+        else:
+            required_delay = max(self.delay_seconds, self.min_interval)
         if required_delay <= 0:
             return
         now = time.monotonic()

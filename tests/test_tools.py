@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from bounty_agent.auth_context import AuthContext, CookieDef, CookieGroup
 from bounty_agent.config import AgentSettings, ProgramScope
 from bounty_agent.report import write_report
 from bounty_agent.scope import ScopeGuard
@@ -93,6 +94,33 @@ def test_httpx_tool_adds_scheme_for_raw_ip_targets() -> None:
     registry.execute({"action": "httpx", "target": "198.51.100.10", "timeout_seconds": 5})
 
     assert registry.runner.commands[0].startswith("httpx")
+
+
+def test_auth_context_is_auto_injected_for_matching_subdomains() -> None:
+    registry = make_registry()
+    registry.set_auth_context(
+        AuthContext(
+            targets={
+                "https://gx.games/": (
+                    type(
+                        "TargetAuth",
+                        (),
+                        {
+                            "target": "https://gx.games/",
+                            "cookie_groups": [CookieGroup("gx-session", [CookieDef("SESSION", "abc123")])],
+                            "har_evidence_paths": [],
+                            "notes": "",
+                        },
+                    )()
+                )
+            }
+        )
+    )
+    registry.set_execution_context(target="https://api.gx.games/api/v1/graphql")
+
+    registry.execute({"action": "bash", "command": "curl https://api.gx.games/api/v1/graphql", "timeout_seconds": 5})
+
+    assert "Cookie: SESSION=abc123" in registry.runner.commands[0]
 
 
 def test_inql_tool_command_is_built() -> None:

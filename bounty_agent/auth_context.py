@@ -148,6 +148,20 @@ class AuthContext:
                 return ta
             target_host = urlparse(target).hostname or ""
             auth_host = urlparse(url).hostname or ""
-            if target_host and auth_host and target_host == auth_host:
+            if self._hosts_match(target_host, auth_host):
                 return ta
         return None
+
+    @staticmethod
+    def _hosts_match(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        if left.endswith(f".{right}") or right.endswith(f".{left}"):
+            return True
+        left_parts = left.split(".")
+        right_parts = right.split(".")
+        if len(left_parts) >= 2 and len(right_parts) >= 2:
+            return ".".join(left_parts[-2:]) == ".".join(right_parts[-2:])
+        return False

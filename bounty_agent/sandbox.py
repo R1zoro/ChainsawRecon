@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import os
 import subprocess
+
+
+def _safe_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "VIRTUAL_ENV"}}
+    return env
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,23 @@ class LocalWorkspaceRunner(SandboxRunner):
         self.workspace.mkdir(parents=True, exist_ok=True)
 
     def exec(self, command: str, timeout_seconds: int) -> CommandResult:
+        env = None
+        if self.settings is not None:
+            env = dict(**_safe_env())
+            if getattr(self.settings, "http_proxy", ""):
+                env["HTTP_PROXY"] = self.settings.http_proxy
+                env["http_proxy"] = self.settings.http_proxy
+            if getattr(self.settings, "https_proxy", ""):
+                env["HTTPS_PROXY"] = self.settings.https_proxy
+                env["https_proxy"] = self.settings.https_proxy
+            if getattr(self.settings, "burp_proxy", ""):
+                env["HTTP_PROXY"] = self.settings.burp_proxy
+                env["http_proxy"] = self.settings.burp_proxy
+                env["HTTPS_PROXY"] = self.settings.burp_proxy
+                env["https_proxy"] = self.settings.burp_proxy
+            if getattr(self.settings, "no_proxy", ""):
+                env["NO_PROXY"] = self.settings.no_proxy
+                env["no_proxy"] = self.settings.no_proxy
         try:
             completed = subprocess.run(
                 command,
@@ -52,6 +75,7 @@ class LocalWorkspaceRunner(SandboxRunner):
                 errors="replace",
                 capture_output=True,
                 timeout=timeout_seconds,
+                env=env,
             )
             return CommandResult(command, completed.returncode, completed.stdout, completed.stderr)
         except subprocess.TimeoutExpired as exc:
@@ -103,6 +127,24 @@ class DockerSandboxRunner(LocalWorkspaceRunner):
             "-c",
             f"timeout -s KILL -k 5 {timeout_seconds} sh -c {self._shell_quote(command)}",
         ]
+        env = None
+        if self.settings is not None:
+            env = dict(**_safe_env())
+            if getattr(self.settings, "http_proxy", ""):
+                env["HTTP_PROXY"] = self.settings.http_proxy
+                env["http_proxy"] = self.settings.http_proxy
+            if getattr(self.settings, "https_proxy", ""):
+                env["HTTPS_PROXY"] = self.settings.https_proxy
+                env["https_proxy"] = self.settings.https_proxy
+            if getattr(self.settings, "no_proxy", ""):
+                env["NO_PROXY"] = self.settings.no_proxy
+                env["no_proxy"] = self.settings.no_proxy
+            # Milestone 5.1: Burp proxy capture via host.docker.internal:8080
+            if getattr(self.settings, "burp_proxy", ""):
+                env["HTTP_PROXY"] = self.settings.burp_proxy
+                env["http_proxy"] = self.settings.burp_proxy
+                env["HTTPS_PROXY"] = self.settings.burp_proxy
+                env["https_proxy"] = self.settings.burp_proxy
         try:
             completed = subprocess.run(
                 docker_command,
@@ -111,6 +153,7 @@ class DockerSandboxRunner(LocalWorkspaceRunner):
                 errors="replace",
                 capture_output=True,
                 timeout=timeout_seconds + 10,
+                env=env,
             )
             return CommandResult(command, completed.returncode, completed.stdout, completed.stderr)
         except subprocess.TimeoutExpired as exc:
@@ -142,9 +185,34 @@ class DockerSandboxRunner(LocalWorkspaceRunner):
             "run",
             "-d",
             "--rm",
+            "--add-host",
+            "host.docker.internal:host-gateway",
             "-e",
             "PATH=/root/go/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin",
         ]
+        if self.settings is not None:
+            if getattr(self.settings, "burp_proxy", ""):
+                command.extend([
+                    "-e", f"HTTP_PROXY={self.settings.burp_proxy}",
+                    "-e", f"http_proxy={self.settings.burp_proxy}",
+                    "-e", f"HTTPS_PROXY={self.settings.burp_proxy}",
+                    "-e", f"https_proxy={self.settings.burp_proxy}",
+                ])
+            if getattr(self.settings, "http_proxy", ""):
+                command.extend([
+                    "-e", f"HTTP_PROXY={self.settings.http_proxy}",
+                    "-e", f"http_proxy={self.settings.http_proxy}",
+                ])
+            if getattr(self.settings, "https_proxy", ""):
+                command.extend([
+                    "-e", f"HTTPS_PROXY={self.settings.https_proxy}",
+                    "-e", f"https_proxy={self.settings.https_proxy}",
+                ])
+            if getattr(self.settings, "no_proxy", ""):
+                command.extend([
+                    "-e", f"NO_PROXY={self.settings.no_proxy}",
+                    "-e", f"no_proxy={self.settings.no_proxy}",
+                ])
         if self.env_file and self.env_file.exists():
             command.extend(["--env-file", str(self.env_file.resolve())])
         command.extend([

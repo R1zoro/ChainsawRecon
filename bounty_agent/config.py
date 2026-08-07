@@ -69,6 +69,10 @@ class AgentSettings:
     priority_targets_path: Path | None = None
     source_code_path: Path | None = None
     har_paths: tuple[Path, ...] = ()
+    http_proxy: str = ""
+    https_proxy: str = ""
+    no_proxy: str = ""
+    burp_proxy: str = ""  # M5.1: e.g. http://host.docker.internal:8080
 
 
 def env_or_default(name: str, default: str) -> str:

@@ -1,0 +1,69 @@
+{
+  "target": "http://localhost:3000",
+  "target_type": "dvwa",
+  "started_at": "2026-08-04T16:04:23+00:00",
+  "recall": {
+    "true_positives": 0,
+    "expected_findings": 6,
+    "matched_ids": [],
+    "recall_pct": 0.0
+  },
+  "precision": {
+    "false_positives_blocked": 0,
+    "recorded_findings": 0
+  },
+  "controls": {
+    "rate_limit_hits": 0,
+    "total_events": 6
+  },
+  "events": [
+    {
+      "phase": "m5_harness",
+      "name": "expected_finding:juice-reflected-xss",
+      "passed": false,
+      "metric": "finding_expected",
+      "value": 0.0,
+      "detail": "xss @ /rest/product/5/search"
+    },
+    {
+      "phase": "m5_harness",
+      "name": "expected_finding:juice-idor-rest",
+      "passed": false,
+      "metric": "finding_expected",
+      "value": 0.0,
+      "detail": "idor @ /rest/basket/1"
+    },
+    {
+      "phase": "m5_harness",
+      "name": "expected_finding:juice-ssti",
+      "passed": false,
+      "metric": "finding_expected",
+      "value": 0.0,
+      "detail": "ssti @ /rest/feedback"
+    },
+    {
+      "phase": "m5_harness",
+      "name": "expected_finding:juice-sql-comment",
+      "passed": false,
+      "metric": "finding_expected",
+      "value": 0.0,
+      "detail": "sqli @ /rest/user/login"
+    },
+    {
+      "phase": "m5_harness",
+      "name": "expected_finding:juice-qs-injection",
+      "passed": false,
+      "metric": "finding_expected",
+      "value": 0.0,
+      "detail": "reset @ /rest/user/reset-password"
+    },
+    {
+      "phase": "m5_harness",
+      "name": "expected_finding:juice-secrets",
+      "passed": false,
+      "metric": "finding_expected",
+      "value": 0.0,
+      "detail": "secrets @ /etc/passwd"
+    }
+  ]
+}

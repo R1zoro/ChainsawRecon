@@ -37,9 +37,9 @@
 ---
 
 ## Milestone 4 — Controls & Validation
-- [ ] **M4.1 Rate-limit boundary probing + dynamic maintenance** — probe X/X+1/X+2 once, record real limit as a fact, `CommandRateLimiter` maintains below it; rate-limit hits tracked as a first-class category. Add `rate_limits` block to Opera scope.json.
-- [ ] **M4.2 Cross-model validation** — Ollama primary + Gemini API adjudicator runs the 7-Question Gate on each finding candidate.
-- [ ] **M4.3 Auto-register cleanup** — reverse-order cleanup registry on SIGINT/crash/exit.
+- [x] **M4.1 Rate-limit boundary probing + dynamic maintenance** — new `controls.py`: `RateLimitProbe` probes X/X+1/X+2 once; `DynamicRateLimiter` maintains below the real limit and halves on each 429/403 hit; wired into `CommandRateLimiter` + `_bash` rate-limit detection. `rate_limits` block in `scope.json` already supported.
+- [x] **M4.2 Cross-model validation** — `GeminiAdjudicator` (controls.py) re-runs the 7-Question Gate on each finding candidate via Gemini API; wired into `ToolRegistry._record_finding`. Requires `GEMINI_API_KEY`.
+- [x] **M4.3 Auto-register cleanup** — `CleanupRegistry` + `atexit` hook (controls.py); agent registers runner/store close callbacks in reverse order; runs on SIGINT/crash/exit.
 
 ---
 

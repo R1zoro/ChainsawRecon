@@ -98,8 +98,7 @@ class ReconStore:
                 status TEXT NOT NULL,
                 tags TEXT NOT NULL,
                 meta TEXT NOT NULL,
-                fingerprint TEXT NOT NULL UNIQUE,
-                last_seen TEXT NOT NULL
+                fingerprint TEXT NOT NULL UNIQUE
             )
             """
         )
@@ -117,8 +116,7 @@ class ReconStore:
                 auth_context TEXT NOT NULL,
                 tags TEXT NOT NULL,
                 meta TEXT NOT NULL,
-                fingerprint TEXT NOT NULL UNIQUE,
-                last_seen TEXT NOT NULL
+                fingerprint TEXT NOT NULL UNIQUE
             )
             """
         )
@@ -135,11 +133,11 @@ class ReconStore:
                 evidence TEXT NOT NULL,
                 tags TEXT NOT NULL,
                 meta TEXT NOT NULL,
-                fingerprint TEXT NOT NULL UNIQUE,
-                last_seen TEXT NOT NULL
+                fingerprint TEXT NOT NULL UNIQUE
             )
             """
         )
+        self._ensure_last_seen_columns()
         # Phase 2 world-model tables. They live beside durable engagement recon
         # data and are intentionally additive for compatibility with old runs.
         self.conn.execute("CREATE TABLE IF NOT EXISTS organizations(id TEXT PRIMARY KEY, name TEXT NOT NULL, domain TEXT, industry TEXT, created_at TEXT NOT NULL)")
@@ -183,6 +181,13 @@ class ReconStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_relationship_source ON relationships(source_kind, source_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_relationship_target ON relationships(target_kind, target_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_browser_requests_capture ON browser_requests(capture_id)")
+        self.conn.commit()
+
+    def _ensure_last_seen_columns(self) -> None:
+        for table_name in ("facts", "surfaces", "attacks"):
+            cols = [row[1] for row in self.conn.execute(f"PRAGMA table_info({table_name})")]
+            if "last_seen" not in cols:
+                self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN last_seen TEXT")
         self.conn.commit()
 
     def add_observation(self, observation: ReconObservation) -> None:

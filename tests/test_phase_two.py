@@ -25,6 +25,20 @@ def test_world_model_materializes_generator_hosts_and_exports_catalogs(tmp_path)
     assert any(item["path"] == "/v1/orders" for item in summary["routes"])
     world.write_catalogs(tmp_path / "catalogs")
     assert (tmp_path / "catalogs" / "world-model.json").exists()
+
+
+def test_world_model_ignores_invalid_persisted_service_hosts(tmp_path):
+    store = ReconStore(tmp_path / "engagement.db")
+    world = WorldModel(store, "eng-2", program_name="Example", target="https://app.example.com", mode="mapping")
+    world.store.conn.execute(
+        "INSERT INTO services(id,app_id,name,service_type,host,port,tls,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("svc-bad", stable_id("svc", "app-2", "auth-context.txt"), "garbage", "web", "auth-context.txt", None, "unknown", "2026-08-05T00:00:00Z"),
+    )
+    world.store.conn.commit()
+    world.write_catalogs(tmp_path / "catalogs")
+    summary = world.architecture_summary()
+    assert all(item["host"] != "auth-context.txt" for item in summary["services"])
+    assert all(item["host"] != "auth-context.txt" for item in summary["routes"])
     store.close()
 
 

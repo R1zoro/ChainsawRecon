@@ -299,12 +299,15 @@ class WorldModel:
         source_assets = self.store.conn.execute("SELECT path,kind,language,framework,source FROM source_assets ORDER BY path").fetchall()
         browser_captures = self.store.conn.execute("SELECT path,title,source FROM browser_captures ORDER BY path").fetchall()
         sessions = self.store.conn.execute("SELECT context,cookie_scope,samesite,httponly,secure,browser_only FROM sessions ORDER BY context").fetchall()
+        valid_services = [row for row in services if _is_valid_service_host(str(row[3]))]
+        valid_hosts = {row[3].lower() for row in valid_services}
+        valid_routes = [row for row in routes if _is_valid_service_host(str(row[0])) and row[0].lower() in valid_hosts]
         return {
             "engagement_id": self.engagement_id,
             "applications": [dict(zip(("id", "name", "framework", "language", "frontend", "cdn_waf", "api_style", "graphql_impl", "auth_provider"), row)) for row in applications],
-            "services": [dict(zip(("id", "app_id", "name", "host", "service_type", "tls"), row)) for row in services],
+            "services": [dict(zip(("id", "app_id", "name", "host", "service_type", "tls"), row)) for row in valid_services],
             "technologies": [dict(zip(("name", "version", "category", "confidence", "source"), row)) for row in technologies],
-            "routes": [dict(zip(("host", "path", "method", "auth_required", "source"), row)) for row in routes],
+            "routes": [dict(zip(("host", "path", "method", "auth_required", "source"), row)) for row in valid_routes],
             "relationships": [
                 {**dict(zip(("source_kind", "source_id", "relation", "target_kind", "target_id", "confidence", "source"), row[:-1])), "meta": _loads(row[-1])}
                 for row in relationships
@@ -399,12 +402,7 @@ def _guard_catalog_sanity(summary: dict[str, Any]) -> None:
     bad_hosts = [
         svc["host"]
         for svc in summary.get("services", [])
-        if not isinstance(svc.get("host"), str)
-        or not svc["host"]
-        or svc["host"] in _INVALID_SERVICE_TOKENS
-        or any(marker in svc["host"].lower() for marker in (" ", "\t", "/", "\\", ":", "|", "&", ";", "$", "`", "(", ")", "{", "}", "[", "]", "<", ">", "=", "'", '"'))
-        or svc["host"].lower().endswith((".py", ".txt", ".md", ".json", ".sh", ".js", ".map"))
-        or "." not in svc["host"].lower()
+        if not _is_valid_service_host(str(svc.get("host", "")))
     ]
     if bad_hosts:
         raise RuntimeError(

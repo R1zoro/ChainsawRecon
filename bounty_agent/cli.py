@@ -56,16 +56,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runner", choices=["local", "docker"], default="local")
     parser.add_argument("--docker-image", default="bounty-sandbox")
     parser.add_argument("--docker-env-file", type=Path, help="Optional env file passed into the Docker sandbox.")
+    parser.add_argument("--proxy", help="Proxy URL for both HTTP and HTTPS traffic, e.g. http://host.docker.internal:8080.")
+    parser.add_argument("--http-proxy", help="HTTP proxy URL. Overrides --proxy for HTTP traffic.")
+    parser.add_argument("--https-proxy", help="HTTPS proxy URL. Overrides --proxy for HTTPS traffic.")
+    parser.add_argument("--no-proxy", help="Hosts or CIDRs to exclude from proxying.")
+    parser.add_argument("--burp-proxy", default="", help="Milestone 5.1: Burp proxy URL for passive capture, e.g. http://host.docker.internal:8080. Routes sandbox traffic through Burp.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and trace planned actions without execution.")
     parser.add_argument("--execute", action="store_true", help="Actually run approved commands. Default is dry-run.")
     parser.add_argument("--clean", action="store_true", help="Run the cleaner pass: audit curated engagement assets and write cleaner-report.md.")
-    parser.add_argument("--clean-apply", action="store_true", help="Same as --clean but also attempt to apply corrections.")
+    parser.add_argument("--apply", "--clean-apply", action="store_true", dest="clean_apply",
+                        help="When used with --clean, indicate that cleaner corrections should be applied instead of read-only audit.")
+    parser.add_argument("--benchmark", help="M5.2: Run evaluation harness against a vulnerable-lab target URL (Juice Shop / DVWA). Emits a scorecard template by default; use --execute to run live.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     load_env_file(Path(".env"))
+    # Milestone 5.2: evaluation harness -- dry mode needs no program/engagement
+    if args.benchmark:
+        from .benchmark import run_benchmark
+        scope_path = (args.program or (args.engagement / "program" / "scope.json")) if args.program or args.engagement else None
+        scorecard_path = run_benchmark(args.benchmark, scope_path, dry=not args.execute)
+        print(f"Benchmark scorecard: {scorecard_path}")
+        return 0
     program_path = resolve_program_path(args.program, args.engagement)
     prompt_path = resolve_prompt_path(args.prompt, args.engagement)
     runs_dir = resolve_runs_dir(args.runs_dir, args.engagement)
@@ -123,7 +137,12 @@ def main(argv: list[str] | None = None) -> int:
         priority_targets_path=resolve_priority_targets_path(args.priority_file, args.engagement),
         source_code_path=args.source_dir,
         har_paths=tuple(args.har_file),
+        http_proxy=args.http_proxy or args.proxy or "",
+        https_proxy=args.https_proxy or args.proxy or "",
+        no_proxy=args.no_proxy or "",
+        burp_proxy=args.burp_proxy or "",
     )
+
     if args.clean or args.clean_apply:
         if not args.engagement:
             raise SystemExit("--clean requires --engagement.")
@@ -187,7 +206,12 @@ def resolve_priority_targets_path(priority_file: Path | None, engagement: Path |
     if priority_file:
         return priority_file
     if engagement:
-        for name in ("priority-targets.txt", "priority.txt", "deep-targets.txt"):
+        for name in (
+            "priority-targets.txt",
+            "priority_targets.txt",
+            "priority.txt",
+            "deep-targets.txt",
+        ):
             candidate = engagement / "program" / name
             if candidate.exists():
                 return candidate

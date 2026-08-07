@@ -2,9 +2,11 @@ import json
 from pathlib import Path
 
 from bounty_agent.cli import (
+    build_parser,
     resolve_docker_env_file,
     resolve_engagement_db_path,
     resolve_program_path,
+    resolve_priority_targets_path,
     resolve_prompt_path,
     resolve_runs_dir,
     resolve_targets,
@@ -33,6 +35,15 @@ def test_explicit_paths_win() -> None:
 
 def test_explicit_docker_env_file_wins() -> None:
     assert resolve_docker_env_file(Path("secrets.env"), Path("engagements/acme")) == Path("secrets.env")
+
+
+def test_priority_targets_detects_underscored_filename(tmp_path: Path) -> None:
+    engagement = tmp_path / "engagements" / "acme"
+    program_dir = engagement / "program"
+    program_dir.mkdir(parents=True)
+    (program_dir / "priority_targets.txt").write_text("https://foo.example\n", encoding="utf-8")
+
+    assert resolve_priority_targets_path(None, engagement) == program_dir / "priority_targets.txt"
 
 
 def test_engagement_db_defaults_under_agent_folder() -> None:
@@ -87,3 +98,14 @@ def test_program_scope_expands_allowed_hosts_from_engagement_in_scope(tmp_path: 
 
     assert "198.51.100.10" in scope.allowed_domains
     assert "api.example.com" in scope.allowed_domains
+
+
+def test_clean_apply_flag_parses_both_aliases() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--engagement", "engagements/acme", "--clean", "--apply"])
+    assert args.clean is True
+    assert args.clean_apply is True
+
+    args2 = parser.parse_args(["--engagement", "engagements/acme", "--clean", "--clean-apply"])
+    assert args2.clean is True
+    assert args2.clean_apply is True

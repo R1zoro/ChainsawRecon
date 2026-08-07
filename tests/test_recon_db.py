@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
@@ -76,6 +77,40 @@ def test_next_task_planner_prefers_uncovered_js_and_api_surfaces() -> None:
         assert any(task["attack_type"] != "api" for task in summary["next_tasks"]) or summary["next_tasks"][0][
             "surface_type"
         ] != "api"
+    finally:
+        store.close()
+
+
+def test_legacy_database_schema_is_migrated_to_add_last_seen_columns() -> None:
+    db_path = _test_db_path("legacy")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE facts(
+                id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                source TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                status TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                meta TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = ReconStore(db_path)
+    try:
+        cols = [row[1] for row in store.conn.execute("PRAGMA table_info(facts)")]
+        assert "last_seen" in cols
     finally:
         store.close()
 
