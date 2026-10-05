@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-"""Deterministic mapping decisions used to constrain, not replace, the LLM."""
+"""Model-driven mapping decisions.
+
+The coordinator gives the model a compact mission based on evidence gaps and
+leaves the model to choose the lawful, scoped experiment that fills the gap.
+Mapping state is stored in the run workspace as artifacts and in the engagement
+state store as validated evidence. At end-of-run, validated mapping data is
+promoted to the engagement-wide knowledge base.
+"""
 
 from dataclasses import dataclass
 from typing import Iterable
@@ -23,6 +30,7 @@ class MappingSnapshot:
     api_routes: int
     authenticated_routes: int
     recommended_focus: tuple[str, ...]
+    suggested_actions: tuple[str, ...]
 
 
 class MappingCoordinator:
@@ -50,19 +58,25 @@ class MappingCoordinator:
         if not hosts:
             phase = self.phases[0]
             focus = ("establish in-scope hosts from durable evidence",)
+            actions = ("browser_map", "httpx", "use_skill:target_mapping")
         elif technology_count == 0:
             phase = self.phases[1]
             focus = ("collect one bounded response or local artifact per representative host",)
+            actions = ("httpx", "whatweb", "wafw00f", "browser_map")
         elif not values:
             phase = self.phases[2]
             focus = ("map public routes and API entry points before exploit testing",)
+            actions = ("katana", "gau", "waybackurls", "browser_map")
         elif browser_capture_count == 0 and authenticated == 0:
             phase = self.phases[3]
             focus = ("separate guest and authorized browser paths when an auth context is available",)
+            actions = ("browser_map", "use_skill:target_mapping")
         elif source_asset_count == 0:
             phase = self.phases[4]
             focus = ("inspect available client artifacts or source only; do not infer missing code",)
+            actions = ("katana", "browser_map", "use_skill:source_analysis")
         else:
             phase = self.phases[4]
             focus = ("correlate source, browser, and observed routes; identify evidence gaps",)
-        return MappingSnapshot(phase, len(hosts), len(values), api_routes, authenticated, focus)
+            actions = ("search_artifact", "read_artifact_slice", "browser_map")
+        return MappingSnapshot(phase, len(hosts), len(values), api_routes, authenticated, focus, tuple(actions))

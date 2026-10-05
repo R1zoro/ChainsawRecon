@@ -16,6 +16,10 @@ Designed for authorized penetration testing, security audits, and defensive surf
 * **Independent Validation Engine:** Findings follow an evidence ladder and must pass independent replay and differential control testing before classification.
 * **Deterministic Hunt Engine (M2):** Tool-first policy steers the model to dedicated security tools over generic Python loops; endpoint-exhaustion tracking prunes dead endpoints; auth-gate awareness prevents login walls from being reported as findings; a 7-Question Gate validates every finding candidate.
 * **Knowledge & Tradecraft (M3):** Per-vuln-class skill packs (IDOR, SSRF, XSS, SQLi, upload, OAuth, race, GraphQL authz) auto-load based on discovered surfaces; a report-writing skill produces submission-grade write-ups; deterministic OSV/Tavily research probes replace HTML scraping.
+* **Playwright Auth Pipeline:** Deterministic Firefox login worker for simple id+password apps. Credentials are read from environment variables named in the engagement auth JSON — never written to spec files, prompts, traces, or artifacts. Supports cookie capture, operator-maintained cookie renewal, and verify-only session checks. Sessionless in-scope subdomains stay on the unauthenticated mapping lane.
+* **Verified Burp MCP Adapter:** Tool catalog, wire format, and pagination verified against the live PortSwigger `mcp-server` extension (default `http://127.0.0.1:9876`). History entries get stable synthesized ids (`index-hash`) so the model can search → retrieve → replay → compare → open Repeater tabs against real captures.
+* **Deterministic Worker Gate, Nuclei Action & Surface Router:** Worker action contracts are hard-blocked at dispatch (not just prompt guidance); nuclei runs as a typed, scope-checked action with JSONL evidence parsing; a fingerprinting surface router picks the specialist lane with a burned-rung fallback ladder.
+* **ASM-Style Asset Staleness:** World-model assets (services, routes, technologies) carry `last_seen`; anything not re-observed within 30 days is flagged as stale in the architecture summary instead of being trusted forever.
 * **Human-Readable Catalogs & Machine-Readable State:** Generates both SQLite/JSON knowledge graphs for AI reasoning and clean Markdown/TSV catalogs for manual testing and reporting.
 
 ---
@@ -156,6 +160,111 @@ python -m bounty_agent.cli \
   --max-commands-per-minute 40
 ```
 
+### Burp MCP request workflow
+
+Burp MCP is the preferred Burp integration. The agent searches requests
+captured by Burp, retrieves full request/response bodies only when needed,
+creates Repeater experiments from captured templates, applies narrow patches,
+and stores the complete result as an engagement artifact. It does not require
+the model to reconstruct cookies, CSRF values, or browser headers manually.
+
+Start Burp Suite with the MCP extension enabled and use the endpoint and
+transport shown by that extension (default `http://127.0.0.1:9876`). The
+endpoint is host-side; it normally must not be placed inside the Docker
+sandbox.
+
+PowerShell example:
+
+```powershell
+python -m bounty_agent.cli `
+  --engagement engagements\Pixabay `
+  --mode attack `
+  --provider ollama `
+  --model ollama/qwen3.5:4b `
+  --llm-base-url http://localhost:11434/v1 `
+  --llm-api-key ollama `
+  --runner docker `
+  --docker-image bounty-sandbox `
+  --execute `
+  --auth-file engagements\Pixabay\program\auth.json `
+  --burp-mcp-url http://127.0.0.1:9876 `
+  --burp-mcp-transport sse `
+  --max-steps 600 `
+  --max-commands-per-minute 50
+```
+
+Use `--burp-mcp-transport streamable-http` when the extension exposes an MCP
+streamable HTTP endpoint instead of SSE. Add `--burp-mcp-token` only when the
+extension is configured to require a bearer token. `--burp-api-url` and
+`--burp-api-key` remain deprecated compatibility flags for the older REST
+path; they are not needed for MCP.
+
+At run start, ChainsawRecon performs a non-fatal MCP health and capability
+preflight. The result is written to the trace. If Burp is closed or the
+extension exposes insufficient capabilities, the run continues with the
+remaining mapping/CLI tools and the MCP actions return an actionable error.
+The exact extension tool names are discovered at runtime through `tools/list`
+and mapped to the agent's stable semantic actions.
+
+### Authentication lanes
+
+Each run registers an engagement-level session lane in
+`knowledge/sessions.db`. The database stores session identity, source, role,
+status, expiry/validation metadata, and Burp rule references; it does not store
+raw cookies or bearer values. Existing `--auth-file`/`--auth-context` inputs
+remain supported.
+
+Choose the acquisition mode explicitly when needed:
+
+```powershell
+--auth-mode operator-handover `
+--auth-session-alias PixabayLogin `
+--auth-wait-timeout 300
+```
+
+Use `recorded-login` for a Burp session-handling rule or recorded flow,
+`operator-handover` when the operator authenticates in the visible browser,
+`credentials` only with a configured local secret reference, and `none` for
+unauthenticated mapping. The model receives only a compact lane status and
+retrieves full cookies or requests through the explicitly selected Burp/auth
+action when the testing hypothesis requires them.
+
+### Playwright login pipeline (simple id+password apps)
+
+For basic user/pass web apps, the agent can acquire and maintain the session
+itself. Add a top-level `"login"` block to the engagement auth JSON:
+
+```json
+{
+  "login": {
+    "url": "https://app.example.com/login",
+    "username_env": "CHAINSAW_AUTH_USERNAME",
+    "password_env": "CHAINSAW_AUTH_PASSWORD",
+    "success_url_contains": "/dashboard",
+    "verify_url": "https://app.example.com/account",
+    "verify_indicator": "Sign out",
+    "session_alias": "main-user",
+    "role": "user",
+    "maintain_cookies": ["remember_me"]
+  }
+}
+```
+
+The block names **environment variables**, never secret values — put the
+actual credentials in `.env` / `secrets.env`. The agent gains four actions:
+
+| Action | Behaviour |
+|---|---|
+| `session_status` | Lists session lanes for the engagement and their state. |
+| `perform_login` | Runs a deterministic Playwright Firefox login in the sandbox, captures cookies/storage, registers an `active` lane. |
+| `verify_session` | Cookie-injection check of the stored cookies against `verify_url`; marks the lane `active`/`expired`. |
+| `renew_session` | Marks the lane stale and re-runs the login, preserving `maintain_cookies` entries the fresh login did not re-issue. |
+
+Optional `username_selector` / `password_selector` / `submit_selector` /
+`success_selector` keys override the built-in autodetect fallbacks. A lane
+only covers the cookie domains the target sets; in-scope subdomains without a
+session remain on the unauthenticated mapping lane (httpx/katana/nuclei).
+
 ### Modes of Operation
 
 | Mode | Description | Primary Focus |
@@ -172,7 +281,7 @@ python -m bounty_agent.cli \
 * `--mode <mapping|recon|attack|auto|assistant>`: Execution mode (default: `auto`).
 * `--execute`: Enables live tool execution inside the sandbox container.
 * `--dry-run`: Runs the planner in simulation mode without executing external commands.
-* `--provider <ollama|openai|custom>`: LLM provider backend type.
+* `--provider <ollama|groq|gemini|openrouter|nvidia>`: LLM provider backend type. NVIDIA uses the OpenAI-compatible hosted NIM endpoint at `https://integrate.api.nvidia.com/v1`.
 * `--model <model_name>`: Model identifier specified in your provider backend.
 * `--llm-base-url <url>`: API endpoint URL (e.g., `http://localhost:11434/v1`).
 * `--max-steps <int>`: Global step/action budget for the session.

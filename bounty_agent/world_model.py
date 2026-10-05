@@ -107,6 +107,8 @@ class Relationship:
     target_id: str
     source: str
     confidence: str = "observed"
+    trust_boundary: bool = False
+    attacker_reachable: bool = False
     meta: dict[str, Any] | None = None
 
 
@@ -126,6 +128,12 @@ class WorldModel:
         self.store = store
         self.engagement_id = engagement_id
         self.program_name = program_name
+        # Idempotent migration: world asset tables get last_seen for staleness
+        # tracking (enterprise ASM pattern: first_seen/last_seen on assets).
+        try:
+            self.store.ensure_world_freshness_columns()
+        except Exception:
+            pass
         self._ensure_engagement(target, mode)
 
     def _ensure_engagement(self, target: str, mode: str) -> None:
@@ -158,9 +166,9 @@ class WorldModel:
             service_id = stable_id("svc", app_id, host)
             services[host] = service_id
             self.store.conn.execute(
-                """INSERT INTO services(id,app_id,name,service_type,host,port,tls,created_at) VALUES (?,?,?,?,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET host=excluded.host,name=excluded.name""",
-                (service_id, app_id, host, "web", host, None, "unknown", _now()),
+                """INSERT INTO services(id,app_id,name,service_type,host,port,tls,created_at,last_seen) VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET host=excluded.host,name=excluded.name,last_seen=excluded.last_seen""",
+                (service_id, app_id, host, "web", host, None, "unknown", _now(), _now()),
             )
             self.link(Relationship("application", app_id, "exposes", "service", service_id, "topology"))
         self.store.conn.commit()
@@ -182,21 +190,38 @@ class WorldModel:
                 method=method,
                 auth_required=surface.auth_context,
                 source=source,
-                meta={"surface_type": surface.surface_type, "tags": list(surface.tags), **(surface.meta or {})},
+                meta={
+                    "surface_type": surface.surface_type,
+                    "tags": list(surface.tags),
+                    "confidence": surface.confidence,
+                    **(surface.meta or {}),
+                },
             )
             self.upsert_route(route)
-            self.link(Relationship("service", service_id, "serves", "route", route.id, source))
+            boundary = surface.auth_context in {"auth", "authenticated", "verified"}
+            self.link(Relationship(
+                "service", service_id, "serves", "route", route.id, source,
+                confidence=surface.confidence,
+                trust_boundary=boundary,
+                attacker_reachable=True,
+                meta={
+                    "auth_context": surface.auth_context,
+                    "surface_type": surface.surface_type,
+                    "tags": list(surface.tags),
+                    "boundary_kind": _boundary_kind(surface.surface_type, surface.auth_context),
+                },
+            ))
             if surface.surface_type in {"api", "graphql"}:
                 self.link(Relationship("application", app_id, "uses", "api_style", surface.surface_type, source))
 
     def upsert_technology(self, technology: Technology) -> None:
         self.store.conn.execute(
-            """INSERT INTO technologies(id,app_id,service_id,name,version,category,confidence,cves,playbook,source,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """INSERT INTO technologies(id,app_id,service_id,name,version,category,confidence,cves,playbook,source,created_at,last_seen)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET version=excluded.version,confidence=excluded.confidence,
-                   playbook=excluded.playbook,source=excluded.source""",
+                   playbook=excluded.playbook,source=excluded.source,last_seen=excluded.last_seen""",
             (technology.id, technology.app_id, technology.service_id, technology.name, technology.version,
-             technology.category, technology.confidence, "[]", _json(technology.playbook or {}), technology.source, _now()),
+             technology.category, technology.confidence, "[]", _json(technology.playbook or {}), technology.source, _now(), _now()),
         )
         self.store.conn.commit()
 
@@ -217,12 +242,12 @@ class WorldModel:
 
     def upsert_route(self, route: Route) -> None:
         self.store.conn.execute(
-            """INSERT INTO world_routes(id,service_id,host,path,method,auth_required,source,meta,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)
+            """INSERT INTO world_routes(id,service_id,host,path,method,auth_required,source,meta,created_at,last_seen)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(service_id,path,method) DO UPDATE SET auth_required=excluded.auth_required,
-                   source=excluded.source,meta=excluded.meta""",
+                   source=excluded.source,meta=excluded.meta,last_seen=excluded.last_seen""",
             (route.id, route.service_id, route.host, route.path, route.method, route.auth_required,
-             route.source, _json(route.meta or {}), _now()),
+             route.source, _json(route.meta or {}), _now(), _now()),
         )
         self.store.conn.commit()
 
@@ -243,13 +268,19 @@ class WorldModel:
     def link(self, relationship: Relationship) -> None:
         relation_id = stable_id("rel", relationship.source_kind, relationship.source_id, relationship.relation,
                                 relationship.target_kind, relationship.target_id)
+        meta = {
+            "trust_boundary": relationship.trust_boundary,
+            "attacker_reachable": relationship.attacker_reachable,
+            "evidence_source": relationship.source,
+            **(relationship.meta or {}),
+        }
         self.store.conn.execute(
             """INSERT INTO relationships(id,source_kind,source_id,relation,target_kind,target_id,confidence,source,meta,created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_kind,source_id,relation,target_kind,target_id)
                DO UPDATE SET confidence=excluded.confidence,source=excluded.source,meta=excluded.meta""",
             (relation_id, relationship.source_kind, relationship.source_id, relationship.relation,
              relationship.target_kind, relationship.target_id, relationship.confidence, relationship.source,
-             _json(relationship.meta or {}), _now()),
+             _json(meta), _now()),
         )
         self.store.conn.commit()
 
@@ -290,6 +321,34 @@ class WorldModel:
         self.store.conn.commit()
         return request_id
 
+    def stale_assets(self, *, older_than_days: int = 30) -> dict[str, list[str]]:
+        """Assets not re-observed within the staleness window (ASM TTL pattern).
+
+        Returns hosts/routes/technologies whose ``last_seen`` predates the
+        cutoff; entries with no ``last_seen`` (pre-migration rows) count as
+        stale so the operator is nudged to reconfirm them rather than silently
+        trusting legacy map data.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+
+        def _stale(query: str, name_col: int = 0) -> list[str]:
+            try:
+                rows = self.store.conn.execute(query, (cutoff,)).fetchall()
+            except Exception:
+                return []
+            return [str(row[name_col]) for row in rows]
+
+        return {
+            "services": _stale(
+                "SELECT host FROM services WHERE last_seen IS NULL OR last_seen < ?"),
+            "routes": _stale(
+                "SELECT host || ' ' || method || ' ' || path FROM world_routes WHERE last_seen IS NULL OR last_seen < ?"),
+            "technologies": _stale(
+                "SELECT name || COALESCE(' ' || version, '') FROM technologies WHERE last_seen IS NULL OR last_seen < ?"),
+        }
+
     def architecture_summary(self) -> dict[str, Any]:
         applications = self.store.conn.execute("SELECT id,name,framework,language,frontend,cdn_waf,api_style,graphql_impl,auth_provider FROM applications ORDER BY name").fetchall()
         services = self.store.conn.execute("SELECT id,app_id,name,host,service_type,tls FROM services ORDER BY host").fetchall()
@@ -315,7 +374,42 @@ class WorldModel:
             "source_assets": [dict(zip(("path", "kind", "language", "framework", "source"), row)) for row in source_assets],
             "browser_captures": [dict(zip(("path", "title", "source"), row)) for row in browser_captures],
             "sessions": [dict(zip(("context", "cookie_scope", "samesite", "httponly", "secure", "browser_only"), row)) for row in sessions],
+            "stale_assets": self.stale_assets(),
         }
+
+    def attack_surface_summary(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Return compact, evidence-labelled trust boundaries for planning.
+
+        This reports only externally observable route boundaries. It does not
+        infer internal services, databases, or exploitability from topology.
+        """
+        rows = self.store.conn.execute(
+            "SELECT host,path,method,auth_required,source,meta FROM world_routes ORDER BY host,path,method"
+        ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for host, path, method, auth_context, source, raw_meta in rows:
+            if not _is_valid_service_host(str(host)):
+                continue
+            meta = _loads(raw_meta)
+            surface_type = str(meta.get("surface_type", "web"))
+            tags = [str(item) for item in meta.get("tags", [])]
+            boundary = _boundary_kind(surface_type, str(auth_context or "unknown"))
+            high_value = surface_type in {"api", "graphql", "auth", "upload", "redirect"} or "parameter" in tags
+            if not high_value:
+                continue
+            mission = _boundary_mission(surface_type, str(auth_context or "unknown"), tags)
+            candidates.append({
+                "surface": f"{method} {host}{path}",
+                "boundary": boundary,
+                "attacker_reachable": True,
+                "auth_context": auth_context,
+                "surface_type": surface_type,
+                "mission": mission,
+                "confidence": str(meta.get("confidence", "observed")),
+                "evidence_source": source,
+            })
+        candidates.sort(key=lambda item: (item["mission"] != "auth_boundary_test", item["surface"]))
+        return candidates[:max(1, limit)]
 
     def write_catalogs(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
@@ -348,6 +442,31 @@ def stable_id(prefix: str, *parts: str) -> str:
 def host_from_url(value: str) -> str:
     parsed = urlparse(value if "://" in value else f"https://{value}")
     return (parsed.hostname or "").lower()
+
+
+def _boundary_kind(surface_type: str, auth_context: str) -> str:
+    auth = auth_context.lower()
+    if auth in {"auth", "authenticated", "verified"}:
+        return "session_to_protected_route"
+    if surface_type in {"api", "graphql"}:
+        return "public_to_api_route"
+    if surface_type == "upload":
+        return "public_to_upload_handler"
+    if surface_type == "redirect":
+        return "public_to_outbound_request"
+    return "public_to_web_route"
+
+
+def _boundary_mission(surface_type: str, auth_context: str, tags: list[str]) -> str:
+    if auth_context.lower() in {"auth", "authenticated", "verified"} and surface_type in {"api", "graphql"}:
+        return "auth_boundary_test"
+    if surface_type == "graphql":
+        return "graphql_authorization_review"
+    if surface_type == "api" and "parameter" in tags:
+        return "data_flow_trace"
+    if surface_type in {"upload", "redirect"}:
+        return "input_boundary_test"
+    return "endpoint_mapping"
 
 
 def _is_valid_service_host(value: str) -> bool:

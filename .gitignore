@@ -5,7 +5,15 @@ __pycache__/
 .pytest_cache/
 pytest-cache-files-*/
 .uv-cache/
+.cache/
 .venv/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+htmlcov/
+.coverage
+coverage.xml
+
 
 # Local engagements are sensitive. Track only the reusable template scaffolding.
 /engagements/*/
@@ -51,5 +59,23 @@ sandbox/test-local-runner/
 .DS_Store
 Thumbs.db
 
+# Cloned public repositories used only for architecture research.
+/research/
+/tests/
 # Generated test-run artifacts; keep normal test source files versioned.
 /tests/LDrun_test/
+
+# Machine-local agent/tool configuration and generated state.
+/.agents/
+/.claude/
+/.clinerules
+/.codegraph/
+/.codegraph.yml
+/.mcp.json
+/.rtk/
+/.tokenade/
+/.fastembed_cache/
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+*.tokenade-original

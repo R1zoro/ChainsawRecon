@@ -25,6 +25,24 @@ PROVIDER_DEFAULTS = {
         "api_key_default": "",
         "model": "groq/llama-3.3-70b-versatile",
     },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_key_env": "GEMINI_API_KEY",
+        "api_key_default": "",
+        "model": "gemini-2.5-flash",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "api_key_default": "",
+        "model": "google/gemini-2.5-flash",
+    },
+    "nvidia": {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "api_key_env": "NVIDIA_API_KEY",
+        "api_key_default": "",
+        "model": "moonshotai/kimi-k3",
+    },
 }
 
 
@@ -45,6 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--max-repeated-commands", type=int, default=5)
     parser.add_argument("--max-malformed-responses", type=int, default=10)
+    parser.add_argument("--keep-alive", action="store_true", help="Enable a cheap idle-only Ollama/Colab route health probe.")
+    parser.add_argument("--keep-alive-probe-seconds", type=int, default=180,
+                        help="Idle seconds before a route-gated Ollama health probe is attempted.")
     parser.add_argument("--llm-timeout-seconds", type=int, help="Timeout seconds for LLM HTTP calls.")
     parser.add_argument("--auth-file", type=Path, help="Optional auth context file with cookies, headers, tokens, or login notes.")
     parser.add_argument("--source-dir", type=Path, help="Optional local source tree to map without executing it.")
@@ -61,6 +82,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--https-proxy", help="HTTPS proxy URL. Overrides --proxy for HTTPS traffic.")
     parser.add_argument("--no-proxy", help="Hosts or CIDRs to exclude from proxying.")
     parser.add_argument("--burp-proxy", default="", help="Milestone 5.1: Burp proxy URL for passive capture, e.g. http://host.docker.internal:8080. Routes sandbox traffic through Burp.")
+    parser.add_argument("--burp-api-url", default="", help="DEPRECATED: Burp REST API URL for active control. Use --burp-mcp-url instead.", dest="burp_api_url")
+    parser.add_argument("--burp-api-key", default="", help="DEPRECATED: Burp REST API key. Prefer Burp MCP over REST.", dest="burp_api_key")
+    # ── Stage 1: Burp MCP ──────────────────────────────────────────────
+    parser.add_argument("--burp-mcp-url", default="", help="Stage 1: Burp MCP endpoint URL (host-side). The extension listens on http://127.0.0.1:9876 by default (Burp → Extensions → MCP).")
+    parser.add_argument("--burp-mcp-transport", default="sse", choices=["sse", "streamable-http", "stdio"],
+                        help="Stage 1: Burp MCP transport. Prefer host-side SSE/streamable-http.")
+    parser.add_argument("--burp-mcp-token", default="", help="Stage 1: Optional bearer token for the Burp MCP endpoint.")
+    parser.add_argument("--burp-project-alias", default="", help="Stage 1: Burp project alias used for config export and session rules.")
+    parser.add_argument("--burp-session-alias", default="", help="Stage 1: Burp session-handling rule alias for authenticated requests.")
+    # ── Stage 2: Sessions and auth lanes ───────────────────────────────
+    parser.add_argument("--auth-mode", default="none",
+                        choices=["none", "recorded-login", "operator-handover", "credentials"],
+                        help="Stage 2: How authenticated work obtains a session.")
+    parser.add_argument("--auth-session-alias", default="", help="Stage 2: Session alias for recorded-login or operator-handover.")
+    parser.add_argument("--auth-wait-timeout", type=int, default=300, help="Stage 2: Seconds to wait for operator-handover before deferring session work.")
+    parser.add_argument("--auth-login-url", default="", help="Stage 2: Login URL for credentials mode.")
+    parser.add_argument("--auth-credentials-ref", default="",
+                        help="Stage 2: Reference to local secret store entry (never pass the secret on the CLI).")
+    # ── Stage 7: Context budget ─────────────────────────────────────────
+    parser.add_argument("--ollama-num-ctx", type=int, default=0,
+                        help="Stage 7: Ollama num_ctx window. 0 = provider-aware default. OLLAMA_NUM_CTX env is a fallback.")
+    parser.add_argument("--llm-max-output-tokens", type=int, default=4096,
+                        help="Stage 7: Maximum output tokens for LLM responses.")
+    parser.add_argument("--llm-input-budget-tokens", type=int, default=0,
+                        help="Stage 7: Input token budget. 0 = auto-derived from num_ctx - output - safety margin.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and trace planned actions without execution.")
     parser.add_argument("--execute", action="store_true", help="Actually run approved commands. Default is dry-run.")
     parser.add_argument("--clean", action="store_true", help="Run the cleaner pass: audit curated engagement assets and write cleaner-report.md.")
@@ -90,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
     llm_api_key = args.llm_api_key
     if llm_api_key is None:
         llm_api_key = os.environ.get(provider["api_key_env"], provider["api_key_default"])
+        if not llm_api_key and args.provider == "gemini":
+            llm_api_key = os.environ.get("GOOGLE_API_KEY", "")
     model = args.model
     if args.no_llm:
         model = None
@@ -125,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.llm_timeout_seconds is not None
             else 480
         ),
+        keep_alive=args.keep_alive,
+        keep_alive_probe_seconds=args.keep_alive_probe_seconds,
         rate_limit_notes=scope.rate_limits.notes,
         allow_all_hosts=args.allow_all_hosts,
         max_repeated_commands=args.max_repeated_commands,
@@ -141,6 +191,24 @@ def main(argv: list[str] | None = None) -> int:
         https_proxy=args.https_proxy or args.proxy or "",
         no_proxy=args.no_proxy or "",
         burp_proxy=args.burp_proxy or "",
+        burp_api_url=args.burp_api_url or "",
+        burp_api_key=args.burp_api_key or "",
+        # ── Stage 1: Burp MCP ──────────────────────────────────────────
+        burp_mcp_url=args.burp_mcp_url or "",
+        burp_mcp_transport=args.burp_mcp_transport or "sse",
+        burp_mcp_token=args.burp_mcp_token or "",
+        burp_project_alias=args.burp_project_alias or "",
+        burp_session_alias=args.burp_session_alias or "",
+        # ── Stage 2: Sessions and auth lanes ───────────────────────────
+        auth_mode=args.auth_mode or "none",
+        auth_session_alias=args.auth_session_alias or "",
+        auth_wait_timeout=max(1, args.auth_wait_timeout),
+        auth_login_url=args.auth_login_url or "",
+        auth_credentials_ref=args.auth_credentials_ref or "",
+        # ── Stage 7: Context budget ─────────────────────────────────────
+        ollama_num_ctx=max(0, args.ollama_num_ctx),
+        llm_max_output_tokens=max(256, args.llm_max_output_tokens),
+        llm_input_budget_tokens=max(0, args.llm_input_budget_tokens),
     )
 
     if args.clean or args.clean_apply:

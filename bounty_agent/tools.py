@@ -17,15 +17,18 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from .artifact_store import ArtifactStore, artifact_manifest
 from .auth_context import AuthContext
 from .browser_worker import BROWSER_WORKER_SCRIPT
+from .burp_mcp import BurpMcpClient, BurpMcpConfig, MCP_ACTIONS, parse_patch
 from .canonical_surface import normalize_url
 from .controls import DynamicRateLimiter, GeminiAdjudicator
-from .engagement_state import EngagementStateStore
+from .engagement_state import EXPERIMENT_READY_STATES, EngagementStateStore
 from .infrastructure import ChallengeType, InfrastructureStore, classify_response, extract_hosts_from_tool_output
+from .journeys import BrowserPage, JourneyStore
 from .retrieval import RetrievalStore
 from .recon_db import (
     NullReconStore,
     ReconObservation,
     ReconStore,
+    SurfaceRecord,
     build_attack_results_from_action_result,
     build_facts_from_action_result,
     build_surfaces_from_action_result,
@@ -36,6 +39,18 @@ from .scope import ScopeGuard
 from .skills import get_skill
 from .strategy_memory import StrategyMemory
 from .trace import TraceLogger
+from .workers import get_worker, worker_gate, worker_manifest
+from .nuclei import build_nuclei_command, parse_nuclei_jsonl, render_nuclei_summary
+from .surface_router import SurfaceRoute, render_route, route_surface
+from .auth_pipeline import (
+    LoginSpec,
+    load_login_spec,
+    merge_maintained_cookies,
+    parse_login_output,
+    render_session_line,
+    worker_spec_payload,
+)
+from .login_worker import LOGIN_WORKER_SCRIPT
 
 
 @dataclass
@@ -97,6 +112,8 @@ class ToolRegistry:
         self.active_objective_id: str | None = None
         self.active_hypothesis_id: str | None = None
         self.active_target = ""
+        self.active_worker_name: str | None = None
+        self._surface_routes: dict[str, SurfaceRoute] = {}
         self.max_actions = max(0, max_actions)
         self.action_count = 0
 
@@ -105,6 +122,12 @@ class ToolRegistry:
         self._auth_context: Optional[AuthContext] = None
         self._adjudicator: Any = None
         self.scorecard: Any | None = None
+        self._burp_mcp_client: Optional[BurpMcpClient] = None
+        self._journey_store: JourneyStore | None = None
+        self._world_model: Any | None = None
+        self._session_manager: Any | None = None
+        self._auth_context_path: Path | None = None
+        self._engagement_id: str = ""
 
     def set_infrastructure_store(self, store: InfrastructureStore) -> None:
         """Attach infrastructure store for WAF/challenge awareness."""
@@ -134,12 +157,64 @@ class ToolRegistry:
         """Attach an optional benchmark scorecard for live measurement."""
         self.scorecard = scorecard
 
+    def set_burp_mcp_client(self, client: BurpMcpClient | None) -> None:
+        """Attach the Burp MCP adapter for high-level captured-request operations."""
+        self._burp_mcp_client = client
+
+    def set_journey_store(self, store: JourneyStore | None) -> None:
+        """Attach durable browser journey storage for browser captures."""
+        self._journey_store = store
+
+    def set_world_model(self, model: Any | None) -> None:
+        """Attach the engagement world model for bounded model queries."""
+        self._world_model = model
+
+    def set_session_manager(self, manager: Any | None) -> None:
+        """Attach the first-class session/auth-lane manager."""
+        self._session_manager = manager
+
+    def set_auth_context_path(self, path: Path | None) -> None:
+        """Path to the engagement auth JSON (login spec + cookie groups)."""
+        self._auth_context_path = path
+
+    def set_engagement_id(self, engagement_id: str) -> None:
+        """Stable engagement id sessions are partitioned under.
+
+        Must match the id the agent uses when reading the session lane
+        (``stable_id("engagement", db_parent, program_name)``); defaults to the
+        run id when never set.
+        """
+        self._engagement_id = engagement_id
+
+    def _session_engagement_id(self) -> str:
+        return self._engagement_id or self.run_id
+
     def set_execution_context(self, *, objective_id: str | None = None, hypothesis_id: str | None = None,
                               target: str = "") -> None:
         """Attach all subsequent actions to the current security objective."""
         self.active_objective_id = objective_id
         self.active_hypothesis_id = hypothesis_id
         self.active_target = target
+
+    def _select_worker(self, action: dict[str, Any]) -> ToolResult:
+        """Activate a specialist worker and enforce its action contract."""
+        name = str(action.get("name") or "").strip()
+        if not name:
+            return ToolResult(False, "select_worker requires a worker name. Use list_workers to see options.")
+        worker = get_worker(name)
+        if worker is None:
+            available = [w["name"] for w in worker_manifest()]
+            return ToolResult(False, f"Unknown worker '{name}'. Available: {', '.join(available)}.", {"available_workers": available})
+        self.active_worker_name = name
+        lines = [f"Worker '{worker.name}' active.", f"Mission: {worker.mission}"]
+        lines.append(f"Allowed actions: {', '.join(worker.allowed_actions) or '(none)'}")
+        lines.append(f"Required evidence: {', '.join(worker.evidence_required) or 'none'}")
+        return ToolResult(True, "\n".join(lines), {"active_worker": name})
+
+    def _list_workers(self, action: dict[str, Any]) -> ToolResult:
+        manifest = worker_manifest()
+        lines = [f"- {w['name']}: {w['mission']}" for w in manifest]
+        return ToolResult(True, "\n".join(lines), {"workers": [w["name"] for w in manifest]})
 
     def execute(self, action: dict[str, Any]) -> ToolResult:
         name = str(action.get("action", "")).strip()
@@ -157,20 +232,27 @@ class ToolRegistry:
         if name != "finish":
             self.action_count += 1
         self.trace.write("tool_call", action=action)
+        experiment_hypothesis_id: str | None = None
         # Reset consecutive search counter on non-search actions
         if name != "search":
             self._consecutive_search_count = 0
         try:
-            if self.state_store and _requires_hypothesis(action) and not (
-                action.get("hypothesis_id") or self.active_hypothesis_id
-            ):
+            gate_error = worker_gate(self.active_worker_name, name)
+            hypothesis_error = ""
+            if not gate_error and _requires_hypothesis(action):
+                hypothesis_error, experiment_hypothesis_id = self._experiment_hypothesis_gate(action)
+            if gate_error:
+                result = ToolResult(False, gate_error, {"worker_gate_blocked": True, "active_worker": self.active_worker_name})
+            elif hypothesis_error:
                 result = ToolResult(
                     False,
-                    "This attack action requires a recorded hypothesis first. Use create_hypothesis with the security question and required evidence, then run one bounded experiment.",
+                    hypothesis_error,
                     {"hypothesis_required": True},
                 )
             elif name == "bash":
                 result = self._bash(action)
+            elif name == "nuclei":
+                result = self._nuclei_action(action)
             elif name in _TOOL_ACTIONS:
                 result = self._tool_action(action)
             elif name == "search":
@@ -183,6 +265,14 @@ class ToolRegistry:
                 result = self._read_file(action)
             elif name == "browser_map":
                 result = self._browser_map(action)
+            elif name in {"list_journeys", "get_journey_steps", "search_journey_requests", "get_journey_request"}:
+                result = self._journey_action(action)
+            elif name in {"world_model_summary", "search_world_model"}:
+                result = self._world_model_action(action)
+            elif name == "route_surface":
+                result = self._route_surface(action)
+            elif name in {"perform_login", "verify_session", "renew_session", "session_status"}:
+                result = self._auth_action(action)
             elif name == "list_artifacts":
                 result = self._list_artifacts(action)
             elif name == "search_artifact":
@@ -215,16 +305,51 @@ class ToolRegistry:
                 result = self._create_verifier(action)
             elif name == "finish":
                 result = ToolResult(True, "Finished.")
+            elif name == "select_worker":
+                result = self._select_worker(action)
+            elif name == "list_workers":
+                result = self._list_workers(action)
+            elif name == "burp_send":
+                result = self._burp_send(action)
+            elif name == "burp_history":
+                result = self._burp_history(action)
+            elif name in MCP_ACTIONS:
+                result = self._burp_mcp_action(action)
             else:
                 result = ToolResult(False, f"Unsupported action: {name}")
         except Exception as exc:
             result = ToolResult(False, f"{type(exc).__name__}: {exc}")
+        if experiment_hypothesis_id and self.state_store:
+            self.state_store.transition_hypothesis(experiment_hypothesis_id, "experiment_attempted")
+            result.meta["hypothesis_id"] = experiment_hypothesis_id
+            result.meta["hypothesis_state"] = "experiment_attempted"
         self.trace.write("tool_result", ok=result.ok, content=_truncate(result.content), meta=result.meta)
         self.history.append((action, result))
+        self._burn_failed_tool(action, result)
         self._record_recon_state(action, result)
         self._record_phase_one_state(action, result)
         self._record_scorecard_event(action, result)
         return result
+
+    def _experiment_hypothesis_gate(self, action: dict[str, Any]) -> tuple[str, str | None]:
+        """Require a durable, non-terminal hypothesis for an active experiment."""
+        if not self.state_store:
+            return "Structured engagement state is required before running an intrusive experiment.", None
+        hypothesis_id = str(action.get("hypothesis_id") or self.active_hypothesis_id or "").strip()
+        if not hypothesis_id:
+            return (
+                "This attack action requires a recorded hypothesis first. Use create_hypothesis with the security question and required evidence, then run one bounded experiment.",
+                None,
+            )
+        hypothesis = self.state_store.hypothesis(hypothesis_id)
+        if not hypothesis:
+            return f"Hypothesis '{hypothesis_id}' does not exist. Create or select a recorded hypothesis before testing.", None
+        if str(hypothesis.get("state", "")) not in EXPERIMENT_READY_STATES:
+            return (
+                f"Hypothesis '{hypothesis_id}' is in terminal state '{hypothesis.get('state')}'. Create or select an unresolved hypothesis before testing.",
+                None,
+            )
+        return "", hypothesis_id
 
     def _record_phase_one_state(self, action: dict[str, Any], result: ToolResult) -> None:
         if not self.state_store:
@@ -470,6 +595,9 @@ class ToolRegistry:
 
     def _tool_action(self, action: dict[str, Any]) -> ToolResult:
         name = str(action.get("action", "")).strip()
+        schema_result = _validate_tool_action_schema(name, action)
+        if schema_result:
+            return schema_result
         url = str(action.get("url") or action.get("target") or action.get("path") or "").strip()
         host = str(action.get("host") or "").strip()
         if not url and host:
@@ -478,6 +606,303 @@ class ToolRegistry:
             return ToolResult(False, f"Missing target for {name} action.")
         command = _build_tool_command(name, url, action)
         return self._bash({**action, "action": "bash", "command": command, "timeout_seconds": action.get("timeout_seconds", self.runner.settings.command_timeout_seconds)})
+
+    def _nuclei_action(self, action: dict[str, Any]) -> ToolResult:
+        """Run nuclei deterministically and render a record_finding-ready summary.
+
+        Outputs JSONL to a per-target file, parses it back into deduplicated,
+        severity-sorted findings, and returns a compact summary the model can
+        act on directly (instead of a raw banner/result dump).
+        """
+        name = str(action.get("action", "")).strip()
+        schema_result = _validate_tool_action_schema(name, action)
+        if schema_result:
+            return schema_result
+        url = str(action.get("url") or action.get("target") or action.get("path") or "").strip()
+        if not url:
+            return ToolResult(False, "Missing target for nuclei action.")
+        decision = self.scope_guard.validate_target(url)
+        if not decision.allowed:
+            return ToolResult(False, f"Scope blocked nuclei: {decision.reason}")
+        digest = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:12]
+        output_path = f"nuclei-{digest}.jsonl"
+        command = build_nuclei_command(
+            url,
+            severity=str(action.get("severity", "")).strip(),
+            tags=str(action.get("tags", "")).strip(),
+            output_path=output_path,
+        )
+        result = self._bash({
+            "action": "bash",
+            "command": command,
+            "timeout_seconds": action.get("timeout_seconds", 300),
+        })
+        if not result.ok:
+            return result
+        raw = ""
+        try:
+            raw = self.runner.read_file(output_path)
+        except Exception:
+            raw = ""
+        findings = parse_nuclei_jsonl(raw)
+        summary = render_nuclei_summary(findings, url)
+        return ToolResult(True, summary, {"nuclei_findings": len(findings), "nuclei_target": url})
+
+    def _route_surface(self, action: dict[str, Any]) -> ToolResult:
+        """Fingerprint a surface and return its ordered fallback ladder.
+
+        Advisory: the router answers "what should I try next here?" so the
+        model doesn't re-pick a tool that already failed.  Burned rungs are
+        tracked per surface and persist for the run.
+        """
+        url = str(action.get("url") or action.get("target") or action.get("host") or "").strip()
+        if not url:
+            return ToolResult(False, "Missing target for route_surface action.")
+        route = route_surface(url, prior_failures=self._burned_for(url))
+        self._surface_routes[_surface_route_key(url)] = route
+        return ToolResult(True, render_route(route), {
+            "surface_type": route.surface_type,
+            "technologies": list(route.technologies),
+            "next_tool": route.next_rung().tool if route.next_rung() else "",
+        })
+
+    def _burn_failed_tool(self, action: dict[str, Any], result: ToolResult) -> None:
+        """When a tool action fails against a routed surface, burn that rung so
+        the router's next_rung() skips it (fallback ladder instead of retrying
+        the dead tool)."""
+        if result.ok:
+            return
+        name = str(action.get("action", "")).strip()
+        if name not in _TOOL_ACTIONS and name != "browser_map":
+            return
+        target = str(action.get("url") or action.get("target") or action.get("host") or "").strip()
+        if not target:
+            return
+        try:
+            route = self._surface_routes.get(_surface_route_key(target))
+            if route is not None:
+                route.burn(name)
+        except Exception:
+            pass
+
+    def _burned_for(self, url: str) -> list[str]:
+        """Look up already-failed tools for the surface this URL belongs to."""
+        route = self._surface_routes.get(_surface_route_key(url))
+        return list(route.burned) if route else []
+
+    # ── Auth pipeline (simple id+password login, cookie renewal) ────────────
+
+    def _auth_action(self, action: dict[str, Any]) -> ToolResult:
+        name = str(action.get("action", "")).strip()
+        if name == "session_status":
+            return self._session_status()
+        if self._session_manager is None:
+            return ToolResult(False, "Session manager is not attached; auth lane unavailable.", {"auth_disabled": True})
+        if name == "perform_login":
+            return self._perform_login()
+        if name == "verify_session":
+            return self._verify_session(str(action.get("alias") or ""))
+        if name == "renew_session":
+            return self._renew_session(str(action.get("alias") or ""))
+        return ToolResult(False, f"Unknown auth action '{name}'.")
+
+    def _login_spec(self) -> LoginSpec | None:
+        return load_login_spec(self._auth_context_path)
+
+    def _perform_login(self) -> ToolResult:
+        """Execute the Playwright id+password login and register the session."""
+        spec = self._login_spec()
+        if spec is None:
+            return ToolResult(
+                False,
+                "No login spec found. Add a top-level \"login\" block to the engagement auth JSON "
+                "(url, username_env, password_env, optional selectors/verify_url). Credentials are read "
+                "from the named environment variables, never from the spec.",
+                {"login_spec_missing": True},
+            )
+        decision = self.scope_guard.validate_target(spec.login_url)
+        if not decision.allowed:
+            return ToolResult(False, f"Scope blocked perform_login: {decision.reason}")
+        if spec.verify_url:
+            verify_decision = self.scope_guard.validate_target(spec.verify_url)
+            if not verify_decision.allowed:
+                return ToolResult(False, f"Scope blocked perform_login verify_url: {verify_decision.reason}")
+
+        digest = hashlib.sha256(spec.login_url.encode("utf-8", errors="replace")).hexdigest()[:12]
+        script_path = ".chainsaw_login_worker.py"
+        spec_path = f"auth/login-spec-{digest}.json"
+        output_path = f"auth/login-output-{digest}.json"
+        self.runner.write_file(script_path, LOGIN_WORKER_SCRIPT)
+        # The spec file names env vars only — no secret values are written.
+        self.runner.write_file(spec_path, json.dumps(worker_spec_payload(spec), indent=2))
+        import sys
+        python_bin = "/opt/venv/bin/python3" if self.runner.__class__.__name__ == "DockerSandboxRunner" else sys.executable
+        command = (
+            f"{python_bin} {shlex.quote(script_path)} --spec {shlex.quote(spec_path)} "
+            f"--output {shlex.quote(output_path)} --timeout-ms 30000"
+        )
+        run = self._bash({"action": "bash", "command": command, "timeout_seconds": 180})
+        if not run.ok:
+            return ToolResult(False, f"perform_login worker failed: {run.content}", run.meta)
+        try:
+            outcome = parse_login_output(self.runner.read_file(output_path))
+        except (OSError, ValueError) as exc:
+            return ToolResult(False, f"perform_login produced no readable output: {type(exc).__name__}: {exc}", run.meta)
+
+        if not outcome.success:
+            session = self._session_manager.create_session(
+                alias=spec.session_alias, engagement_id=self._session_engagement_id(), source="credentials",
+                auth_mechanism="form-login", domains=(), role=spec.role, tenant=spec.tenant, status="failed",
+            )
+            self._session_manager.update_status(session.id, "failed", failure_reason=outcome.error or "login did not reach success state")
+            return ToolResult(False, f"Login failed: {outcome.error or 'success condition not met'}", {"login_success": False})
+
+        session = self._register_session(spec, outcome.cookie_map, outcome)
+        self._record_login_journey(spec, outcome)
+        lines = [
+            f"Login succeeded as session '{spec.session_alias}' ({session.id}).",
+            f"final_url={outcome.final_url}",
+            f"cookies captured: {len(outcome.cookies)} ({', '.join(sorted(outcome.cookie_map)[:8])})",
+        ]
+        if outcome.verify_ok is not None:
+            lines.append(f"verify_url check: {'ok' if outcome.verify_ok else 'FAILED'} (status={outcome.verify_status})")
+        return ToolResult(True, "\n".join(lines), {
+            "login_success": True, "session_id": session.id, "alias": spec.session_alias,
+            "cookie_count": len(outcome.cookies), "domains": list(outcome.cookie_domains),
+        })
+
+    def _register_session(self, spec: LoginSpec, cookies: dict[str, str], outcome: Any):
+        prior = self._find_session(spec.session_alias)
+        if prior is not None and spec.maintain_cookies:
+            prior_cookies = dict(getattr(prior, "cookies", None) or {})
+            cookies = merge_maintained_cookies(cookies, prior_cookies, spec.maintain_cookies)
+        session = self._session_manager.create_session(
+            alias=spec.session_alias, engagement_id=self._session_engagement_id(), source="credentials",
+            auth_mechanism="form-login", domains=outcome.cookie_domains, role=spec.role,
+            tenant=spec.tenant, secret_policy="never-inline", status="active",
+        )
+        if outcome.verify_ok:
+            self._session_manager.mark_verified(session.id, f"verify:{spec.verify_url}")
+        if self._world_model is not None and cookies:
+            try:
+                from .world_model import Session as WorldSession
+                self._world_model.upsert_session(WorldSession(
+                    id=session.id, context=spec.session_alias, token_type="cookie",
+                    role=spec.role, tenant=spec.tenant, cookies=cookies,
+                ))
+            except Exception:
+                pass
+        return session
+
+    def _find_session(self, alias: str):
+        """Best session for an alias: prefer active/verified, then freshest."""
+        matches = [
+            s for s in self._session_manager.list_sessions(engagement_id=self._session_engagement_id())
+            if s.alias == alias
+        ]
+        if not matches:
+            return None
+        rank = {"active": 0, "waiting": 1, "pending": 2, "stale": 3, "expired": 4, "deferred": 5, "failed": 6}
+        # ISO timestamps sort lexicographically; invert for freshest-first.
+        matches.sort(key=lambda s: str(s.last_verified_at or ""), reverse=True)
+        matches.sort(key=lambda s: rank.get(str(s.status), 9))
+        return matches[0]
+
+    def _verify_session(self, alias: str) -> ToolResult:
+        """Re-check a session lane against its verify URL (cookie-injection)."""
+        spec = self._login_spec()
+        if spec is None:
+            return ToolResult(False, "No login spec; nothing to verify against.", {"login_spec_missing": True})
+        session = self._find_session(alias or spec.session_alias)
+        if session is None:
+            return ToolResult(False, f"No session with alias '{alias or spec.session_alias}'. Run perform_login first.")
+        cookies = self._session_cookies(session)
+        if not cookies:
+            return ToolResult(False, f"Session '{session.alias}' has no stored cookies to verify with.")
+        return self._run_verify(spec, session, cookies)
+
+    def _renew_session(self, alias: str) -> ToolResult:
+        """Renew a session: re-run the login, preserving operator-maintained cookies."""
+        spec = self._login_spec()
+        if spec is None:
+            return ToolResult(False, "No login spec; cannot renew.", {"login_spec_missing": True})
+        session = self._find_session(alias or spec.session_alias)
+        if session is not None:
+            self._session_manager.update_status(session.id, "stale", failure_reason="renewal requested")
+        return self._perform_login()
+
+    def _session_status(self) -> ToolResult:
+        if self._session_manager is None:
+            return ToolResult(True, "Session lane: none. Continue unauthenticated work.", {"sessions": []})
+        sessions = self._session_manager.list_sessions(engagement_id=self._session_engagement_id())
+        if not sessions:
+            return ToolResult(True, "Session lane: none. Continue unauthenticated work.", {"sessions": []})
+        lines = ["Session lane status:"]
+        for s in sessions[:5]:
+            lines.append(render_session_line(s.alias, s.status, s.auth_mechanism,
+                                             role=s.role, domains=tuple(s.domains), failure=s.failure_reason))
+        return ToolResult(True, "\n".join(lines), {"sessions": [s.to_dict() for s in sessions[:5]]})
+
+    def _session_cookies(self, session: Any) -> dict[str, str]:
+        """Read the session's cookies from the world model (never inline in prompts)."""
+        if self._world_model is None:
+            return {}
+        # World model sessions carry cookie maps keyed by session id.
+        try:
+            rows = self._world_model.store.conn.execute(
+                "SELECT cookies FROM sessions WHERE id=?", (session.id,)
+            ).fetchall()
+            if rows:
+                return {str(k): str(v) for k, v in json.loads(rows[0][0] or "{}").items()}
+        except Exception:
+            return {}
+        return {}
+
+    def _run_verify(self, spec: LoginSpec, session: Any, cookies: dict[str, str]) -> ToolResult:
+        digest = hashlib.sha256(spec.login_url.encode("utf-8", errors="replace")).hexdigest()[:12]
+        script_path = ".chainsaw_login_worker.py"
+        spec_path = f"auth/verify-spec-{digest}.json"
+        output_path = f"auth/verify-output-{digest}.json"
+        self.runner.write_file(script_path, LOGIN_WORKER_SCRIPT)
+        self.runner.write_file(spec_path, json.dumps(worker_spec_payload(spec, verify_only=True, cookies=cookies), indent=2))
+        import sys
+        python_bin = "/opt/venv/bin/python3" if self.runner.__class__.__name__ == "DockerSandboxRunner" else sys.executable
+        command = (
+            f"{python_bin} {shlex.quote(script_path)} --spec {shlex.quote(spec_path)} "
+            f"--output {shlex.quote(output_path)} --timeout-ms 20000"
+        )
+        run = self._bash({"action": "bash", "command": command, "timeout_seconds": 120})
+        if not run.ok:
+            return ToolResult(False, f"verify_session worker failed: {run.content}", run.meta)
+        try:
+            outcome = parse_login_output(self.runner.read_file(output_path))
+        except (OSError, ValueError) as exc:
+            return ToolResult(False, f"verify_session produced no readable output: {type(exc).__name__}: {exc}", run.meta)
+        if outcome.success:
+            self._session_manager.mark_verified(session.id, f"verify:{spec.verify_url or spec.login_url}")
+            return ToolResult(True, f"Session '{session.alias}' verified active (status={outcome.verify_status}).",
+                              {"session_id": session.id, "verified": True})
+        self._session_manager.update_status(session.id, "expired", failure_reason="verify check failed")
+        return ToolResult(False, f"Session '{session.alias}' failed verification (status={outcome.verify_status}). Consider renew_session.",
+                          {"session_id": session.id, "verified": False})
+
+    def _record_login_journey(self, spec: LoginSpec, outcome: Any) -> None:
+        if self._journey_store is None:
+            return
+        try:
+            journey_id = self._journey_store.create_journey(
+                f"login:{spec.session_alias}",
+                description="Playwright id+password login flow with session capture.",
+                source="perform_login",
+                meta={"login_url": spec.login_url, "final_url": outcome.final_url},
+            )
+            self._journey_store.add_step(journey_id, action="navigate", page_after=spec.login_url)
+            self._journey_store.add_step(journey_id, action="submit_credentials", page_before=spec.login_url,
+                                         page_after=outcome.final_url)
+            if outcome.verify_ok is not None:
+                self._journey_store.add_step(journey_id, action="verify_session", page_after=spec.verify_url)
+        except Exception:
+            pass
 
     def _search(self, action: dict[str, Any]) -> ToolResult:
         query = str(action.get("query", "")).strip()
@@ -580,11 +1005,32 @@ class ToolRegistry:
         return ToolResult(True, content, artifact_meta)
 
     def _record_browser_surfaces(self, capture: dict[str, Any], *, source: str) -> None:
+        journey_id = ""
+        if self._journey_store:
+            journey_id = self._journey_store.create_journey(
+                str(capture.get("title") or capture.get("url") or "browser journey"),
+                description="Browser worker capture with page and network lineage.",
+                source=source,
+                meta={"start_url": capture.get("url", ""), "page_count": len(capture.get("pages", []))},
+            )
         for page in capture.get("pages", []):
             url = str(page.get("final_url") or page.get("url") or "")
             parsed = urlparse(url)
             if not parsed.hostname:
                 continue
+            page_id = ""
+            if self._journey_store:
+                page_id = self._journey_store.upsert_page(BrowserPage(
+                    id=f"PAGE-{hashlib.sha1(url.encode()).hexdigest()[:12]}",
+                    url=url, title=str(page.get("title") or ""), status=page.get("status"),
+                    input_count=len(page.get("inputs", []) or []),
+                    meta={"source": source},
+                ))
+                step_id = self._journey_store.add_step(
+                    journey_id, action="navigate", page_after=page_id,
+                    element_description=str(page.get("title") or url),
+                    meta={"url": url, "status": page.get("status")},
+                )
             self.recon_store.upsert_surface(SurfaceRecord(
                 url, parsed.hostname.lower(), parsed.path or "/", "web", source,
                 tags=("browser",), meta={"title": page.get("title", ""), "status": page.get("status")},
@@ -604,12 +1050,76 @@ class ToolRegistry:
             parsed = urlparse(url)
             if not parsed.hostname:
                 continue
+            request_id = ""
+            if self._journey_store:
+                request_id = self._journey_store.add_captured_request(
+                    method=str(request.get("method") or "GET").upper(), url=url,
+                    headers=request.get("request_headers") or request.get("headers") or {},
+                    body=str(request.get("request_body") or request.get("body") or ""),
+                    source=source, meta={"resource_type": request.get("resource_type", "")},
+                )
+                if journey_id:
+                    step_id = self._journey_store.add_step(
+                        journey_id, action="network-request", page_after=url,
+                        meta={"request_id": request_id, "method": request.get("method", "GET")},
+                    )
+                    self._journey_store.link_request_to_step(journey_id, step_id, request_id, relation="caused")
             path = parsed.path or "/"
             kind = "graphql" if "graphql" in path.lower() else "api" if "/api/" in path.lower() else "web"
             self.recon_store.upsert_surface(SurfaceRecord(
                 url, parsed.hostname.lower(), path, kind, source, tags=("browser", "network"),
                 meta={"method": request.get("method", "GET"), "resource_type": request.get("resource_type", "")},
             ))
+
+    def _journey_action(self, action: dict[str, Any]) -> ToolResult:
+        """Return bounded journey indexes or one stored request on demand."""
+        if not self._journey_store:
+            return ToolResult(False, "Journey storage is unavailable.", {"journey_store_disabled": True})
+        name = str(action.get("action", ""))
+        limit = max(1, min(int(action.get("limit", 20)), 100))
+        if name == "list_journeys":
+            journeys = self._journey_store.list_journeys(limit=limit)
+            return ToolResult(True, "\n".join(f"- {j.id}: {j.name} ({j.source})" for j in journeys) or "No journeys stored.", {"count": len(journeys)})
+        journey_id = str(action.get("journey_id") or "")
+        if name == "get_journey_steps":
+            if not journey_id:
+                return ToolResult(False, "get_journey_steps requires journey_id.")
+            steps = self._journey_store.steps_for_journey(journey_id)
+            return ToolResult(True, "\n".join(f"{s.order}. {s.action} before={s.page_before} after={s.page_after}" for s in steps) or "No steps stored.", {"journey_id": journey_id, "count": len(steps)})
+        if name == "search_journey_requests":
+            query = str(action.get("query") or "")
+            requests = self._journey_store.search_captured_requests(query, limit=limit)
+            return ToolResult(True, "\n".join(f"- {r.id}: {r.method} {r.url} session={r.session_id or '-'}" for r in requests) or "No matching journey requests.", {"count": len(requests)})
+        request_id = str(action.get("request_id") or "")
+        if not request_id:
+            return ToolResult(False, "get_journey_request requires request_id.")
+        request = self._journey_store.get_captured_request(request_id)
+        if not request:
+            return ToolResult(False, f"Journey request not found: {request_id}")
+        return ToolResult(True, json.dumps({"id": request.id, "method": request.method, "url": request.url, "headers": request.headers, "body": request.body}, ensure_ascii=False), {"request_id": request_id})
+
+    def _world_model_action(self, action: dict[str, Any]) -> ToolResult:
+        if self._world_model is None:
+            return ToolResult(False, "World model is unavailable.", {"world_model_disabled": True})
+        summary = self._world_model.architecture_summary()
+        if action.get("action") == "world_model_summary":
+            bounded = {key: value for key, value in summary.items() if key != "relationships"}
+            bounded["relationship_count"] = len(summary.get("relationships", []))
+            bounded["attack_boundaries"] = self._world_model.attack_surface_summary(limit=10)
+            return ToolResult(True, json.dumps(bounded, ensure_ascii=False), {"query": "summary"})
+        query = str(action.get("query") or "").lower()
+        limit = max(1, min(int(action.get("limit", 30)), 100))
+        matches: list[str] = []
+        for category in ("services", "technologies", "routes", "source_assets", "browser_captures", "sessions"):
+            for item in summary.get(category, []):
+                text = json.dumps(item, ensure_ascii=False)
+                if not query or query in text.lower():
+                    matches.append(f"[{category}] {text}")
+                    if len(matches) >= limit:
+                        break
+            if len(matches) >= limit:
+                break
+        return ToolResult(True, "\n".join(matches) or "No matching world-model records.", {"query": query, "count": len(matches)})
 
     def _list_artifacts(self, action: dict[str, Any]) -> ToolResult:
         if not self.artifact_store:
@@ -1082,6 +1592,184 @@ class ToolRegistry:
             return
 
 
+    def _burp_mcp_action(self, action: dict[str, Any]) -> ToolResult:
+        """Dispatch high-level Burp MCP actions.
+
+        These actions are scope-checked and rate-limited before the MCP
+        invocation, and their results are compact so the model does not
+        receive raw traffic or secrets in the prompt.
+        """
+        name = str(action.get("action", "")).strip()
+        if self._burp_mcp_client is None:
+            return ToolResult(
+                False,
+                "Burp MCP is not configured. Use --burp-mcp-url (and --burp-mcp-transport/--burp-mcp-token) "
+                "to enable captured-request operations, or use the deprecated --burp-api-url/--burp-api-key.",
+                {"burp_mcp_disabled": True, "action": name},
+            )
+        target = str(action.get("target") or action.get("url") or self.active_target or "").strip()
+        if target:
+            decision = self.scope_guard.validate_target(target)
+            if not decision.allowed:
+                return ToolResult(False, f"Scope blocked {name}: {decision.reason}")
+        request_id = str(action.get("request_id") or action.get("template_id") or "").strip()
+
+        try:
+            if name == "search_captured_requests":
+                result = self._burp_mcp_client.search_history(
+                    str(action.get("query", "")), target=target, limit=max(1, min(int(action.get("limit", 20)), 100)),
+                )
+            elif name == "get_captured_request":
+                if not request_id:
+                    return ToolResult(False, "get_captured_request requires request_id.")
+                result = self._burp_mcp_client.get_request(request_id)
+            elif name == "get_captured_response":
+                if not request_id:
+                    return ToolResult(False, "get_captured_response requires request_id.")
+                result = self._burp_mcp_client.get_response(request_id)
+            elif name == "replay_captured_request":
+                if not request_id:
+                    return ToolResult(False, "replay_captured_request requires request_id.")
+                try:
+                    patch = parse_patch(action.get("patch"))
+                except ValueError as exc:
+                    return ToolResult(False, str(exc))
+                result = self._burp_mcp_client.replay_request(request_id, patch, target)
+                if result.ok:
+                    result.meta.update({
+                        "template_id": request_id,
+                        "patch": patch,
+                        "session_alias": str(action.get("session_alias") or "").strip() or getattr(self._burp_mcp_client.config, "session_alias", ""),
+                    })
+            elif name == "compare_captured_responses":
+                baseline_id = str(action.get("baseline_id") or "").strip()
+                candidate_id = str(action.get("candidate_id") or "").strip()
+                if not baseline_id or not candidate_id:
+                    return ToolResult(False, "compare_captured_responses requires baseline_id and candidate_id.")
+                result = self._burp_mcp_client.compare_responses(baseline_id, candidate_id)
+            elif name == "create_repeater_experiment":
+                if not request_id:
+                    return ToolResult(False, "create_repeater_experiment requires request_id.")
+                result = self._burp_mcp_client.create_repeater_experiment(request_id, target)
+            else:
+                return ToolResult(False, f"Unsupported Burp MCP action: {name}")
+        except Exception as exc:
+            return ToolResult(False, f"{type(exc).__name__}: {exc}", {"burp_mcp_error": True})
+
+        if not result.ok:
+            return ToolResult(False, result.content, {"burp_mcp": True, **result.meta})
+
+        # Compact result: strip raw request/response bodies unless explicitly asked.
+        content = result.content
+        if name not in {"get_captured_request", "get_captured_response"}:
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    content = "\n".join(
+                        f"- {item.get('method', '?')} {item.get('url', '')} status={item.get('status_code', '')}"
+                        for item in parsed[: min(len(parsed), 30)]
+                    ) or "No matching entries."
+                elif isinstance(parsed, dict):
+                    if "history" in parsed:
+                        content = "\n".join(
+                            f"- {item.get('method', '?')} {item.get('url', '')} status={item.get('status_code', '')}"
+                            for item in parsed.get("history", [])[:30]
+                        ) or "No matching entries."
+            except (json.JSONDecodeError, TypeError):
+                pass
+        meta = {"burp_mcp": True, "action": name, **result.meta}
+        if self.artifact_store and result.content:
+            record = self.artifact_store.capture_text(
+                "burp_mcp",
+                result.content,
+                source=f"burp_mcp:{name}",
+                summary=f"Burp MCP {name} result",
+                meta={
+                    "target": target,
+                    "request_id": request_id,
+                    "session_alias": str(action.get("session_alias") or "").strip(),
+                    "burp_result_meta": result.meta,
+                },
+            )
+            meta["artifact_id"] = record.artifact_id
+            meta["artifact_path"] = record.path
+            meta["artifact_absolute_path"] = str(self.artifact_store.workspace / record.path)
+        return ToolResult(True, content, meta)
+
+    def _burp_send(self, action: dict[str, Any]) -> ToolResult:
+        """Send a raw HTTP request through Burp REST API (Repeater-style)."""
+        if not getattr(self.runner.settings, "burp_api_url", "") or not getattr(self.runner.settings, "burp_api_key", ""):
+            return ToolResult(False, "Burp REST API is not configured. Use --burp-api-url and --burp-api-key.", {"burp_disabled": True})
+        target = str(action.get("target") or self.active_target or "").strip()
+        if not target:
+            return ToolResult(False, "burp_send requires a target URL.")
+        scope = self.scope_guard.validate_target(target)
+        if not scope.allowed:
+            return ToolResult(False, f"Scope blocked burp_send: {scope.reason}")
+        method = str(action.get("method", "GET")).upper()
+        headers = action.get("headers") or {}
+        body = action.get("body")
+        if not isinstance(headers, dict):
+            headers = {}
+        burp_url = self._build_burp_api_url("/send", target)
+        payload: dict[str, Any] = {"url": target, "method": method, "headers": headers}
+        if body is not None:
+            payload["body"] = body
+        command = (
+            f"curl -sS -X POST {shlex.quote(burp_url)} "
+            f"-H 'Authorization: Bearer {shlex.quote(getattr(self.runner.settings, 'burp_api_key', ''))}' "
+            f"-H 'Content-Type: application/json' "
+            f"--data {shlex.quote(json.dumps(payload, ensure_ascii=False))}"
+        )
+        result = self._bash({"action": "bash", "command": command, "timeout_seconds": int(action.get("timeout_seconds", self.runner.settings.command_timeout_seconds))})
+        if result.ok:
+            try:
+                data = json.loads(result.stdout or "{}")
+                return ToolResult(True, json.dumps(data, ensure_ascii=False, indent=2)[:4000], {"burp_action": "send", "target": target})
+            except (json.JSONDecodeError, ValueError):
+                return ToolResult(True, result.stdout[:4000], {"burp_action": "send", "target": target})
+        return ToolResult(False, result.content, {"burp_action": "send", "target": target})
+
+    def _burp_history(self, action: dict[str, Any]) -> ToolResult:
+        """Query Burp proxy history for recent requests/responses."""
+        if not getattr(self.runner.settings, "burp_api_url", "") or not getattr(self.runner.settings, "burp_api_key", ""):
+            return ToolResult(False, "Burp REST API is not configured. Use --burp-api-url and --burp-api-key.", {"burp_disabled": True})
+        target = str(action.get("target") or self.active_target or "").strip()
+        if target:
+            scope = self.scope_guard.validate_target(target)
+            if not scope.allowed:
+                return ToolResult(False, f"Scope blocked burp_history: {scope.reason}")
+        limit = max(1, min(int(action.get("limit", 20)), 100))
+        params = f"?limit={limit}"
+        if target:
+            params += f"&url={shlex.quote(target)}"
+        burp_url = self._build_burp_api_url(f"/history{params}", target or "")
+        command = (
+            f"curl -sS {shlex.quote(burp_url)} "
+            f"-H 'Authorization: Bearer {shlex.quote(getattr(self.runner.settings, 'burp_api_key', ''))}'"
+        )
+        result = self._bash({"action": "bash", "command": command, "timeout_seconds": int(action.get("timeout_seconds", self.runner.settings.command_timeout_seconds))})
+        if result.ok:
+            try:
+                data = json.loads(result.stdout or "[]")
+                if isinstance(data, list):
+                    lines = [f"Burp history: {len(data)} entries"]
+                    for entry in data[: min(len(data), limit)]:
+                        url = entry.get("url", "")
+                        method = entry.get("method", "")
+                        status = entry.get("status_code", "")
+                        lines.append(f"- {method} {status} {url}")
+                    return ToolResult(True, "\n".join(lines), {"burp_action": "history", "target": target, "count": len(data)})
+                return ToolResult(True, json.dumps(data, ensure_ascii=False, indent=2)[:4000], {"burp_action": "history", "target": target})
+            except (json.JSONDecodeError, ValueError):
+                return ToolResult(True, result.stdout[:4000], {"burp_action": "history", "target": target})
+        return ToolResult(False, result.content, {"burp_action": "history", "target": target})
+
+    def _build_burp_api_url(self, path: str, target: str) -> str:
+        base = getattr(self.runner.settings, "burp_api_url", "").rstrip("/")
+        return f"{base}{path}"
+
+
 class CommandRateLimiter:
     def __init__(self, delay_seconds: float, max_commands_per_minute: int, trace: TraceLogger) -> None:
         self.delay_seconds = max(0.0, delay_seconds)
@@ -1151,14 +1839,19 @@ _TOOL_ACTIONS = {
 
 
 _HYPOTHESIS_REQUIRED_TOOLS = {
-    "sqlmap", "xsstrike", "dalfox", "inql", "clairvoyance", "grapeql",
+    "sqlmap", "xsstrike", "dalfox", "inql", "clairvoyance", "grapeql", "nuclei", "burp_send",
 }
+_HYPOTHESIS_REQUIRED_MCP_ACTIONS = {"replay_captured_request"}
 
 
 def _requires_hypothesis(action: dict[str, Any]) -> bool:
     name = str(action.get("action", "")).strip().lower()
     if name in _HYPOTHESIS_REQUIRED_TOOLS:
         return True
+    if name in _HYPOTHESIS_REQUIRED_MCP_ACTIONS:
+        # A replay without a patch is a baseline operation; a mutation is an
+        # active security experiment and must be tied to a hypothesis.
+        return bool(action.get("patch"))
     if name != "bash":
         return False
     command = str(action.get("command", "")).lower()
@@ -1166,6 +1859,31 @@ def _requires_hypothesis(action: dict[str, Any]) -> bool:
     if "command -v" in command or "for t in" in command:
         return False
     return any(re.search(rf"(^|[;&|\s]){re.escape(tool)}\b", command) for tool in _HYPOTHESIS_REQUIRED_TOOLS)
+
+
+def _validate_tool_action_schema(name: str, action: dict[str, Any]) -> ToolResult | None:
+    """Enforce a typed tool contract: scanner actions must carry a target field,
+    and must not smuggle an arbitrary raw command string through the action object.
+    """
+    if name not in _TOOL_ACTIONS:
+        return None
+    if "command" in action:
+        return ToolResult(
+            False,
+            f"{name} action blocked. Use the tool action schema only; do not pass a raw scanner command string in the action object.",
+            {"tool_schema_blocked": True, "tool": name},
+        )
+    target = str(action.get("url") or action.get("target") or action.get("host") or action.get("path") or "").strip()
+    if not target:
+        return ToolResult(False, f"Missing target for {name} action.", {"tool_schema_blocked": True, "tool": name})
+    # Sanitize away free-form bash-like keys that bypass action typing.
+    if any(key in action for key in ("shell", "stdin", "args", "argv")):
+        return ToolResult(
+            False,
+            f"{name} action blocked. Tool actions must be typed and mapped through the canonical command builder.",
+            {"tool_schema_blocked": True, "tool": name},
+        )
+    return None
 
 
 def _build_tool_command(tool: str, url: str, action: dict[str, Any]) -> str:
@@ -1302,6 +2020,18 @@ def _finding_fingerprint(finding: Finding) -> str:
     text = re.sub(r"['\"]?[./]*etc/(passwd|shadow|hosts)['\"]?", "etc-file", text)
     text = re.sub(r"\b[a-f0-9]{8,}\b", "hex-token", text)
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _surface_route_key(url: str) -> str:
+    """Stable per-surface key for the fallback-ladder burn registry.
+
+    Normalizes the URL (challenge-token/tracking strip, www, protocol, path)
+    so the same surface maps to one key regardless of the exact URL variant
+    the model passed.
+    """
+    normalized = normalize_url(url if "://" in url else f"https://{url}")
+    parsed = urlparse(normalized)
+    return (parsed.hostname or "").lower() + (parsed.path or "/")
 
 
 def _action_target(action: dict[str, Any]) -> str:
@@ -1540,11 +2270,25 @@ def recommended_tool_for_surface(surface_type: str) -> list[str]:
 
 
 def is_bulk_python_scan(command: str) -> bool:
-    """Detect the 'write one python script that scans 100 endpoints' anti-pattern."""
-    if "python" not in command.lower():
+    """Detect the 'write one python script that scans 100 endpoints' anti-pattern.
+
+    Only matches actual Python script execution, not bash loops that mention
+    python3 as a tool name in a command -v inventory check.
+    """
+    lowered = command.lower()
+    # Exempt baseline recon commands (tool presence check, robots.txt, sitemap.xml)
+    if _is_baseline_recon_command(command):
         return False
-    if "range(" in command or "for " in command:
-        if "requests" in command or "urllib" in command or "httpx" in command:
+    # Must be actual Python invocation: python3 script.py, python3 -c "code", or python3 <<EOF
+    # Do NOT match bash loops like: for t in curl python3 httpx; do ... done
+    is_python_invocation = bool(re.search(r'\bpython3?\s+(?:-[a-z]+\s+)?[a-zA-Z0-9_./-]+\.py\b', lowered) or
+                                re.search(r'\bpython3?\s+-c\s+', lowered) or
+                                re.search(r'\bpython3?\s+<<', lowered))
+    if not is_python_invocation:
+        return False
+    # Now check for bulk scanning patterns within the Python script/command
+    if "range(" in lowered or "for " in lowered:
+        if "requests" in lowered or "urllib" in lowered or "httpx" in lowered:
             return True
     return False
 
@@ -1629,13 +2373,30 @@ def _validate_command_safety(command: str) -> ToolResult | None:
                 "Command blocked by safety policy. Use low-impact recon and verification only.",
                 {"safety_blocked": True, "pattern": pattern},
             )
+    # Harden the validator against malformed scanner grammar that the model can emit
+    # through the command-compiler loop. These are syntax rejections, not runtime
+    # scanner hints, so they should fail immediately with the same rate-guard meta.
+    if re.search(r"\bhttpx\b.*\s-(?:t|c)\b", lowered):
+        return ToolResult(
+            False,
+            "httpx command blocked because it uses malformed low-rate flag grammar. "
+            "Replace -t/-c with the supported httpx rate/threads controls instead of emitting an ungrounded alias map.",
+            {"rate_guard_blocked": True, "tool": "httpx"},
+        )
+    if re.search(r"\bkatana\b.*\s-ls\b", lowered):
+        return ToolResult(
+            False,
+            "katana command blocked because it uses a malformed or unsupported flag grammar. "
+            "Use a supported katana rate/concurrency signal such as -c or the documented rate-limit flag instead of -ls.",
+            {"rate_guard_blocked": True, "tool": "katana"},
+        )
     if "command -v" in lowered:
         return None
     scanner_rate_hints = {
         "ffuf": [" -rate", " --rate", " -t 1", " -t 2", " -t 3", " -t 4", " -t 5"],
         "nuclei": [" -rl ", " -rate-limit", " -rate", " --rate", " -c ", " -concurrency", " --concurrency", " -t 1", " -t 2"],
-        "httpx": [" -rl ", " -rate-limit", " -rate", " --rate", " -threads", " --threads", " -c ", " -t "],
-        "katana": [" -rl ", " -rate-limit", " -rate", " --rate", " -c ", " -concurrency", " --concurrency", " -t "],
+        "httpx": [" -rl ", " -rate-limit", " -rate", " --rate", " -threads", " --threads"],
+        "katana": [" -rl ", " -rate-limit", " -rate", " --rate", " -c ", " -concurrency", " --concurrency"],
         "gobuster": [" -t ", " --delay ", " --rate "],
         "dirsearch": [" --max-rate ", " -t ", " --rate "],
         "sqlmap": [" --delay=", " --threads=", " --safe-url", " --batch"],

@@ -184,7 +184,17 @@ class ReconStore:
         self.conn.commit()
 
     def _ensure_last_seen_columns(self) -> None:
+        # ASM-style staleness tracking: every re-observation of an asset bumps
+        # last_seen so old map data can be aged out instead of trusted forever.
         for table_name in ("facts", "surfaces", "attacks"):
+            cols = [row[1] for row in self.conn.execute(f"PRAGMA table_info({table_name})")]
+            if "last_seen" not in cols:
+                self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN last_seen TEXT")
+        self.conn.commit()
+
+    def ensure_world_freshness_columns(self) -> None:
+        """Add last_seen to world-model asset tables (idempotent migration)."""
+        for table_name in ("services", "world_routes", "technologies"):
             cols = [row[1] for row in self.conn.execute(f"PRAGMA table_info({table_name})")]
             if "last_seen" not in cols:
                 self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN last_seen TEXT")

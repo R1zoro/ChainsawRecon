@@ -9,14 +9,17 @@ from pathlib import Path
 
 from .auth_context import AuthContext
 from .artifact_store import ArtifactStore
+from .burp_mcp import BurpMcpClient, BurpMcpConfig
 from .config import AgentSettings, ProgramScope
 from .browser_evidence import parse_har
 from .canonical_surface import CanonicalSurfaceManager
 from .engagement_state import EngagementStateStore, extract_hosts
 from .infrastructure import InfrastructureStore
+from .journeys import JourneyStore
 from .llm import ChatMessage, LLMClient, NullLLMClient, OpenAICompatibleClient
 from .mapping import MappingCoordinator
 from .prompts import build_system_prompt, deterministic_recon_plan
+from .session_manager import SessionManager, session_status_prompt
 from .strategy_memory import StrategyMemory
 from .report import write_engagement_report, write_report
 from .retrieval import NullRetrievalStore, RetrievalStore
@@ -24,6 +27,7 @@ from .recon_db import NullReconStore, ReconStore, promote_run_facts
 from .sandbox import DockerSandboxRunner, LocalWorkspaceRunner
 from .endpoint_tracker import AuthGateClassifier, EndpointExhaustionTracker, SurfaceOutcome
 from .controls import DynamicRateLimiter, GeminiAdjudicator, RateLimitProbe, get_cleanup_registry
+from .context import ContextLedger
 from .scope import ScopeGuard
 from .tools import ToolRegistry
 from .trace import TraceLogger
@@ -61,9 +65,13 @@ class BountyAgent:
             except Exception as exc:
                 self.trace.write("auth_context_load_failed", error=f"{type(exc).__name__}: {exc}")
         self.retrieval = self._build_retrieval_store()
+        self.context_ledger = ContextLedger()
         self.run_recon = self._build_run_recon_store()
         self.engagement_recon = self._build_engagement_recon_store()
         self.engagement_state = self._build_engagement_state_store()
+        self.session_manager = self._build_session_manager()
+        self._register_auth_lane()
+        self.journey_store = self._build_journey_store()
         self.mapping_coordinator = MappingCoordinator()
         self.world_model = WorldModel(
             self.engagement_recon,
@@ -143,8 +151,33 @@ class BountyAgent:
         cleanup.register('engagement_state.close', lambda: self.engagement_state.close() if hasattr(self, 'engagement_state') else None)
         self.trace.write('cleanup_registered', count=len(cleanup))
         self.tools.set_strategy_memory(self.strategy_memory)
+        self.tools.set_journey_store(self.journey_store)
+        self.tools.set_world_model(self.world_model)
+        self.tools.set_session_manager(self.session_manager)
+        self.tools.set_auth_context_path(settings.auth_context_path)
+        # Sessions are partitioned under the stable engagement id (shared across
+        # runs of the same program), not the per-run id — otherwise login-created
+        # sessions would be invisible to the session-lane prompt.
+        self.tools.set_engagement_id(stable_id(
+            "engagement", str(self._engagement_db_path().parent.resolve()), self.scope.program_name
+        ))
         if self.auth_context:
             self.tools.set_auth_context(self.auth_context)
+        # Stage 1: wire Burp MCP client into tools
+        if settings.burp_mcp_url:
+            self.burp_mcp_client = BurpMcpClient(
+                BurpMcpConfig(
+                    url=settings.burp_mcp_url,
+                    transport=settings.burp_mcp_transport,
+                    token=settings.burp_mcp_token,
+                    project_alias=settings.burp_project_alias,
+                    session_alias=settings.burp_session_alias,
+                )
+            )
+            self.tools.set_burp_mcp_client(self.burp_mcp_client)
+            self.trace.write("burp_mcp_configured", url=settings.burp_mcp_url, transport=settings.burp_mcp_transport)
+        else:
+            self.burp_mcp_client = None
         # Milestone 2: wire endpoint exhaustion + auth-gate classifiers into tools
         self.tools.set_endpoint_tracker(_endpoint_tracker)
         self.tools.set_auth_gate_classifier(_auth_gate_classifier)
@@ -231,6 +264,7 @@ class BountyAgent:
 
     def _run(self) -> Path:
         self.trace.write("session_start", targets=self.session_targets, runner=self.settings.runner)
+        self._preflight_burp_mcp()
         effective_mode = self._resolve_effective_mode()
         self.trace.write("mode_selected", requested=self.settings.mode, effective=effective_mode)
         self._stage_auth_context()
@@ -249,6 +283,11 @@ class BountyAgent:
             index = len(self.completed_targets) + 1
             current_target = self.pending_targets.pop(0)
             self.target = current_target
+            self.context_ledger.reset()
+            self.context_ledger.set_target(
+                current_target,
+                f"Map and assess {current_target}; identify the highest-value unresolved security question.",
+            )
             objective_id = self.engagement_state.ensure_objective(
                 title=f"Map and assess {current_target}",
                 target=current_target,
@@ -300,6 +339,7 @@ class BountyAgent:
                         result_ok = result.ok
                         self.session_step_count = self.tools.action_count
                     self.retrieval.add(index, action, result_content, {"type": action.get("action"), "phase": "startup", "target": current_target})
+                    self.context_ledger.observe(action, result_ok, result_content)
                     messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
                 self._tool_presence_done = True
             summary = ""
@@ -307,12 +347,10 @@ class BountyAgent:
                 self.trace.write("mode_preflight", mode=effective_mode, action="mapping", target=current_target)
                 summary = self._run_mapping_preflight(messages)
                 self.session_step_count = self.tools.action_count
-            if effective_mode == "mapping":
-                summary = summary or f"{current_target}: mapping mode completed."
-            elif self.settings.model:
+            if self.settings.model:
                 summary = self._run_llm_loop(messages)
             else:
-                summary = f"{current_target}: dry run completed without an LLM."
+                summary = summary or f"{current_target}: completed without an LLM."
             self.target_outcomes[current_target] = summary
             self.completed_targets.append(current_target)
             discovered = self._extend_pending_targets_from_recon()
@@ -362,6 +400,30 @@ class BountyAgent:
         self.trace.write("finish", report=str(self.run_dir / "report.md"))
         self._persist_session_state(effective_mode, finished=True)
         return self.run_dir
+
+    def _preflight_burp_mcp(self) -> None:
+        """Check configured Burp MCP once without making Burp mandatory."""
+        client = getattr(self, "burp_mcp_client", None)
+        if client is None:
+            return
+        try:
+            health = client.health()
+            self.trace.write("burp_mcp_health", ok=health.ok, message=health.content[:1000], meta=health.meta)
+            if not health.ok:
+                return
+            capabilities = client.discover_capabilities()
+            self.trace.write(
+                "burp_mcp_capabilities",
+                ok=capabilities.ok,
+                message=capabilities.content[:1000],
+                meta=capabilities.meta,
+            )
+        except Exception as exc:
+            self.trace.write(
+                "burp_mcp_preflight_error",
+                error=f"{type(exc).__name__}: {exc}",
+                action="continue_without_burp_mcp_until_reconfigured",
+            )
 
     def _run_llm_loop(self, messages: list[ChatMessage]) -> str:
         final_summary = ""
@@ -490,12 +552,20 @@ class BountyAgent:
                     repeat_blocks += 1
                 if "Unsupported action:" in result_content:
                     valid_actions = (
-                        "bash, read_file, write_file, list_files, list_artifacts, search_artifact, read_artifact_slice, use_skill, record_finding, "
-                        "create_objective, create_hypothesis, record_evidence, save_artifact, "
-                        "create_verifier, sqlmap, dalfox, nuclei, httpx, katana, ffuf, finish"
+                        "bash, read_file, write_file, list_files, list_artifacts, search_artifact, read_artifact_slice, use_skill, research, "
+                        "record_finding, create_objective, create_hypothesis, record_evidence, save_artifact, "
+                        "create_verifier, browser_map, burp_send, burp_history, "
+                        "list_journeys, get_journey_steps, search_journey_requests, get_journey_request, "
+                        "world_model_summary, search_world_model, route_surface, "
+                        "perform_login, verify_session, renew_session, session_status, "
+                        "select_worker, list_workers, "
+                        "search_captured_requests, get_captured_request, get_captured_response, "
+                        "replay_captured_request, compare_captured_responses, create_repeater_experiment, "
+                        "sqlmap, dalfox, nuclei, httpx, katana, ffuf, finish"
                     )
                     result_content += f"\n[SYSTEM NOTICE] '{action_name}' is not a valid action name. Valid actions are: {valid_actions}. Use one of these in your JSON object."
             self.retrieval.add(step, action, result_content, {"type": action.get("action")})
+            self.context_ledger.observe(action, result_ok, result_content)
             messages.append(ChatMessage("assistant", json.dumps(action)))
             messages.append(ChatMessage("user", self._format_tool_feedback(action, result_ok, result_content)))
 
@@ -627,11 +697,21 @@ class BountyAgent:
         targets = mapping_state.get("targets", [])
         hosts = mapping_state.get("hosts", [])
         surfaces = mapping_state.get("surfaces", [])
+        snapshot = mapping_state.get("snapshot", {})
         lines = [
             "Persisted mapping state from a prior run. Treat this as the current target map and prioritize these targets and surfaces.",
             f"Targets: {_summarize_items([str(target) for target in targets], 6)}",
             f"Hosts: {_summarize_items([str(host) for host in hosts], 8)}",
         ]
+        if snapshot:
+            phase = snapshot.get("phase", "unknown")
+            focus = snapshot.get("recommended_focus", [])
+            actions = snapshot.get("suggested_actions", [])
+            lines.append(f"Current mapping phase: {phase}")
+            if focus:
+                lines.append(f"Focus: {'; '.join(focus)}")
+            if actions:
+                lines.append(f"Suggested actions (choose one that fits): {', '.join(actions)}")
         if surfaces:
             lines.append("Surfaces:")
             for surface in surfaces[:5]:
@@ -653,8 +733,6 @@ class BountyAgent:
         return "\n".join(lines)
 
     def _build_research_focus_prompt(self) -> str:
-        if self.settings.mode != "assistant":
-            return "Internet research is disabled in autonomous modes. Derive decisions only from observed target evidence and installed tools."
         surfaces = self._merged_surfaces()
         surface_types = sorted({surface.surface_type for surface in surfaces if getattr(surface, "surface_type", "")})
         hosts = sorted({surface.host for surface in surfaces if getattr(surface, "host", "") and surface.host != "local"})
@@ -669,11 +747,30 @@ class BountyAgent:
             keywords.extend(["sso", "oauth", "session fixation", "tenant switching"])
         if any("docs" in host for host in hosts):
             keywords.extend(["sdk", "docs generator", "fern", "code snippets", "sample token"])
+        examples = [
+            '{"action":"research","source":"tavily","query":"pixabay API documentation endpoint format key"}',
+            '{"action":"research","source":"tavily","query":"<tech> <bug class> bug bounty writeup"}',
+            '{"action":"research","source":"osv","package":"<package-name>","ecosystem":"<ecosystem>","version":"<version>"}',
+        ]
+        if self.settings.mode == "assistant":
+            if not keywords:
+                return "Assistant research focus: use one focused, user-visible query and return cited sources for operator selection."
+            return (
+                "Assistant research focus: build one focused query from observed technologies and bug classes, then return cited sources for operator selection. "
+                f"Current promising terms: {', '.join(dict.fromkeys(keywords))}."
+            )
+        # Autonomous modes: deterministic research via the `research` action only.
         if not keywords:
-            return "Assistant research focus: use one focused, user-visible query and return cited sources for operator selection."
+            return (
+                "Deterministic research focus: use the `research` action (source=tavily) to look up "
+                "observed technologies or API patterns before deeper probing. Budget 4 calls per target.\n"
+                f"Example: {examples[1]}"
+            )
         return (
-            "Assistant research focus: build one focused query from observed technologies and bug classes, then return cited sources for operator selection. "
-            f"Current promising terms: {', '.join(dict.fromkeys(keywords))}."
+            "Deterministic research focus (enabled in this mode): use the `research` action to look up "
+            "observed technologies, API documentation, or bug classes. Budget 4 calls per target.\n"
+            f"Current promising terms: {', '.join(dict.fromkeys(keywords))}.\n"
+            f"Example: {examples[1]}"
         )
 
     def _build_cluster_prompt(self) -> str:
@@ -726,11 +823,34 @@ class BountyAgent:
         return "\n".join(lines)
 
     def _build_auth_context_prompt(self) -> str:
+        lane_status = session_status_prompt(
+            self.session_manager.list_sessions(engagement_id=stable_id(
+                "engagement", str(self._engagement_db_path().parent.resolve()), self.scope.program_name
+            ))
+        )
+        # When Burp MCP is enabled, the operator's FRESH session is in Burp proxy history.
+        # Prefer replaying captured requests over stale auth.json cookies.
+        if self.settings.burp_mcp_url:
+            lines = [
+                lane_status,
+                "Burp MCP is enabled. The operator's FRESH authenticated session is captured in Burp proxy history.",
+                "PREFERRED auth path: call `search_captured_requests` to find the operator's login requests, "
+                "`get_captured_request` to extract exact fresh cookies/headers, and `replay_captured_request` "
+                "to replay authenticated requests with mutations.",
+                "Do NOT rely on stale auth-context.txt cookies when Burp MCP is available — they expire and are not renewed.",
+            ]
+            # Still show the structured auth context as a fallback reference
+            if self.auth_context:
+                section = self.auth_context.build_prompt_section(self.target)
+                if section:
+                    lines.extend(["", "Fallback auth context (may be stale — prefer Burp MCP captured session):", section])
+            return "\n".join(lines)
         # If structured auth context is loaded, show per-target cookie groups
         if self.auth_context:
             section = self.auth_context.build_prompt_section(self.target)
             if section:
                 lines = [
+                    lane_status,
                     "Structured authenticated context with per-target cookie groups is available.",
                     "Use it carefully for authenticated checks, compare unauthenticated and authenticated behavior, and avoid treating normal logged-in access as a finding.",
                     "",
@@ -740,15 +860,16 @@ class BountyAgent:
         # Fallback to the flat auth-context.txt file
         staged = self.workspace / "auth-context.txt"
         if not staged.exists():
-            return "Authenticated context: none supplied. If auth-only surfaces are discovered, keep notes for a future authenticated run."
+            return lane_status + "\nAuthenticated context: none supplied. If auth-only surfaces are discovered, keep notes for a future authenticated run."
         try:
             content = staged.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
-            return "Authenticated context file exists but could not be read."
+            return lane_status + "\nAuthenticated context file exists but could not be read."
         if not content:
-            return "Authenticated context file is empty."
+            return lane_status + "\nAuthenticated context file is empty."
         preview = content[:1200]
         lines = [
+            lane_status,
             "Authenticated context is available in workspace file `auth-context.txt`.",
             "Use it carefully for authenticated checks, compare unauthenticated and authenticated behavior, and avoid treating normal logged-in access as a finding.",
             "Auth context preview:",
@@ -770,20 +891,85 @@ class BountyAgent:
                 files = sorted(skel_dir.glob("*.http"), key=lambda p: 0 if preferred and preferred in p.name else 1)
                 if files:
                     lines.append("")
-                    lines.append("Operator-provided HTTP skeletons available (use as templates for headers/cookies):")
+                    lines.append("Operator-provided HTTP skeletons available. Parse and reuse them as templates:")
+                    parsed_any = False
                     for f in files[:4]:
                         try:
                             text = f.read_text(encoding="utf-8", errors="replace").strip()
                         except OSError:
                             continue
-                        preview_s = text[:800].replace('\n', '\\n')
-                        name = f.name
-                        lines.append(f"- {name}: {preview_s}{'... [truncated]' if len(text) > 800 else ''}")
-                    lines.append("When generating verifiers, prefer these skeletons as starting templates and try minimal header permutations to determine required auth headers.")
+                        parsed = self._parse_http_skeleton(text, f.name)
+                        if not parsed:
+                            continue
+                        parsed_any = True
+                        lines.append(f"- {f.name}: {parsed['method']} {parsed['url']}")
+                        if parsed.get("headers"):
+                            lines.append(f"  headers: {', '.join(parsed['headers'].keys())}")
+                        if parsed.get("cookies"):
+                            lines.append(f"  cookies: {', '.join(parsed['cookies'].keys())}")
+                        # Store parsed skeleton in engagement state for reuse across runs
+                        if self.engagement_state:
+                            self.engagement_state.record_evidence(
+                                "auth_skeleton",
+                                str(f),
+                                f"Parsed HTTP skeleton: {parsed['method']} {parsed['url']}",
+                                content=json.dumps(parsed, ensure_ascii=False, indent=2),
+                                source="operator",
+                            )
+                    if parsed_any:
+                        lines.append("When generating verifiers, prefer these skeletons as exact header/cookie templates. Do not guess headers that are present in the skeleton.")
         except Exception:
             # best-effort; never fail prompt construction
             pass
         return "\n".join(lines)
+
+    def _parse_http_skeleton(self, text: str, filename: str) -> dict[str, object] | None:
+        """Parse a raw HTTP request skeleton into structured method/url/headers/cookies."""
+        if not text:
+            return None
+        lines = text.splitlines()
+        if not lines:
+            return None
+        # First line: METHOD URL HTTP/VERSION
+        request_line = lines[0].strip()
+        parts = request_line.split()
+        if len(parts) < 2:
+            return None
+        method = parts[0].upper()
+        url = parts[1]
+        headers: dict[str, str] = {}
+        cookies: dict[str, str] = {}
+        body_lines: list[str] = []
+        in_body = False
+        for line in lines[1:]:
+            if not in_body:
+                if not line.strip():
+                    in_body = True
+                    continue
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+                    if key == "cookie":
+                        for cookie in value.split(";"):
+                            cookie = cookie.strip()
+                            if "=" in cookie:
+                                ck, cv = cookie.split("=", 1)
+                                cookies[ck.strip()] = cv.strip()
+                    else:
+                        headers[key] = value
+            else:
+                body_lines.append(line)
+        result: dict[str, object] = {
+            "filename": filename,
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "cookies": cookies,
+        }
+        if body_lines:
+            result["body"] = "\n".join(body_lines)
+        return result
 
     def _build_target_map_content(self) -> str:
         payload = self._build_mapping_payload()
@@ -820,6 +1006,12 @@ class BountyAgent:
         for target in reversed(self.completed_targets + self.pending_targets):
             if target not in hosts:
                 hosts = [target] + hosts
+        snapshot = self.mapping_coordinator.assess(
+            surfaces,
+            technology_count=len(self.world_model.architecture_summary()["technologies"]),
+            browser_capture_count=len(self.world_model.architecture_summary()["browser_captures"]),
+            source_asset_count=len(self.world_model.architecture_summary()["source_assets"]),
+        )
         payload = {
             "program_name": self.scope.program_name,
             "target": self.target,
@@ -839,6 +1031,17 @@ class BountyAgent:
                 }
                 for surface in surfaces
             ],
+            "snapshot": {
+                "phase": snapshot.phase.name,
+                "complete_when": snapshot.phase.complete_when,
+                "priority": snapshot.phase.priority,
+                "known_hosts": snapshot.known_hosts,
+                "known_routes": snapshot.known_routes,
+                "api_routes": snapshot.api_routes,
+                "authenticated_routes": snapshot.authenticated_routes,
+                "recommended_focus": list(snapshot.recommended_focus),
+                "suggested_actions": list(snapshot.suggested_actions),
+            },
             "generated_at": datetime.now().isoformat(),
         }
         return payload
@@ -1000,6 +1203,7 @@ class BountyAgent:
 
     def _build_world_model_prompt(self) -> str:
         summary = self.world_model.architecture_summary()
+        boundaries = self.world_model.attack_surface_summary(limit=4)
         mapping = self.mapping_coordinator.assess(
             self._merged_surfaces(), technology_count=len(summary["technologies"]),
             browser_capture_count=len(summary["browser_captures"]), source_asset_count=len(summary["source_assets"]),
@@ -1008,9 +1212,14 @@ class BountyAgent:
             return f"Architecture world model: no verified topology yet. Current mapping phase: {mapping.phase.name}; focus: {'; '.join(mapping.recommended_focus)}."
         technologies = ", ".join(item["name"] for item in summary["technologies"][:12]) or "none"
         routes = ", ".join(f"{item['method']} {item['host']}{item['path']}" for item in summary["routes"][:12]) or "none"
+        boundary_text = "; ".join(
+            f"{item['surface']} [{item['boundary']} → {item['mission']}]"
+            for item in boundaries
+        ) or "none yet"
         return (
             "Architecture world model (evidence, not proof): "
-            f"services={len(summary['services'])}; technologies={technologies}; routes={routes}; mapping phase={mapping.phase.name}. "
+            f"services={len(summary['services'])}; technologies={technologies}; routes={routes}; "
+            f"attack boundaries={boundary_text}; mapping phase={mapping.phase.name}. "
             "Use it to form a bounded hypothesis and select representative surfaces; do not assume unverified relationships are exploitable."
         )
 
@@ -1360,6 +1569,7 @@ class BountyAgent:
         return path
 
     def _append_tool_feedback(self, messages: list[ChatMessage], action: dict[str, object], result: object) -> None:
+        self.context_ledger.observe(action, getattr(result, "ok", False), getattr(result, "content", ""))
         messages.append(ChatMessage("assistant", json.dumps(action)))
         messages.append(ChatMessage("user", self._format_tool_feedback(action, getattr(result, "ok", False), getattr(result, "content", ""))))
 
@@ -1384,6 +1594,11 @@ class BountyAgent:
         if step >= 8 and self.settings.mode == "assistant" and action_counts.get("search", 0) == 0:
             hints.append(
                 "Assistant research is available only on an explicit operator request. Return concise cited sources and wait for the operator to select one."
+            )
+        if step >= 4 and self.settings.mode != "assistant" and action_counts.get("research", 0) == 0:
+            hints.append(
+                "Deterministic research is enabled. Use the `research` action (source=tavily) to look up "
+                "observed technologies, API documentation, or bug classes before deeper probing. Budget 4 calls per target."
             )
         if step >= 12 and action_counts.get("write_file", 0) == 0:
             hints.append(
@@ -1537,12 +1752,8 @@ class BountyAgent:
         hits = self.retrieval.search(query, top_k=5)
         if not hits:
             return []
-        lines: list[str] = ["Relevant prior tool outputs:"]
-        for hit in hits:
-            lines.append(f"Step {hit.step}: action={json.dumps(hit.action)}")
-            lines.append(hit.content)
-            lines.append("---")
-        return [ChatMessage("system", "\n".join(lines))]
+        content = self.context_ledger.render_retrieval(step, hits)
+        return [ChatMessage("system", content)] if content else []
 
     def _derive_retrieval_query(self, messages: list[ChatMessage]) -> str:
         last_user = next((msg.content for msg in reversed(messages) if msg.role == "user"), "")
@@ -1604,7 +1815,8 @@ class BountyAgent:
         trimmed_convo = convo_messages[-12:]
         auto_skill = self._build_auto_skill_prompt()
         auto_skill_snippet = [ChatMessage("system", auto_skill)] if auto_skill else []
-        return system_messages + auto_skill_snippet + memory_snippet + coverage_snippet + progress_hint + trimmed_convo
+        working_memory = [ChatMessage("system", self.context_ledger.render_working_memory())]
+        return system_messages + working_memory + auto_skill_snippet + memory_snippet + coverage_snippet + progress_hint + trimmed_convo
 
     def _build_llm(self) -> LLMClient:
         if not self.settings.model:
@@ -1614,6 +1826,12 @@ class BountyAgent:
             api_key=self.settings.llm_api_key,
             model=self.settings.model,
             timeout_seconds=self.settings.llm_timeout_seconds,
+            num_ctx=self.settings.ollama_num_ctx,
+            max_output_tokens=self.settings.llm_max_output_tokens,
+            input_budget_tokens=self.settings.llm_input_budget_tokens,
+            keep_alive=self.settings.keep_alive,
+            keep_alive_probe_seconds=self.settings.keep_alive_probe_seconds,
+            trace=self.trace,
         )
 
     def _build_retrieval_store(self) -> RetrievalStore | NullRetrievalStore:
@@ -1655,6 +1873,63 @@ class BountyAgent:
         except Exception as exc:
             self.trace.write("engagement_state_fallback", error=f"{type(exc).__name__}: {exc}")
             return EngagementStateStore(self.run_dir / "knowledge" / "state.db")
+
+    def _build_session_manager(self) -> SessionManager:
+        """Open the first-class session store."""
+        path = self._engagement_db_path().parent / "knowledge" / "sessions.db"
+        try:
+            store = SessionManager(path)
+            self.trace.write("session_manager_enabled", path=str(store.path))
+            return store
+        except Exception as exc:
+            self.trace.write("session_manager_fallback", error=f"{type(exc).__name__}: {exc}")
+            return SessionManager(self.run_dir / "knowledge" / "sessions.db")
+
+    def _register_auth_lane(self) -> None:
+        """Register the run's selected authentication lane in durable state.
+
+        This records session metadata only. Cookies and bearer values remain in
+        the existing protected auth context or Burp session; they are never
+        copied into the engagement session database.
+        """
+        mode = str(self.settings.auth_mode or "none")
+        alias = (
+            self.settings.auth_session_alias
+            or self.settings.burp_session_alias
+            or ("auth-context" if self.auth_context else "public")
+        )
+        if mode == "none" and (self.auth_context or self.settings.burp_mcp_url):
+            mode = "operator-handover" if self.settings.burp_mcp_url else "recorded-login"
+        mechanism = "none" if mode == "none" else ("burp-session" if self.settings.burp_mcp_url else "cookie-context")
+        status = "active" if mode == "none" or self.auth_context else "pending"
+        engagement_id = stable_id("engagement", str(self._engagement_db_path().parent.resolve()), self.scope.program_name)
+        domains = tuple(self.auth_context.target_urls()) if self.auth_context else tuple(self.scope.allowed_domains)
+        try:
+            session = self.session_manager.create_session(
+                alias=alias,
+                engagement_id=engagement_id,
+                source=mode,
+                auth_mechanism=mechanism,
+                domains=domains,
+                burp_project_ref=self.settings.burp_project_alias or None,
+                burp_rule_name=self.settings.burp_session_alias or None,
+                secret_policy="never-inline",
+                status=status,
+            )
+            self.trace.write("auth_lane_registered", session=session.to_dict())
+        except Exception as exc:
+            self.trace.write("auth_lane_registration_failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _build_journey_store(self) -> JourneyStore:
+        """Open the browser journey and request-template store."""
+        path = self._engagement_db_path().parent / "knowledge" / "journeys.db"
+        try:
+            store = JourneyStore(path)
+            self.trace.write("journey_store_enabled", path=str(store.path))
+            return store
+        except Exception as exc:
+            self.trace.write("journey_store_fallback", error=f"{type(exc).__name__}: {exc}")
+            return JourneyStore(self.run_dir / "knowledge" / "journeys.db")
 
     def _engagement_db_path(self) -> Path:
         return self.settings.engagement_db_path or self.run_dir.parent / "knowledge.db"
@@ -2092,12 +2367,15 @@ def _recon_coverage_gaps(
     written_files: set[str] = set()
     executed_python = False
     hosts: set[str] = set()
+    research_calls = 0
     for action, result in history:
         if not getattr(result, "ok", False):
             continue
         action_name = str(action.get("action", ""))
         if action_name == "search":
             search_queries.append(str(action.get("query", "")).lower())
+        elif action_name == "research":
+            research_calls += 1
         elif action_name == "write_file":
             written_files.add(str(action.get("path", "")))
         elif action_name == "bash":
@@ -2115,6 +2393,10 @@ def _recon_coverage_gaps(
         "cve": any("cvedetails.com" in query or "cve" in query for query in search_queries),
         "snyk": any("snyk.io" in query or "snyk" in query for query in search_queries),
     }
+    # In autonomous modes, deterministic `research` calls (Tavily/OSV) satisfy the research gap.
+    if research_calls:
+        research_sources["tavily"] = True
+        research_sources["osv"] = True
     command_text = "\n".join(commands)
     coverage_summary = coverage_summary or {}
     surface_count = int(coverage_summary.get("surface_count", 0) or 0)

@@ -22,6 +22,10 @@ LIFECYCLE_STATES = {
     "observed", "suspected", "evidence_required", "experiment_planned",
     "experiment_attempted", "reproduced", "validated", "rejected", "deferred", "blocked",
 }
+EXPERIMENT_READY_STATES = {
+    "suspected", "evidence_required", "experiment_planned", "experiment_attempted", "reproduced",
+}
+MISSION_STATES = {"active", "completed", "deferred", "blocked"}
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,20 @@ class SecurityObjective:
     priority: int = 50
     description: str = ""
     source: str = "agent"
+    meta: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class Mission:
+    mission_id: str
+    objective_id: str | None
+    title: str
+    target: str
+    kind: str
+    worker: str
+    status: str = "active"
+    required_evidence: tuple[str, ...] = ()
+    completion_criteria: tuple[str, ...] = ()
     meta: dict[str, Any] | None = None
 
 
@@ -71,6 +89,12 @@ class EngagementStateStore:
                 state TEXT NOT NULL, confidence TEXT NOT NULL, required_evidence TEXT NOT NULL,
                 source TEXT NOT NULL, meta TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS missions(
+                mission_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                objective_id TEXT, title TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL,
+                worker TEXT NOT NULL, status TEXT NOT NULL, required_evidence TEXT NOT NULL,
+                completion_criteria TEXT NOT NULL, meta TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS evidence(
                 evidence_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, hypothesis_id TEXT,
                 objective_id TEXT, kind TEXT NOT NULL, location TEXT NOT NULL, summary TEXT NOT NULL,
@@ -90,6 +114,7 @@ class EngagementStateStore:
                 path TEXT NOT NULL, summary TEXT NOT NULL, source TEXT NOT NULL, meta TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_hypotheses_objective ON hypotheses(objective_id);
+            CREATE INDEX IF NOT EXISTS idx_missions_objective ON missions(objective_id);
             CREATE INDEX IF NOT EXISTS idx_actions_run ON actions(run_id);
             CREATE INDEX IF NOT EXISTS idx_evidence_hypothesis ON evidence(hypothesis_id);
             """
@@ -125,6 +150,22 @@ class EngagementStateStore:
                  state=excluded.state, confidence=excluded.confidence, required_evidence=excluded.required_evidence, meta=excluded.meta""",
             (key, now, now, objective_id, surface, title, security_question, state, confidence,
              _json(list(required_evidence)), source, _json(meta)),
+        )
+        self.conn.commit()
+        return key
+
+    def ensure_mission(self, title: str, target: str, *, kind: str, worker: str,
+                       objective_id: str | None = None, required_evidence: Iterable[str] = (),
+                       completion_criteria: Iterable[str] = (), meta: dict[str, Any] | None = None) -> str:
+        key = _stable_id("MIS", objective_id or "", target, kind, title)
+        now = _now()
+        self.conn.execute(
+            """INSERT INTO missions(mission_id,created_at,updated_at,objective_id,title,target,kind,worker,status,required_evidence,completion_criteria,meta)
+               VALUES (?,?,?,?,?,?,?,?, 'active',?,?,?)
+               ON CONFLICT(mission_id) DO UPDATE SET updated_at=excluded.updated_at,worker=excluded.worker,
+                 required_evidence=excluded.required_evidence,completion_criteria=excluded.completion_criteria,meta=excluded.meta""",
+            (key, now, now, objective_id, title, target, kind, worker, _json(list(required_evidence)),
+             _json(list(completion_criteria)), _json(meta)),
         )
         self.conn.commit()
         return key
@@ -182,6 +223,72 @@ class EngagementStateStore:
     def hypotheses(self) -> list[dict[str, Any]]:
         return self._rows("SELECT hypothesis_id,objective_id,surface,title,security_question,state,confidence,required_evidence,source,meta FROM hypotheses ORDER BY updated_at DESC")
 
+    def hypothesis(self, hypothesis_id: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            "SELECT hypothesis_id,objective_id,surface,title,security_question,state,confidence,required_evidence,source,meta "
+            "FROM hypotheses WHERE hypothesis_id=?",
+            (hypothesis_id,),
+        )
+        return rows[0] if rows else None
+
+    def mission(self, mission_id: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            "SELECT mission_id,objective_id,title,target,kind,worker,status,required_evidence,completion_criteria,meta "
+            "FROM missions WHERE mission_id=?",
+            (mission_id,),
+        )
+        return rows[0] if rows else None
+
+    def missions(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            return self._rows(
+                "SELECT mission_id,objective_id,title,target,kind,worker,status,required_evidence,completion_criteria,meta "
+                "FROM missions WHERE status=? ORDER BY updated_at DESC",
+                (status,),
+            )
+        return self._rows(
+            "SELECT mission_id,objective_id,title,target,kind,worker,status,required_evidence,completion_criteria,meta "
+            "FROM missions ORDER BY updated_at DESC"
+        )
+
+    def transition_mission(self, mission_id: str, status: str, *, reason: str = "",
+                           completion_evidence: Iterable[str] = ()) -> bool:
+        if status not in MISSION_STATES:
+            raise ValueError(f"Unsupported mission status: {status}")
+        mission = self.mission(mission_id)
+        if not mission:
+            return False
+        meta = dict(mission.get("meta") or {})
+        if reason:
+            meta["status_reason"] = reason
+        evidence = [str(item) for item in completion_evidence if str(item).strip()]
+        if evidence:
+            meta["completion_evidence"] = evidence
+        cursor = self.conn.execute(
+            "UPDATE missions SET status=?, updated_at=?, meta=? WHERE mission_id=?",
+            (status, _now(), _json(meta), mission_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def set_mission_worker(self, mission_id: str, worker: str) -> bool:
+        cursor = self.conn.execute(
+            "UPDATE missions SET worker=?, updated_at=? WHERE mission_id=?",
+            (worker, _now(), mission_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def transition_hypothesis(self, hypothesis_id: str, state: str) -> bool:
+        if state not in LIFECYCLE_STATES:
+            raise ValueError(f"Unsupported hypothesis state: {state}")
+        cursor = self.conn.execute(
+            "UPDATE hypotheses SET state=?, updated_at=? WHERE hypothesis_id=?",
+            (state, _now(), hypothesis_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def budget_summary(self, run_id: str) -> dict[str, int]:
         row = self.conn.execute("SELECT COUNT(*), COALESCE(SUM(ok),0) FROM actions WHERE run_id=?", (run_id,)).fetchone()
         return {"actions": int(row[0] or 0), "successful_actions": int(row[1] or 0)}
@@ -221,18 +328,18 @@ class EngagementStateStore:
         paths["tool-manifest.json"] = manifest
         return paths
 
-    def _rows(self, query: str) -> list[dict[str, Any]]:
-        cursor = self.conn.execute(query)
+    def _rows(self, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        cursor = self.conn.execute(query, params)
         names = [item[0] for item in cursor.description]
         rows = []
         for values in cursor.fetchall():
             row = dict(zip(names, values))
-            for key in ("meta", "required_evidence"):
+            for key in ("meta", "required_evidence", "completion_criteria"):
                 if key in row:
                     try:
-                        row[key] = json.loads(row[key] or ("[]" if key == "required_evidence" else "{}"))
+                        row[key] = json.loads(row[key] or ("[]" if key in {"required_evidence", "completion_criteria"} else "{}"))
                     except json.JSONDecodeError:
-                        row[key] = [] if key == "required_evidence" else {}
+                        row[key] = [] if key in {"required_evidence", "completion_criteria"} else {}
             if "ok" in row:
                 row["ok"] = bool(row["ok"])
             rows.append(row)

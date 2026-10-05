@@ -548,5 +548,5 @@ def skill_catalog_prompt(include_research: bool = True) -> str:
 
 
 def get_skill(name: str) -> AgentSkill | None:
-    normalized = name.strip().lower().replace("-", "_")
+    normalized = name.strip().lower().replace("-", "_").replace(" ", "_")
     return BUILTIN_SKILLS.get(normalized)

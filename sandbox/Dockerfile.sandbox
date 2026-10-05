@@ -34,8 +34,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 \
     libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 \
     libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release xdg-utils \
-    libjpeg-turbo8 libpng16-16 libwebp7 libwebpdemux2 libwebpmux3 \
-    libavcodec58 libavformat58 libavutil56 libswresample3 \
     libxshmfence1 && rm -rf /var/lib/apt/lists/*
 RUN apt-get update \
     && for pkg in gobuster dirsearch nikto sqlmap wafw00f xsstrike; do \

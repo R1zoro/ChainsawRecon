@@ -113,6 +113,18 @@ bounty_agent/
 ├── mapping.py               # Target mapping coordinator and seed planner
 ├── prompts.py               # System prompts, recon plans, and instruction builders
 ├── llm.py                   # OpenAI-compatible LLM client wrapper (Ollama/vLLM)
+├── workers.py               # Specialist worker contracts + hard-block exec gate
+├── surface_router.py        # Fingerprinting router: surface → specialist lane ladder
+├── nuclei.py                # Typed nuclei action: scope check, JSONL parse, evidence
+├── session_manager.py       # Session lane lifecycle (pending→active→stale→expired)
+├── auth_pipeline.py         # LoginSpec loading, secret-free payloads, cookie merging
+├── login_worker.py          # Playwright Firefox login worker script (deterministic)
+├── journeys.py              # Browser journey store: steps, request lineage, mutations
+├── burp_mcp/                # Verified PortSwigger MCP adapter
+│   ├── client.py            #   JSON-RPC client, entry resolution by synthesized id
+│   ├── parsing.py           #   Real wire format: \n\n-joined, truncation-tolerant
+│   ├── schema.py            #   Tool catalog + capability discovery
+│   └── actions.py           #   Semantic actions (search/get/replay/compare/repeater)
 └── report.md                # Automated Markdown catalog and report generators
 ```
 
@@ -278,6 +290,49 @@ Two milestone layers harden the reasoning loop so the model stops producing garb
 | Recon-aware auto-selection | `agent.py` | `_build_auto_skill_prompt()` maps discovered surfaces → skill packs and injects them into `_prepare_llm_messages`; no `use_skill` call needed. |
 
 **Tavily key:** `TAVILY_API_KEY` lives in the root `.env` (loaded by `cli.py` via `load_env_file`). Without it, Tavily returns a clear "unavailable" message and the agent falls back to the keyless OSV API.
+
+---
+
+## 7c. Harness Upgrades (2026-09 Series)
+
+Post-M3 upgrades that move ChainsawRecon from agent loop toward a full bug-hunting **harness**. Full research/audit record: `tests/researched_improvements/updates-implemented.md`.
+
+### 7c.1 Verified Burp MCP Adapter (`burp_mcp/`)
+
+The adapter is verified against the live PortSwigger `mcp-server` extension source:
+
+* **Real wire format:** proxy history arrives as `\n\n`-joined serialized items (`{request, response, notes}`, **no id**), each truncated at 5000 chars with a `... (truncated)` marker. `parsing._split_history_blob` tracks JSON brace depth across blank lines and treats the truncation marker as an item terminator; unparseable items survive as raw text.
+* **Synthesized ids:** entries get `id = "<page-index>-<sha1(request-line)[:8]>"`, prefixed into summaries as `[id]`. `client._find_entry` resolves full ids, bare page indexes, or hash suffixes — making search → get → replay → compare → Repeater workflows functional against the real extension.
+* **Catalog:** tool names match the extension's `toLowerSnakeCase()` registrations; default endpoint `http://127.0.0.1:9876`.
+
+### 7c.2 Session Lanes & Playwright Auth Pipeline
+
+```mermaid
+flowchart LR
+    Spec["auth JSON 'login' block\n(env-var names, selectors, verify_url)"] --> Tools
+    Tools["tools.py auth actions\nperform_login / verify_session / renew_session / session_status"] --> Worker["login_worker.py\nPlaywright Firefox (sandbox)"]
+    Worker -->|cookies + storage| SM["SessionManager lane\n(secret_policy=never-inline)"]
+    Worker -->|cookies| WM["WorldModel sessions table\n(cookies live here, never in prompts)"]
+    Tools --> JNY["Journey: navigate → submit_credentials → verify_session"]
+```
+
+* **Secret hygiene:** the spec names *environment variables* (`CHAINSAW_AUTH_USERNAME`/`CHAINSAW_AUTH_PASSWORD` by default). Secret values never enter spec files, argv, traces, prompts, or artifacts.
+* **Lane partitioning:** sessions are keyed by the stable engagement id `stable_id("engagement", db_parent, program_name)` — shared across runs of the same program. `_find_session` resolves alias collisions by preferring active/verified, then freshest verification.
+* **Renewal:** `renew_session` marks the lane stale, re-runs the login, and merges operator-maintained cookies (`maintain_cookies`, e.g. `remember_me`) that the fresh capture did not re-issue.
+* **Verify-only lane:** operator-supplied cookie groups are injected and checked against `verify_url` without performing a login.
+* **Subdomain coverage:** a lane covers only the cookie domains the target set; sessionless in-scope subdomains stay on the unauthenticated mapping lane.
+
+### 7c.3 Worker Hard-Block Gate, Nuclei Action, Surface Router
+
+| Module | Responsibility |
+|---|---|
+| `workers.py` | Worker action contracts enforced at dispatch: an action outside the active worker's `allowed_actions` is **hard-blocked** with an error naming the allowed set. `WORKER_META_ACTIONS` (finish, record_*, auth actions, …) always pass. |
+| `nuclei.py` | Typed `nuclei` action: scope-validated, JSONL output parsing, severity filtering, structured evidence records. |
+| `surface_router.py` | Fingerprints a surface and returns an ordered specialist-lane **fallback ladder** with burned-rung memory (a failed lane is not retried on that surface). |
+
+### 7c.4 World-Model Asset Staleness
+
+Enterprise ASM pattern (first_seen/last_seen): `services`, `world_routes`, and `technologies` carry a `last_seen` column (idempotent migration in `recon_db.ensure_world_freshness_columns`), bumped on every upsert. `WorldModel.stale_assets(older_than_days=30)` reports assets not re-observed in the window — pre-migration NULL rows count as stale so legacy map data is reconfirmed rather than silently trusted — and `architecture_summary()` exposes the result as `stale_assets`.
 
 ---
 

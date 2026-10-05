@@ -73,6 +73,27 @@ class AgentSettings:
     https_proxy: str = ""
     no_proxy: str = ""
     burp_proxy: str = ""  # M5.1: e.g. http://host.docker.internal:8080
+    burp_api_url: str = ""  # M6: e.g. http://host.docker.internal:1337
+    burp_api_key: str = ""  # M6: Burp REST API key
+    # ── Stage 1: Burp MCP ──────────────────────────────────────────────
+    burp_mcp_url: str = ""               # host-side MCP endpoint; extension default is http://127.0.0.1:9876
+    burp_mcp_transport: str = "sse"      # sse | streamable-http | stdio
+    burp_mcp_token: str = ""             # optional bearer token for MCP
+    burp_project_alias: str = ""         # Burp project alias for exports
+    burp_session_alias: str = ""         # Burp session-handling rule alias
+    # ── Stage 2: First-class sessions and auth lanes ───────────────────
+    auth_mode: str = "none"              # none | recorded-login | operator-handover | credentials
+    auth_session_alias: str = ""         # session alias for recorded-login / handover
+    auth_wait_timeout: int = 300         # seconds to wait before deferring session work
+    auth_login_url: str = ""             # login URL for credentials mode
+    auth_credentials_ref: str = ""       # local secret reference (not the secret itself)
+    # ── Stage 7: Context budget ─────────────────────────────────────────
+    ollama_num_ctx: int = 0              # 0 = auto (provider-aware default)
+    llm_max_output_tokens: int = 4096    # conservative default max_tokens
+    llm_input_budget_tokens: int = 0     # 0 = auto-derived from num_ctx - output - margin
+    # ── Keep-alive probe for local-Colab/Ollama routes ───────────────────
+    keep_alive: bool = False             # enable optional idle-only Ollama route health probe
+    keep_alive_probe_seconds: int = 180 # idle seconds before probe is attempted
 
 
 def env_or_default(name: str, default: str) -> str:
