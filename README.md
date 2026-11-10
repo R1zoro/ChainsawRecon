@@ -1,328 +1,326 @@
-# ChainsawRecon
+<div align="center">
 
-**ChainsawRecon** is an autonomous, scope-aware AI penetration testing and security assessment agent. It orchestrates security tools inside an isolated Docker sandbox, builds a stateful world model of web applications and APIs, and executes hypothesis-driven experiments with concrete evidence validation.
+# ⛓️🪚 ChainsawRecon
 
-Designed for authorized penetration testing, security audits, and defensive surface assessment, ChainsawRecon bridges high-level AI reasoning with deterministic, auditable execution.
+**A stateful, evidence-first pentesting harness for authorized security research.**
 
----
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-4B5563)](#)
+[![Sandbox](https://img.shields.io/badge/sandbox-native%20OS%20%C2%B7%20Docker%20optional-0F766E)](#execution-and-sandbox)
+[![Status](https://img.shields.io/badge/status-v2%20preview-7C3AED)](#project-status)
+[![GitHub stars](https://img.shields.io/github/stars/R1zoro/ChainsawRecon?style=social)](https://github.com/R1zoro/ChainsawRecon)
 
-## 🌟 Key Features
+**If ChainsawRecon saves you time, please consider leaving a star — it helps other researchers find it.**
 
-* **Stateful World Model & Engagement Memory:** Maintains persistent relational state (organizations, applications, services, routes, endpoints, auth contexts, technologies) across test runs rather than treating each target in isolation.
-* **Hypothesis Lifecycle & Objective-Driven Work:** Moves beyond tool-centric output. Replaces raw scanner outputs with structured hypothesis tracking (`observed` $\rightarrow$ `suspected` $\rightarrow$ `evidence_required` $\rightarrow$ `experiment_planned` $\rightarrow$ `reproduced` $\rightarrow$ `validated`/`rejected`).
-* **Isolated Sandbox Execution:** All command execution occurs inside a locked-down Docker container. The LLM never has host-shell access or direct system access.
-* **Scope Guard & Rate Control:** Strict pre-execution scope verification for every single outbound tool request, with configurable rate limits and request spacing.
-* **Multi-Modal Evidence Capture:** Imports and normalizes HTTP requests/responses, HAR browser captures, technology playbooks, and static source-code analysis into canonical, replayable evidence items.
-* **Independent Validation Engine:** Findings follow an evidence ladder and must pass independent replay and differential control testing before classification.
-* **Deterministic Hunt Engine (M2):** Tool-first policy steers the model to dedicated security tools over generic Python loops; endpoint-exhaustion tracking prunes dead endpoints; auth-gate awareness prevents login walls from being reported as findings; a 7-Question Gate validates every finding candidate.
-* **Knowledge & Tradecraft (M3):** Per-vuln-class skill packs (IDOR, SSRF, XSS, SQLi, upload, OAuth, race, GraphQL authz) auto-load based on discovered surfaces; a report-writing skill produces submission-grade write-ups; deterministic OSV/Tavily research probes replace HTML scraping.
-* **Playwright Auth Pipeline:** Deterministic Firefox login worker for simple id+password apps. Credentials are read from environment variables named in the engagement auth JSON — never written to spec files, prompts, traces, or artifacts. Supports cookie capture, operator-maintained cookie renewal, and verify-only session checks. Sessionless in-scope subdomains stay on the unauthenticated mapping lane.
-* **Verified Burp MCP Adapter:** Tool catalog, wire format, and pagination verified against the live PortSwigger `mcp-server` extension (default `http://127.0.0.1:9876`). History entries get stable synthesized ids (`index-hash`) so the model can search → retrieve → replay → compare → open Repeater tabs against real captures.
-* **Deterministic Worker Gate, Nuclei Action & Surface Router:** Worker action contracts are hard-blocked at dispatch (not just prompt guidance); nuclei runs as a typed, scope-checked action with JSONL evidence parsing; a fingerprinting surface router picks the specialist lane with a burned-rung fallback ladder.
-* **ASM-Style Asset Staleness:** World-model assets (services, routes, technologies) carry `last_seen`; anything not re-observed within 30 days is flagged as stale in the architecture summary instead of being trusted forever.
-* **Human-Readable Catalogs & Machine-Readable State:** Generates both SQLite/JSON knowledge graphs for AI reasoning and clean Markdown/TSV catalogs for manual testing and reporting.
+</div>
 
 ---
 
-## 🛠️ Architecture & How It Works
+ChainsawRecon is a desktop-style security workbench and autonomous execution engine. It is built
+for one job: turn authorized recon and testing into **durable, reproducible evidence** instead of a
+pile of scanner output and chat logs.
 
-ChainsawRecon operates across four structured layers:
+It is not a chatbot with a shell. It is a harness with a journal, an application model, typed
+tasks, scoped execution, and an evidence lifecycle.
 
-1. **AI Orchestration & Reasoning Layer:** The Coordinator model receives target scope, current world model state, coverage gaps, and active security objectives. It selects structured JSON actions rather than executing unverified shell commands.
-2. **Worker & Strategy Layer:** Bounded execution flows handle specialized tasks (Target Mapping, Technology Analysis, API/GraphQL Surface Probing, Auth Context Evaluation, and Result Validation).
-3. **Tool & Sandbox Execution Layer:** Executes approved tools (`httpx`, `katana`, `nuclei`, `ffuf`, `dalfox`, `sqlmap`, `inql`, `clairvoyance`, etc.) inside a sandboxed environment managed by a strict `ScopeGuard`.
-4. **Data & Knowledge Memory Layer:** Dual-database design featuring a disposable **Run Store** (`recon.db`) for transient trial data and a persistent **Engagement Store** (`knowledge.db`) for verified cross-run intelligence and target topology.
-
----
-
-## 📋 Prerequisites
-
-* **OS:** Linux, macOS, or Windows (PowerShell/WSL2)
-* **Python:** 3.10 or higher
-* **Docker:** Docker Desktop or Docker Engine running locally
-* **Local LLM Server (Optional / Recommended):** Ollama, vLLM, LM Studio, or any OpenAI-compatible API endpoint.
-* **Git**
+> **Authorized testing only.** Use ChainsawRecon only against systems you own or have explicit
+> written permission to test. You are responsible for staying inside the program scope and rules.
 
 ---
 
-## 🚀 Quick Start & Setup Guide
+## Why ChainsawRecon
 
-### 1. Clone the Repository & Setup Python Environment
+- **Journal first.** Every session is an append-only event log. Resume, audit, replay, and UI
+  streaming come from the same source of truth.
+- **Application model, not a URL queue.** Applications, services, routes, inputs, identities,
+  entities, technologies, and flows are modeled together with confidence and freshness.
+- **Deterministic control.** Models propose; deterministic code validates scope, leases tasks,
+  records receipts, enforces budgets, and advances state.
+- **Evidence-backed findings.** A 200 response is not a finding. Findings require a security
+  question, a hypothesis, exact request/response artifacts, reproduction, and an independent gate.
+- **Multi-model roles, one or many providers.** Use one model for everything, or assign different
+  providers to the orchestrator, recon analyst, tool operator, validator, and reporter.
+- **Native execution.** OS-level confinement on Windows, Linux, and macOS. Docker is optional, not
+  a requirement.
+- **Built-in HTTP workbench.** Capture, search, replay, mutate, diff, and promote traffic to
+  evidence without requiring Burp. Burp MCP remains an optional integration.
+- **Auth profiles as a first-class dimension.** Manual browser handover, saved sessions, credentials,
+  SSO/OAuth, and multiple identities with side-by-side authorization testing.
+
+---
+
+## Project status
+
+**v2 is under active development.** The repository currently contains the legacy agent CLI and
+domain modules while the journal/application-model runtime, native sandbox, workbench, and desktop
+UI are being rebuilt. The architecture below is the target; features marked **planned** are not in
+the current tree yet.
+
+| Area | Current | Target |
+|---|---|---|
+| CLI agent loop | ✅ legacy | replaced by deterministic controller |
+| Scope guard / sandboxed tools | ✅ legacy | native OS sandbox + optional container |
+| Journal / application model | 🟡 in progress | append-only journal + revisioned graph |
+| Multi-model role routing | 🟡 in progress | per-role provider/model selection |
+| Native HTTP workbench | ⏳ planned | capture/replay/diff/evidence |
+| Auth profiles / embedded auth browser | ⏳ planned | handover, sessions, multi-identity |
+| Desktop UI (Tauri) | ⏳ planned | project/session workspace |
+
+### v2 core already in the tree
+
+- `chainsaw/roles.py` — arbitrary per-role model routing, single-provider `Solo`, fallbacks,
+  capability validation.
+- `chainsaw/context.py` — role visibility, token budgets, deterministic compression ladder,
+  overflow errors.
+- `chainsaw/journal.py` — append-only session journal with hash chain, verification, redaction.
+- `chainsaw/projection.py` — rebuildable SQLite projection for tasks, approvals, evidence, findings,
+  and context.
+- `chainsaw/runtime.py` — deterministic task lifecycle, approvals, observations, evidence, findings,
+  and context events (the write seam for the controller).
+- `chainsaw/appmodel.py` — project-wide revisioned application model (apps, services, routes,
+  inputs, identities, technologies, findings, edges, notes).
+- `chainsaw/workspace.py` — global home, project layout, session layout, session creation.
+- `chainsaw/toolpacks.py` — pinned manifests, checksum-verified install plans, tool-pack status.
+- `chainsaw/api/` — local FastAPI/WebSocket API for projects, sessions, journal, providers, and
+  runtime placeholders.
+- `ui/` — Ready State UI; M0 review is in progress.
+
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart TD
+    UI["Desktop UI<br/>Projects · Sessions · Journal · Workbench"] --> API["Local API + WebSocket"]
+    API --> CTRL["Deterministic Controller<br/>scope · leases · budgets · approvals"]
+    CTRL --> ROLES["Model Roles<br/>orchestrator · recon · operator · validator · reporter"]
+    CTRL --> JOURNAL["Journal<br/>append-only events"]
+    CTRL --> APP["Application Model<br/>apps · services · routes · inputs · identities"]
+    CTRL --> TOOLS["Tool / Workbench Layer<br/>native HTTP · parsers · scanners"]
+    TOOLS --> SANDBOX["Execution Boundary<br/>native OS sandbox · Docker optional"]
+    JOURNAL --> EVIDENCE["Evidence + Findings<br/>receipts · reproduction · gate"]
+    APP --> UI
+    EVIDENCE --> UI
+```
+
+### The four rules
+
+1. **Models propose, never commit.** A model can choose a task or return a structured result; the
+   controller validates it and writes the journal event.
+2. **Every action has a receipt.** Command, environment, output hash, artifact, scope decision,
+   approval, and timestamps.
+3. **Every observation is grounded.** It must cite an exact slice of a receipt. Paraphrases are not
+   evidence.
+4. **Every finding is reproducible.** Baseline, candidate, control, and a second review before it can
+   be called validated.
+
+---
+
+## Model roles
+
+Use one provider or many. Roles are contracts, not separate agents.
+
+| Role | Responsibility | Typical model |
+|---|---|---|
+| **Orchestrator** | Choose the next task, propose one task, or finish. | Strong reasoning / high context |
+| **Recon analyst** | Classify pre-parsed surfaces, triage JS/tool output, choose one probe from a menu. | Small local model / cheap API |
+| **Tool operator** | Execute exactly one leased task using allowed tools. | Local 7B / cheap API |
+| **Validator** | Independently review evidence and the 7-Question Gate. | Different provider when possible |
+| **Reporter** | Turn validated findings into a report. | Strong writing model |
+
+If you configure only one provider, every role uses it. There is no “minimum number of models”
+requirement. Per-role routing, fallback chains, budgets, and capability checks live in the UI and
+config.
+
+---
+
+## Execution and sandbox
+
+The v2 execution boundary is **native-first**:
+
+- **Linux:** `bwrap` + Landlock (read-only host root, private PID namespace, workspace-write).
+- **macOS:** Seatbelt (`sandbox-exec`).
+- **Windows:** restricted token + ACL write grants + Low integrity + Job Objects.
+- **Docker/Podman:** optional for untrusted tools, reproducibility, or CI.
+
+The legacy tree currently uses a local/Docker runner; the native sandbox is part of the v2 rebuild.
+The sandbox confines file effects, not network or reads. Network access is governed by the scope
+guard and an egress proxy; destructive or high-volume actions require approval. If no sandbox
+backend is available, confined execution fails closed rather than running unconfined.
+
+Tool binaries are managed as **tool packs** in a global cache, not baked into one giant image. The
+harness owns the catalog, pinned version, checksum, install/update/health, and parser. The default
+Lite installer downloads the recommended `web-core` pack on first run; an Offline installer bundles
+it. This keeps the desktop build small while giving you the tools you need for real recon.
+
+---
+
+## Quick start (current legacy CLI)
+
+> The commands below run the current tree. The v2 desktop UI and journal runtime are being built.
+
+**Requirements:** Python 3.12+, Git, and an OpenAI-compatible model endpoint (Ollama, vLLM, LM
+Studio, or a hosted API).
 
 ```bash
-git clone https://github.com/your-org/ChainsawRecon.git
+git clone https://github.com/R1zoro/ChainsawRecon.git
 cd ChainsawRecon
-
-# Create and activate virtual environment
-python -m venv .venv
-
-# On Linux/macOS:
-source .venv/bin/activate
-# On Windows (PowerShell):
-# .venv\Scripts\Activate.ps1
-
-# Install dependencies in editable mode
-pip install -e .
-```
-
-### 2. Build the Docker Execution Sandbox
-
-The security tools run inside a dedicated Docker container (`testing-sandbox`). Build the image locally:
-
-```bash
-docker build --pull --no-cache -f sandbox/Dockerfile.sandbox -t testing-sandbox:latest .
-```
-
-> **Note:** The initial build installs security utilities, Go binaries, and web runtime tools (e.g., `httpx`, `katana`, `nuclei`, `ffuf`, `dalfox`, `sqlmap`, `inql`). This may take a few minutes.
-
-Verify sandbox tool installation:
-
-```bash
-docker run --rm bounty-sandbox:latest bash -lc "command -v httpx nuclei katana inql feroxbuster dalfox"
-```
-
-### 3. Configure API Keys (`.env`)
-
-Copy the template and add your keys. The CLI loads `.env` from the project root at startup:
-
-```bash
+uv sync
 cp .env.example .env
 ```
 
-Add the following to `.env`:
-
-```bash
-# LLM provider (Ollama or Groq)
-OLLAMA_API_KEY=ollama
-# or GROQ_API_KEY=gsk_your_key_here
-
-# Tavily search (optional, for M3.4 research skill)
-# Get a free key at https://tavily.com
-TAVILY_API_KEY=tvly-your-key-here
-```
-
-> **Tavily key location:** The `TAVILY_API_KEY` goes in the root `.env` file. The `research` tool action reads it via `os.environ.get("TAVILY_API_KEY")` at runtime. Without it, Tavily search returns a clear "unavailable" message and the agent falls back to the keyless OSV API.
-
-### 4. Start Your Local LLM Provider (e.g., Ollama)
-
-Ensure your LLM provider is running locally and serving an OpenAI-compatible API endpoint:
-
-```bash
-# Example with Ollama:
-ollama serve
-# Pull your preferred model (e.g., Qwen2.5-Coder, Mistral, Llama-3, etc.)
-ollama pull qwen2.5-coder:14b
-```
-
----
-
-## 📁 Setting Up an Engagement Workspace
-
-ChainsawRecon organizes assessment data into engagement directories.
-
-### 1. Initialize an Engagement Directory
+Create an engagement from the template:
 
 ```powershell
-# Copy template directory
-Copy-Item -Recurse engagements\_template engagements\corporate-audit
+Copy-Item -Recurse engagements\_template engagements\my-engagement
 ```
 
-### 2. Configure Scope and Rules
+Edit `engagements/my-engagement/program/`:
 
-Populate the program definition files inside `engagements/corporate-audit/program/`:
+- `scope.json` — domains, URLs, exclusions, rate limits
+- `in-scope.txt` / `out-of-scope.txt`
+- `rules.md` — program rules
+- `prompt.md` — operator goals
+- `auth.json` — optional auth profiles / login spec
+- `priority-targets.txt` — optional deep-test list
 
-* `scope.json`: Machine-readable target domains, CIDRs, and rate limits.
-* `in-scope.txt`: List of authorized target URLs and hostnames.
-* `out-of-scope.txt`: Excluded IP addresses or domains.
-* `rules.md`: Assessment rules, testing windows, and operational constraints.
-* `prompt.md`: High-level security goals or application context for the agent.
-* `secrets.env`: *(Optional)* Auth tokens or test credentials. Keep git-ignored.
-* `priority-targets.txt`: *(Optional)* High-value routes/APIs to assess first.
-
----
-
-## 💻 Usage & CLI Reference
-
-Run ChainsawRecon against an initialized engagement:
+Run the legacy CLI:
 
 ```bash
 python -m bounty_agent.cli \
-  --engagement engagements/corporate-audit \
-  --mode attack \
+  --engagement engagements/my-engagement \
+  --mode auto \
   --provider ollama \
-  --model ollama/qwen3.5:4b \
+  --model ollama/qwen3:8b \
   --llm-base-url http://localhost:11434/v1 \
-  --llm-api-key ollama \
-  --runner docker \
-  --docker-image testing-sandbox \
+  --runner local \
   --execute \
-  --max-steps 1000 \
-  --max-commands-per-minute 40
+  --max-steps 200
 ```
 
-### Burp MCP request workflow
+Use `--runner docker` only if you want the optional container boundary:
 
-Burp MCP is the preferred Burp integration. The agent searches requests
-captured by Burp, retrieves full request/response bodies only when needed,
-creates Repeater experiments from captured templates, applies narrow patches,
-and stores the complete result as an engagement artifact. It does not require
-the model to reconstruct cookies, CSRF values, or browser headers manually.
-
-Start Burp Suite with the MCP extension enabled and use the endpoint and
-transport shown by that extension (default `http://127.0.0.1:9876`). The
-endpoint is host-side; it normally must not be placed inside the Docker
-sandbox.
-
-PowerShell example:
-
-```powershell
-python -m bounty_agent.cli `
-  --engagement engagements\Pixabay `
-  --mode attack `
-  --provider ollama `
-  --model ollama/qwen3.5:4b `
-  --llm-base-url http://localhost:11434/v1 `
-  --llm-api-key ollama `
-  --runner docker `
-  --docker-image bounty-sandbox `
-  --execute `
-  --auth-file engagements\Pixabay\program\auth.json `
-  --burp-mcp-url http://127.0.0.1:9876 `
-  --burp-mcp-transport sse `
-  --max-steps 600 `
-  --max-commands-per-minute 50
+```bash
+docker build --pull -f sandbox/Dockerfile.sandbox -t chainsaw-sandbox:latest .
+python -m bounty_agent.cli ... --runner docker --docker-image chainsaw-sandbox:latest --execute
 ```
 
-Use `--burp-mcp-transport streamable-http` when the extension exposes an MCP
-streamable HTTP endpoint instead of SSE. Add `--burp-mcp-token` only when the
-extension is configured to require a bearer token. `--burp-api-url` and
-`--burp-api-key` remain deprecated compatibility flags for the older REST
-path; they are not needed for MCP.
+Inspect the output under `engagements/my-engagement/agent/`.
 
-At run start, ChainsawRecon performs a non-fatal MCP health and capability
-preflight. The result is written to the trace. If Burp is closed or the
-extension exposes insufficient capabilities, the run continues with the
-remaining mapping/CLI tools and the MCP actions return an actionable error.
-The exact extension tool names are discovered at runtime through `tools/list`
-and mapped to the agent's stable semantic actions.
+### v2 API preview
 
-### Authentication lanes
+The new core/API can be started independently:
 
-Each run registers an engagement-level session lane in
-`knowledge/sessions.db`. The database stores session identity, source, role,
-status, expiry/validation metadata, and Burp rule references; it does not store
-raw cookies or bearer values. Existing `--auth-file`/`--auth-context` inputs
-remain supported.
-
-Choose the acquisition mode explicitly when needed:
-
-```powershell
---auth-mode operator-handover `
---auth-session-alias PixabayLogin `
---auth-wait-timeout 300
+```bash
+uv run chainsaw-serve
+# http://127.0.0.1:8765/api/v1/health
 ```
 
-Use `recorded-login` for a Burp session-handling rule or recorded flow,
-`operator-handover` when the operator authenticates in the visible browser,
-`credentials` only with a configured local secret reference, and `none` for
-unauthenticated mapping. The model receives only a compact lane status and
-retrieves full cookies or requests through the explicitly selected Burp/auth
-action when the testing hypothesis requires them.
-
-### Playwright login pipeline (simple id+password apps)
-
-For basic user/pass web apps, the agent can acquire and maintain the session
-itself. Add a top-level `"login"` block to the engagement auth JSON:
-
-```json
-{
-  "login": {
-    "url": "https://app.example.com/login",
-    "username_env": "CHAINSAW_AUTH_USERNAME",
-    "password_env": "CHAINSAW_AUTH_PASSWORD",
-    "success_url_contains": "/dashboard",
-    "verify_url": "https://app.example.com/account",
-    "verify_indicator": "Sign out",
-    "session_alias": "main-user",
-    "role": "user",
-    "maintain_cookies": ["remember_me"]
-  }
-}
-```
-
-The block names **environment variables**, never secret values — put the
-actual credentials in `.env` / `secrets.env`. The agent gains four actions:
-
-| Action | Behaviour |
-|---|---|
-| `session_status` | Lists session lanes for the engagement and their state. |
-| `perform_login` | Runs a deterministic Playwright Firefox login in the sandbox, captures cookies/storage, registers an `active` lane. |
-| `verify_session` | Cookie-injection check of the stored cookies against `verify_url`; marks the lane `active`/`expired`. |
-| `renew_session` | Marks the lane stale and re-runs the login, preserving `maintain_cookies` entries the fresh login did not re-issue. |
-
-Optional `username_selector` / `password_selector` / `submit_selector` /
-`success_selector` keys override the built-in autodetect fallbacks. A lane
-only covers the cookie domains the target sets; in-scope subdomains without a
-session remain on the unauthenticated mapping lane (httpx/katana/nuclei).
-
-### Modes of Operation
-
-| Mode | Description | Primary Focus |
-|---|---|---|
-| `mapping` | Asset discovery & target mapping. | Discovers hosts, routes, technologies, JS bundles, and endpoints. No intrusive testing. |
-| `recon` | Active fingerprinting & surface analysis. | Low-rate surface probing, header inspection, and framework classification. |
-| `attack` | Hypothesis generation & evidence-led testing. | Executes safe, structured security experiments based on discovered surfaces. |
-| `auto` | Self-directed phase transition. | Automatically moves from mapping $\rightarrow$ recon $\rightarrow$ attack based on state coverage. |
-| `assistant` | Operator-assisted interactive mode. | Allows explicit external search queries and operator guidance. |
-
-### Key CLI Flags
-
-* `--engagement <path>`: *(Required)* Path to the target engagement folder.
-* `--mode <mapping|recon|attack|auto|assistant>`: Execution mode (default: `auto`).
-* `--execute`: Enables live tool execution inside the sandbox container.
-* `--dry-run`: Runs the planner in simulation mode without executing external commands.
-* `--provider <ollama|groq|gemini|openrouter|nvidia>`: LLM provider backend type. NVIDIA uses the OpenAI-compatible hosted NIM endpoint at `https://integrate.api.nvidia.com/v1`.
-* `--model <model_name>`: Model identifier specified in your provider backend.
-* `--llm-base-url <url>`: API endpoint URL (e.g., `http://localhost:11434/v1`).
-* `--max-steps <int>`: Global step/action budget for the session.
-* `--max-commands-per-minute <int>`: Enforces rate throttling for outbound commands.
-* `--har-file <path.har>`: *(Optional)* Import network traffic captures into the engagement evidence model.
-* `--source-dir <path>`: *(Optional)* Import static source code directory for route and sink analysis.
+The API currently provides project/session creation, the append-only journal, run controls, provider
+registration, a rebuildable projection for tasks/approvals/evidence/findings/context, and a
+project-wide application model (apps, services, routes, inputs, identities, technologies, edges).
+The runtime that produces those events is the next milestone. It is local-only and intended for the
+desktop UI.
 
 ---
 
-## 🔒 Safety Controls & Execution Boundary
+## Project and session layout
 
-1. **Docker Isolation:** Tools run inside a container with dropped capabilities, non-root execution, and CPU/RAM limits.
-2. **ScopeGuard Enforcement:** Every domain or IP target is verified against `scope.json` before any action executes.
-3. **No Unsanitised Shell Access:** The LLM issues strict JSON-formatted actions (`run_tool`, `write_file`, `http_request`, `finish`), which are parsed and validated deterministically before execution.
-4. **Evidence Ladder:** A raw tool hit never creates a finding directly. It generates an `observation`, which creates a `hypothesis`, requiring an `experiment`, raw `evidence`, and independent `reproduction`.
-5. **WAF & Failure Awareness:** Cloudflare or rate-limiting responses trigger automatic back-off, evidence preservation, and task deferral rather than noisy brute-force attempts.
-
----
-
-## 📊 Artifacts & Outputs
-
-After execution, all session records are saved under `engagements/<name>/agent/`:
+ChainsawRecon v2 uses a project/session model:
 
 ```text
-engagements/<name>/agent/
-├── knowledge.db              # Curated cross-run persistent relational database
-├── engagement-report.md      # Comprehensive executive & technical report
-├── catalogs/                 # Operational human-readable catalogs
-│   ├── architecture.md       # Target topology, services, and tech stack map
-│   ├── routes.json           # Discovered application endpoints and HTTP methods
-│   ├── technologies.json     # Detected software stacks & component playbooks
-│   └── world-model.json      # Exported machine-readable knowledge graph
-└── runs/<timestamp>/         # Execution artifacts per session
-    ├── trace.jsonl           # Complete audit log of every LLM decision & command
-    ├── report.md             # Per-run technical summary
-    ├── session.state.json    # Run status, metrics, and step accounting
-    └── workspace/            # Raw tool outputs, evidence items, and HTTP logs
+~/.chainsawrecon/                 # global: providers, credentials, tool packs, index
+  config.json
+  credentials.json
+  providers/
+  tools/
+  index.db
+
+<your-project>/                   # any folder you choose
+  .chainsaw/
+    project.json
+    scope/
+    knowledge.db                  # application model + validated findings
+    catalogs/
+    reports/
+    sessions/
+      <session-id>/
+        session.json
+        journal.jsonl             # append-only source of truth
+        state.db                  # rebuildable projection
+        artifacts/
+        workspace/
 ```
+
+- **Global:** identity, provider config, browser profiles, tool packs, UI settings.
+- **Project/engagement:** scope, rules, application model, sitemap, validated findings, reports.
+- **Session:** journal, task board, budgets, raw tool outputs, candidate evidence.
 
 ---
 
-## 📜 License & Compliance
+## Auth profiles
 
-ChainsawRecon is designed exclusively for authorized security testing, defensive posture assessment, and educational research. Users are responsible for obtaining explicit authorization from asset owners before initiating any security assessment.
+The v2 auth model treats authentication as part of execution, not a prompt afterthought:
+
+- **No auth**, **credentials reference**, **saved session/cookie**, **manual browser handover**,
+  **recorded login**, **OAuth/SSO**, **API token**, or **custom headers**.
+- An **embedded auth browser** lets the operator complete login, CAPTCHA, and 2FA in a real browser
+  window; the harness captures the resulting session state and reuses it for the mapped domains.
+- Multiple identities can be attached to the same application for side-by-side authorization
+  testing.
+- Sessions are scoped to their cookie domains, verified, kept alive, and renewed. Secrets never
+  enter prompts, journals, or reports.
+- Each profile chooses a simple persistence mode: **Don’t save** (ephemeral), **Save session only**
+  (default), or **Save credentials**. The account list is ordinary project metadata; passwords,
+  cookies, and tokens are protected by the OS keychain, with an encrypted-file fallback.
+- CAPTCHA/2FA is operator-in-the-loop. The harness does not automate CAPTCHA solving or evade
+  account controls.
+
+---
+
+## Safety
+
+1. Scope is checked at the controller, tool, and proxy layers.
+2. Commands run confined; Docker is optional.
+3. Every action has a budget, rate limit, and audit event.
+4. Risky or state-changing actions require approval.
+5. Findings require exact evidence and independent validation.
+6. Secrets are redacted before they reach the journal, UI, or report.
+7. The harness never treats scanner output as proof.
+
+---
+
+## Repository layout
+
+```text
+bounty_agent/        # legacy Python package (agent loop, tools, domain adapters)
+chainsaw/            # v2 core: role routing, context budgets, journal, tool packs
+ui/                  # desktop UI (React + Vite; Tauri shell planned)
+sandbox/             # optional container definition
+engagements/         # template + local engagement workspaces (git-ignored)
+pyproject.toml       # Python project metadata
+uv.lock              # locked dependencies
+```
+
+Internal research, cloned references, planning notes, and tests are kept local and are not part of
+the public repository.
+
+---
+
+## Contributing
+
+- Open an issue with a clear reproduction or design proposal.
+- Keep changes scoped and include tests for behavior changes.
+- Never commit secrets, engagement data, or generated run artifacts.
+- For security issues, do not open a public issue; contact the maintainer privately.
+
+---
+
+<div align="center">
+
+**If this project is useful to you, a ⭐ helps more researchers find it.**
+
+[Report an issue](https://github.com/R1zoro/ChainsawRecon/issues) ·
+[Star the repo](https://github.com/R1zoro/ChainsawRecon)
+
+</div>

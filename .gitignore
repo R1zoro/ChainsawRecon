@@ -30,6 +30,8 @@ coverage.xml
 # Generated runtime state outside an ignored engagement.
 /runs/
 /artifacts/
+/.chainsaw/
+**/.chainsaw/
 *.db
 *.db-journal
 *.sqlite
@@ -37,6 +39,19 @@ coverage.xml
 *.sqlite-wal
 *.sqlite-shm
 *.jsonl
+/benchmarks/scorecard.md
+/benchmarks/scorecard.json
+
+# Desktop UI build output and package caches.
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+/ui/coverage/
+/ui/playwright-report/
+/ui/test-results/
+*.tsbuildinfo
+/src-tauri/target/
+/ui/src-tauri/target/
 
 # Credentials and machine-local configuration. Examples remain versioned.
 .env
@@ -59,13 +74,13 @@ sandbox/test-local-runner/
 .DS_Store
 Thumbs.db
 
-# Cloned public repositories used only for architecture research.
-/research/
+# Internal research, cloned references, and tests are local-only.
+# Only build/run-relevant files belong in the public repository.
+/Research/
 /tests/
-# Generated test-run artifacts; keep normal test source files versioned.
-/tests/LDrun_test/
 
 # Machine-local agent/tool configuration and generated state.
+/.planning/
 /.agents/
 /.claude/
 /.clinerules

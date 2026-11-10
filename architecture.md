@@ -1,5 +1,10 @@
 # ChainsawRecon Architecture & Internal Engineering Specifications
 
+> **Status note:** This document describes the legacy implementation and remains useful for the
+> existing modules. The v2 target architecture — journal, application model, deterministic
+> controller, native sandbox, auth profiles, and desktop UI — is summarized in `README.md` and is
+> being implemented incrementally.
+
 ## 1. Overview & System Purpose
 
 **ChainsawRecon** is an autonomous, stateful AI penetration testing and security assessment framework. It orchestrates security tools inside an isolated Docker sandbox, builds a stateful world model of target applications, and executes hypothesis-driven experiments with concrete evidence validation.
