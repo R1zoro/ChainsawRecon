@@ -405,15 +405,19 @@ export interface RequestDetailResponse {
 
 export interface ReplayPayload {
   requestId: string;
+  projectId?: string;
   patch?: {
     query?: Record<string, string>;
     path?: string;
+    url?: string;
+    method?: string;
     header?: Record<string, string>;
     cookie?: Record<string, string>;
     form?: Record<string, string>;
     json?: unknown;
   };
   sessionId?: string;
+  justification?: string;
 }
 
 export interface ReplayResult {
@@ -461,6 +465,81 @@ export interface CaStatusResponse {
   path?: string;
   installed?: boolean;
   instructions: string;
+}
+
+// ── Milestone 4: Findings Types ─────────────────────────────────
+
+export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+export type FindingState =
+  | 'candidate'
+  | 'validated'
+  | 'rejected'
+  | 'observed'
+  | 'suspected'
+  | 'experiment_planned'
+  | 'reproduced'
+  | 'deferred'
+  | 'blocked';
+
+export interface GateQuestion {
+  id: number;
+  passed: boolean;
+  reason: string;
+}
+
+export interface FindingGate {
+  passed: boolean;
+  questions: GateQuestion[];
+}
+
+export interface FindingReproductionStep {
+  step: number;
+  description: string;
+  requestId?: string;
+  expected?: string;
+  actual?: string;
+}
+
+export interface Finding {
+  id: string;
+  projectId: string;
+  sessionId: string;
+  title: string;
+  severity: FindingSeverity;
+  vrt: string;
+  state: FindingState;
+  asset: string;
+  entityId?: string;
+  hypothesisId?: string;
+  evidenceIds: string[];
+  gate?: FindingGate;
+  securityQuestion?: string;
+  impact?: string;
+  remediation?: string;
+  reproduction?: string | FindingReproductionStep[];
+  lineage?: {
+    hypothesisId?: string;
+    taskId?: string;
+    sessionId?: string;
+    discoveredBy?: string;
+    validatedBy?: string;
+    validatedAt?: string;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FindingDetailResponse {
+  finding: Finding;
+  evidence: EvidenceItem[];
+}
+
+export interface FindingTransitionPayload {
+  state: string;
+  reason: string;
+  evidence_ids?: string[];
+  evidenceIds?: string[];
 }
 
 

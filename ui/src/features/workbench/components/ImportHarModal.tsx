@@ -1,21 +1,30 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, X, Check, FileCode } from 'lucide-react';
-import { fetchJson } from '../../../api/client';
+import { Upload, X, Check, FileCode, AlertCircle } from 'lucide-react';
+import { fetchJson, isApiError } from '../../../api/client';
 
 interface ImportHarModalProps {
   isOpen: boolean;
   onClose: () => void;
+  projectId: string;
   onImportComplete: () => void;
 }
 
 export const ImportHarModal: React.FC<ImportHarModalProps> = ({
   isOpen,
   onClose,
+  projectId,
   onImportComplete,
 }) => {
   const [format, setFormat] = useState<'har' | 'burp_xml'>('har');
-  const [filePath, setFilePath] = useState('C:/captures/session_dump.har');
+  const [filePath, setFilePath] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setImportError(null);
+    }
+  }, [isOpen]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -31,17 +40,22 @@ export const ImportHarModal: React.FC<ImportHarModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!filePath.trim()) {
+      setImportError('Please provide a valid filesystem path.');
+      return;
+    }
     setIsSubmitting(true);
+    setImportError(null);
     try {
       await fetchJson('/workbench/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ format, path: filePath }),
+        body: JSON.stringify({ projectId, format, path: filePath.trim() }),
       });
       onImportComplete();
       onClose();
-    } catch {
-      // Handled
+    } catch (err) {
+      setImportError(isApiError(err) ? err.message : 'Import failed. Check path format and file permissions.');
     } finally {
       setIsSubmitting(false);
     }
@@ -81,6 +95,16 @@ export const ImportHarModal: React.FC<ImportHarModalProps> = ({
 
         {/* Form Body */}
         <form onSubmit={handleSubmit} className="p-5 space-y-4 text-xs">
+          {importError && (
+            <div className="bg-danger/15 border border-danger/30 rounded-lg p-2.5 flex items-start gap-2 text-danger font-mono text-xs">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Import Failed</p>
+                <p className="text-[11px] text-danger/80 pt-0.5">{importError}</p>
+              </div>
+            </div>
+          )}
+
           {/* Format Radio Selection */}
           <div className="space-y-1.5 font-sans">
             <label className="text-xs font-medium text-text">Capture Format</label>

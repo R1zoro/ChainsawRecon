@@ -12,6 +12,9 @@ export const TopMenuBar: React.FC = () => {
       case 'workbench':
         navigate('/workbench');
         break;
+      case 'findings':
+        navigate('/findings');
+        break;
       case 'models':
         navigate('/models');
         break;
@@ -27,7 +30,7 @@ export const TopMenuBar: React.FC = () => {
     }
   };
 
-  const menus = ['File', 'Workbench', 'View', 'Models', 'Tools', 'Help', 'Docs'];
+  const menus = ['File', 'Workbench', 'Findings', 'View', 'Models', 'Tools', 'Help', 'Docs'];
 
   return (
     <div className="border-b border-border/60 bg-bg text-[11px] font-mono text-text-muted px-6 py-1 flex items-center gap-4">

@@ -25,6 +25,9 @@ import {
   ResponseCompareResponse,
   CreateEvidencePayload,
   CaStatusResponse,
+  Finding,
+  FindingDetailResponse,
+  FindingTransitionPayload,
 } from './types';
 import { initialMockProjects, mockRecentActivity, mockProviders } from './mockData';
 import { ApiError } from './client';
@@ -893,9 +896,173 @@ const initialMockCaStatus: CaStatusResponse = {
   instructions: 'Install Chainsaw CA into your Trusted Root Certification Authorities store or import ca.crt into your browser settings.',
 };
 
+// ── Milestone 4 Mock Findings Fixtures ─────────────────────────
+
+const initialMockFindings: Finding[] = [
+  {
+    id: 'fnd_demo_01',
+    projectId: 'prj_demo',
+    sessionId: 'ses_demo_01',
+    title: 'Cross-tenant invoice read',
+    severity: 'high',
+    vrt: 'P2.2 IDOR',
+    state: 'candidate',
+    asset: 'https://api.example.com/api/v1/invoices/102',
+    entityId: 'rte_invoice',
+    hypothesisId: 'hyp_demo_01',
+    evidenceIds: ['evd_idor_payload'],
+    securityQuestion: 'Can an unprivileged tenant read invoices belonging to another customer organization without authorization?',
+    impact: 'A malicious tenant can harvest confidential billing data, customer addresses, and tax identifiers of competitor tenants.',
+    remediation: 'Enforce tenant isolation checks on the database query layer. Reject object IDs not belonging to the authenticated tenant context.',
+    reproduction: [
+      {
+        step: 1,
+        description: 'Authenticate as Tenant Alpha user via /api/v1/auth/login.',
+        expected: 'Receives Tenant Alpha session token.'
+      },
+      {
+        step: 2,
+        description: 'Issue GET /api/v1/invoices/102 (belonging to Tenant Beta).',
+        expected: 'HTTP 403 Forbidden or 404 Not Found.',
+        actual: 'HTTP 200 OK with complete billing records of Tenant Beta.'
+      }
+    ],
+    gate: {
+      passed: false,
+      questions: [
+        { id: 1, passed: true, reason: 'Asset is in scope.' },
+        { id: 2, passed: true, reason: 'Exact request/response pair captured.' },
+        { id: 3, passed: true, reason: 'Cross-tenant data returned.' },
+        { id: 4, passed: true, reason: 'Not an auth gate; session A is valid.' },
+        { id: 5, passed: true, reason: 'Tenant isolation is core.' },
+        { id: 6, passed: true, reason: 'High severity by VRT.' },
+        { id: 7, passed: false, reason: 'Independent reproduction pending.' }
+      ]
+    },
+    lineage: {
+      hypothesisId: 'hyp_demo_01',
+      taskId: 'tsk_idor_01',
+      sessionId: 'ses_demo_01',
+      discoveredBy: 'Recon Module',
+    },
+    createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+  },
+  {
+    id: 'fnd_demo_02',
+    projectId: 'prj_demo',
+    sessionId: 'ses_demo_02',
+    title: 'Reflected XSS in search endpoint',
+    severity: 'medium',
+    vrt: 'P2 Cross-Site Scripting (Reflected)',
+    state: 'rejected',
+    asset: 'https://app.example.com/search?q=',
+    entityId: 'rte_search',
+    hypothesisId: 'hyp_demo_02',
+    evidenceIds: ['evd_idor_payload'],
+    securityQuestion: 'Does the search parameter execute unescaped JavaScript in client browser context?',
+    impact: 'No impact observed in testing; output is strictly escaped before DOM insertion.',
+    remediation: 'None required. Contextual sanitization verified.',
+    reproduction: 'Injected <script>alert(1)</script> in query string parameter q. Response entity-escaped payload to &lt;script&gt;.',
+    gate: {
+      passed: false,
+      questions: [
+        { id: 1, passed: true, reason: 'Asset is in scope.' },
+        { id: 2, passed: true, reason: 'Request/response captured.' },
+        { id: 3, passed: false, reason: 'Payload was HTML-escaped.' },
+        { id: 4, passed: true, reason: 'Not an auth gate.' },
+        { id: 5, passed: true, reason: 'Search is user-facing.' },
+        { id: 6, passed: true, reason: 'Medium by VRT.' },
+        { id: 7, passed: true, reason: 'Evidence complete.' }
+      ]
+    },
+    lineage: {
+      hypothesisId: 'hyp_demo_02',
+      sessionId: 'ses_demo_02',
+      discoveredBy: 'Active Probe',
+      validatedBy: 'Security Lead',
+      validatedAt: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
+    },
+    createdAt: new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
+  },
+  {
+    id: 'fnd_demo_03',
+    projectId: 'prj_demo',
+    sessionId: 'ses_demo_01',
+    title: 'Candidate finding with zero recorded evidence',
+    severity: 'critical',
+    vrt: 'P1 Broken Authentication',
+    state: 'candidate',
+    asset: 'https://api.example.com/api/v1/auth/internal-bypass',
+    evidenceIds: [],
+    securityQuestion: 'Does an internal bypass header allow authentication skipping?',
+    impact: 'Potential full authentication bypass for administrative interfaces.',
+    remediation: 'Remove internal debug headers in production edge routing.',
+    reproduction: 'Send header X-Chainsaw-Internal: admin to /api/v1/auth/internal-bypass.',
+    gate: {
+      passed: false,
+      questions: [
+        { id: 1, passed: true, reason: 'Asset is in scope.' },
+        { id: 2, passed: false, reason: 'No evidence artifacts recorded yet.' },
+        { id: 3, passed: false, reason: 'Bypass unconfirmed.' },
+        { id: 4, passed: false, reason: 'Pending reproduction.' },
+        { id: 5, passed: true, reason: 'Critical boundary.' },
+        { id: 6, passed: true, reason: 'P1 classification.' },
+        { id: 7, passed: false, reason: 'Verification incomplete.' }
+      ]
+    },
+    lineage: {
+      sessionId: 'ses_demo_01',
+      discoveredBy: 'Passive Observation',
+    },
+    createdAt: new Date(Date.now() - 40 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 40 * 60 * 1000).toISOString(),
+  },
+  {
+    id: 'fnd_demo_04',
+    projectId: 'prj_demo',
+    sessionId: 'ses_demo_01',
+    title: 'Admin role escalation via weak JWT signature verification',
+    severity: 'critical',
+    vrt: 'P1 Privilege Escalation',
+    state: 'validated',
+    asset: 'https://api.example.com/api/v1/admin/privileges',
+    entityId: 'rte_admin',
+    evidenceIds: ['evd_idor_payload'],
+    securityQuestion: 'Can a user forge an HS256 JWT using public RS256 key to gain admin privileges?',
+    impact: 'Attackers can achieve full superuser administrative privileges over all customer accounts and settings.',
+    remediation: 'Enforce asymmetric RS256 verification and explicitly reject symmetric algorithm substitutions (alg: none or HS256).',
+    reproduction: 'Sign JWT with server public key using HS256 algorithm and pass in Authorization header to /api/v1/admin/privileges.',
+    gate: {
+      passed: true,
+      questions: [
+        { id: 1, passed: true, reason: 'Target is strictly in scope.' },
+        { id: 2, passed: true, reason: 'Cryptographic exploit trace recorded with full wire capture.' },
+        { id: 3, passed: true, reason: 'Admin dashboard returned 200 with root privileges.' },
+        { id: 4, passed: true, reason: 'Independent verification confirmed.' },
+        { id: 5, passed: true, reason: 'Critical tenant impact.' },
+        { id: 6, passed: true, reason: 'Severity aligned with CVSS 9.8.' },
+        { id: 7, passed: true, reason: 'Independent reviewer accepted.' }
+      ]
+    },
+    lineage: {
+      hypothesisId: 'hyp_demo_03',
+      taskId: 'tsk_idor_01',
+      sessionId: 'ses_demo_01',
+      discoveredBy: 'Security Agent',
+      validatedBy: 'Validator Lead',
+      validatedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    },
+    createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+  }
+];
+
 let mockCapturedRequests: CapturedRequest[] = JSON.parse(JSON.stringify(initialMockCapturedRequests));
 let mockRequestDetails: Record<string, RequestDetailResponse> = JSON.parse(JSON.stringify(initialMockRequestDetails));
 let mockCaStatus: CaStatusResponse = JSON.parse(JSON.stringify(initialMockCaStatus));
+let mockFindings: Finding[] = JSON.parse(JSON.stringify(initialMockFindings));
 
 export function setMockServiceMode(mode: MockServiceMode) {
   currentMode = mode;
@@ -917,6 +1084,7 @@ export function resetMockData() {
   mockCapturedRequests = JSON.parse(JSON.stringify(initialMockCapturedRequests));
   mockRequestDetails = JSON.parse(JSON.stringify(initialMockRequestDetails));
   mockCaStatus = JSON.parse(JSON.stringify(initialMockCaStatus));
+  mockFindings = JSON.parse(JSON.stringify(initialMockFindings));
   currentMode = 'healthy';
 }
 
@@ -1873,6 +2041,189 @@ export async function fetchWorkbenchExport(
 export async function fetchCaStatus(): Promise<CaStatusResponse> {
   await new Promise((res) => setTimeout(res, 40));
   return mockCaStatus;
+}
+
+// ── Milestone 4: Findings Mock Handlers ─────────────────────────
+
+export async function fetchFindings(params?: {
+  projectId?: string;
+  sessionId?: string;
+  state?: string;
+  severity?: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<Paginated<Finding>> {
+  await new Promise((res) => setTimeout(res, 40));
+
+  if (currentMode === 'disconnected') {
+    throw new Error('NETWORK_DISCONNECTED');
+  }
+
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'FINDINGS_UNAVAILABLE',
+      message: 'Failed to retrieve project findings.',
+      request_id: 'req_fnd_err_01',
+    });
+  }
+
+  if (currentMode === 'empty') {
+    return {
+      items: [],
+      total: 0,
+      limit: params?.limit || 50,
+      offset: params?.offset || 0,
+      next: null,
+    };
+  }
+
+  let items = [...mockFindings];
+
+  if (params?.projectId) {
+    items = items.filter((f) => f.projectId === params.projectId);
+  }
+
+  if (params?.sessionId) {
+    items = items.filter((f) => f.sessionId === params.sessionId);
+  }
+
+  if (params?.state && params.state !== 'ALL') {
+    items = items.filter((f) => f.state.toLowerCase() === params.state!.toLowerCase());
+  }
+
+  if (params?.severity && params.severity !== 'ALL') {
+    items = items.filter((f) => f.severity.toLowerCase() === params.severity!.toLowerCase());
+  }
+
+  if (params?.q) {
+    const qLower = params.q.toLowerCase();
+    items = items.filter(
+      (f) =>
+        f.title.toLowerCase().includes(qLower) ||
+        f.asset.toLowerCase().includes(qLower) ||
+        f.vrt.toLowerCase().includes(qLower) ||
+        f.id.toLowerCase().includes(qLower)
+    );
+  }
+
+  const offset = params?.offset || 0;
+  const limit = params?.limit || 50;
+  const paginatedItems = items.slice(offset, offset + limit);
+  const next = offset + limit < items.length ? offset + limit : null;
+
+  return {
+    items: paginatedItems,
+    total: items.length,
+    limit,
+    offset,
+    next,
+  };
+}
+
+export async function fetchFindingDetail(findingId: string): Promise<FindingDetailResponse> {
+  await new Promise((res) => setTimeout(res, 40));
+
+  if (currentMode === 'disconnected') {
+    throw new Error('NETWORK_DISCONNECTED');
+  }
+
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'FINDING_NOT_FOUND',
+      message: `Finding ${findingId} could not be retrieved.`,
+      request_id: 'req_fnd_err_02',
+    });
+  }
+
+  const finding = mockFindings.find((f) => f.id === findingId);
+  if (!finding) {
+    throw new ApiError({
+      code: 'NOT_FOUND',
+      message: `Finding not found: ${findingId}`,
+      request_id: 'req_fnd_404',
+    });
+  }
+
+  const evidenceIds = new Set(finding.evidenceIds || []);
+  const linkedEvidence = mockEvidence.filter((e) => evidenceIds.has(e.id));
+
+  return {
+    finding: { ...finding },
+    evidence: linkedEvidence,
+  };
+}
+
+export async function transitionFinding(
+  findingId: string,
+  payload: FindingTransitionPayload
+): Promise<Finding> {
+  await new Promise((res) => setTimeout(res, 50));
+
+  if (currentMode === 'disconnected') {
+    throw new Error('NETWORK_DISCONNECTED');
+  }
+
+  const index = mockFindings.findIndex((f) => f.id === findingId);
+  if (index === -1) {
+    throw new ApiError({
+      code: 'NOT_FOUND',
+      message: `Finding not found: ${findingId}`,
+      request_id: 'req_fnd_trans_404',
+    });
+  }
+
+  const targetState = payload.state;
+  if (!['candidate', 'validated', 'rejected'].includes(targetState)) {
+    throw new ApiError({
+      code: 'BAD_REQUEST',
+      message: 'Finding state must be candidate, validated, or rejected',
+      request_id: 'req_fnd_trans_invalid',
+    });
+  }
+
+  const current = mockFindings[index];
+  const linkedEvidence = payload.evidenceIds || payload.evidence_ids || current.evidenceIds || [];
+
+  if (targetState === 'validated') {
+    // Validated requires recorded evidence
+    if (linkedEvidence.length === 0) {
+      throw new ApiError({
+        code: 'BAD_REQUEST',
+        message: 'A validated finding requires at least one recorded evidence id',
+        request_id: 'req_fnd_no_evidence',
+      });
+    }
+  }
+
+  if (targetState === 'rejected') {
+    if (!payload.reason || !payload.reason.trim()) {
+      throw new ApiError({
+        code: 'BAD_REQUEST',
+        message: 'Rejecting a finding requires a non-empty reason',
+        request_id: 'req_fnd_no_reason',
+      });
+    }
+  }
+
+  const updated: Finding = {
+    ...current,
+    state: targetState as Finding['state'],
+    evidenceIds: linkedEvidence,
+    lineage: {
+      ...current.lineage,
+      ...(targetState === 'validated'
+        ? {
+            validatedBy: 'Operator',
+            validatedAt: new Date().toISOString(),
+          }
+        : {}),
+    },
+    updatedAt: new Date().toISOString(),
+  };
+
+  mockFindings[index] = updated;
+  return updated;
 }
 
 

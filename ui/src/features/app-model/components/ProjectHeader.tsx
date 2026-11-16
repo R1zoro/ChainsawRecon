@@ -19,6 +19,8 @@ interface ProjectHeaderProps {
   onToggleStaleFilter: () => void;
   onRefresh: () => void;
   onExportJson: () => void;
+  onExportPng?: () => void;
+  onExportSvg?: () => void;
   isRefreshing?: boolean;
 }
 
@@ -33,6 +35,8 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
   onToggleStaleFilter,
   onRefresh,
   onExportJson,
+  onExportPng,
+  onExportSvg,
   isRefreshing = false,
 }) => {
   const navigate = useNavigate();
@@ -115,6 +119,16 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
 
         {/* Right: Active Session CTA, View Switcher & Actions */}
         <div className="flex items-center gap-3 shrink-0">
+          {/* Findings Quick Link */}
+          <button
+            onClick={() => navigate(`/projects/${project?.id || 'prj_demo'}/findings`)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-bg hover:bg-surface-2 border border-border text-xs text-text transition-colors"
+            title="Open Security Findings"
+          >
+            <ShieldAlert className="w-3.5 h-3.5 text-warning" />
+            <span>Findings</span>
+          </button>
+
           {/* Active Session Quick Link */}
           {activeSession && (
             <button
@@ -201,6 +215,30 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
                   <span>Export JSON</span>
                   <span className="text-[10px] text-text-muted">.json</span>
                 </button>
+                {onExportSvg && (
+                  <button
+                    onClick={() => {
+                      setIsExportMenuOpen(false);
+                      onExportSvg();
+                    }}
+                    className="w-full text-left px-3 py-2 hover:bg-surface-2 text-text flex items-center justify-between"
+                  >
+                    <span>Export SVG</span>
+                    <span className="text-[10px] text-text-muted">.svg</span>
+                  </button>
+                )}
+                {onExportPng && (
+                  <button
+                    onClick={() => {
+                      setIsExportMenuOpen(false);
+                      onExportPng();
+                    }}
+                    className="w-full text-left px-3 py-2 hover:bg-surface-2 text-text flex items-center justify-between"
+                  >
+                    <span>Export PNG</span>
+                    <span className="text-[10px] text-text-muted">.png</span>
+                  </button>
+                )}
               </div>
             )}
           </div>

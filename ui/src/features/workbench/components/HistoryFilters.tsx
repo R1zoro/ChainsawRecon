@@ -17,6 +17,7 @@ interface HistoryFiltersProps {
   onResetFilters: () => void;
   totalCount: number;
   filteredCount: number;
+  authOptions?: string[];
 }
 
 export const HistoryFilters: React.FC<HistoryFiltersProps> = ({
@@ -35,6 +36,7 @@ export const HistoryFilters: React.FC<HistoryFiltersProps> = ({
   onResetFilters,
   totalCount,
   filteredCount,
+  authOptions = [],
 }) => {
   const methods = ['ALL', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
   const statusOptions = [
@@ -43,12 +45,6 @@ export const HistoryFilters: React.FC<HistoryFiltersProps> = ({
     { label: '3xx Redirect', value: '3xx' },
     { label: '4xx Client Err', value: '4xx' },
     { label: '5xx Server Err', value: '5xx' },
-  ];
-  const authOptions = [
-    { label: 'Auth: All', value: 'ALL' },
-    { label: 'session:tenant-a', value: 'session:tenant-a' },
-    { label: 'session:admin', value: 'session:admin' },
-    { label: 'unauthenticated', value: 'unauthenticated' },
   ];
   const tags = ['ALL', 'api', 'object-id', 'state-changing', 'destructive', 'auth'];
 
@@ -130,9 +126,10 @@ export const HistoryFilters: React.FC<HistoryFiltersProps> = ({
             onChange={(e) => onSelectAuth(e.target.value)}
             className="bg-bg border border-border rounded px-2 py-0.5 text-xs text-text font-mono focus:outline-none focus:border-accent"
           >
+            <option value="ALL">Auth: All</option>
             {authOptions.map((a) => (
-              <option key={a.value} value={a.value}>
-                {a.label}
+              <option key={a} value={a}>
+                {a}
               </option>
             ))}
           </select>

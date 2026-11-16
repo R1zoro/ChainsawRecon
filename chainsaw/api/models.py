@@ -63,6 +63,16 @@ class SessionCreate(BaseModel):
     targets: list[str] = Field(default_factory=list)
 
 
+class SessionRunCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    max_steps: int = Field(default=10, ge=1, le=200, alias="maxSteps")
+    context_window: int = Field(default=8192, ge=1024, alias="contextWindow")
+    max_output_tokens: int = Field(default=1024, ge=64, alias="maxOutputTokens")
+    provider_id: str = Field(default="", alias="providerId")
+    model: str = ""
+
+
 class ProviderCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -86,3 +96,86 @@ class ApprovalDecision(BaseModel):
 
 class NoteCreate(BaseModel):
     content: str
+
+
+class CoverageCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    risk_area: str = Field(alias="riskArea")
+    outcome: str
+    surface: str = ""
+    evidence_id: str = Field(default="", alias="evidenceId")
+    reason: str = ""
+    worker: str = ""
+
+
+class FindingTransition(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    state: str
+    reason: str = ""
+    evidence_ids: list[str] = Field(default_factory=list, alias="evidenceIds")
+
+
+class ReplayPatch(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    query: dict[str, str] | None = None
+    path: str | None = None
+    url: str | None = None
+    method: str | None = None
+    header: dict[str, str] | None = None
+    cookie: dict[str, str] | None = None
+    form: dict[str, str] | None = None
+    json_body: Any = Field(default=None, alias="json")
+
+
+class ReplayCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    request_id: str = Field(alias="requestId")
+    project_id: str = Field(default="", alias="projectId")
+    patch: ReplayPatch = Field(default_factory=ReplayPatch)
+    session_id: str = Field(default="", alias="sessionId")
+    justification: str = ""
+
+
+class CompareCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    baseline_id: str = Field(alias="baselineId")
+    candidate_id: str = Field(alias="candidateId")
+
+
+class EvidenceCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    request_id: str = Field(alias="requestId")
+    response_id: str = Field(default="", alias="responseId")
+    hypothesis_id: str = Field(default="", alias="hypothesisId")
+    task_id: str = Field(default="", alias="taskId")
+    note: str = ""
+    session_id: str = Field(default="", alias="sessionId")
+
+
+class ImportCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    project_id: str = Field(default="", alias="projectId")
+    format: Literal["har", "burp_xml"] = "har"
+    path: str
+
+
+class ProxyStart(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    project_id: str = Field(alias="projectId")
+    host: str = "127.0.0.1"
+    port: int = Field(default=8080, ge=0, le=65535)
+    verify_upstream: bool = Field(default=True, alias="verifyUpstream")
+
+
+class ProxyStop(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    project_id: str = Field(alias="projectId")

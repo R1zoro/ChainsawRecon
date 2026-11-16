@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -12,19 +13,47 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from ..ca import ensure_ca
 from ..journal import read_journal, verify_journal
+from ..providers import (
+    OpenAICompatibleProvider,
+    ProviderError,
+    config_from_entry,
+)
+from ..proxy import ProxyError, ProxyManager
+from ..runner import RunConfig, Runner
+from ..runtime import SessionRuntime
+from ..workbench import (
+    ApprovalRequired,
+    FlowNotFound,
+    TransportFailed,
+    WorkbenchError,
+    ca_status,
+    compare,
+    import_file,
+    replay,
+)
 from ..workspace import (
     ChainsawHome,
     SessionPaths,
 )
 from .models import (
     ApprovalDecision,
+    CompareCreate,
+    CoverageCreate,
+    EvidenceCreate,
+    FindingTransition,
+    ImportCreate,
     MessageCreate,
     NoteCreate,
     ProjectCreate,
     ProjectOpen,
     ProviderCreate,
+    ProxyStart,
+    ProxyStop,
+    ReplayCreate,
     SessionCreate,
+    SessionRunCreate,
 )
 from .registry import ProjectNotFoundError, ProjectRegistry
 
@@ -91,8 +120,21 @@ def _page(items: list[Any], *, limit: int, offset: int) -> dict[str, Any]:
 
 
 def create_app(home: ChainsawHome | None = None) -> FastAPI:
-    app = FastAPI(title="ChainsawRecon API", version="2.0.0-preview")
     registry = ProjectRegistry(home or ChainsawHome.default())
+    proxies = ProxyManager(registry.home.root)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            proxies.stop_all()
+
+    app = FastAPI(
+        title="ChainsawRecon API",
+        version="2.0.0-preview",
+        lifespan=lifespan,
+    )
 
     app.add_middleware(
         CORSMiddleware,
@@ -251,9 +293,52 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
                 raise HTTPException(404, f"NOT_FOUND: entity not found: {entity_id}")
             return {
                 "entity": entity.to_dict(),
+                "coverage": model.coverage_for(entity_id),
                 "edges": model.edges(entity_id),
                 "notes": model.notes(entity_id),
             }
+        finally:
+            model.close()
+
+    @app.post("/api/v1/projects/{project_id}/app-model/entities/{entity_id}/coverage", status_code=201)
+    async def app_model_coverage(
+        project_id: str, entity_id: str, payload: CoverageCreate
+    ) -> dict[str, Any]:
+        model = registry.app_model(project_id)
+        try:
+            try:
+                return model.record_coverage(
+                    entity_id,
+                    risk_area=payload.risk_area,
+                    outcome=payload.outcome,
+                    surface=payload.surface,
+                    evidence_id=payload.evidence_id,
+                    reason=payload.reason,
+                    worker=payload.worker,
+                )
+            except KeyError as exc:
+                raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+            except ValueError as exc:
+                raise HTTPException(400, f"BAD_REQUEST: {exc}") from exc
+        finally:
+            model.close()
+
+    @app.get("/api/v1/projects/{project_id}/app-model/coverage")
+    async def app_model_coverage_summary(project_id: str) -> dict[str, Any]:
+        model = registry.app_model(project_id)
+        try:
+            return model.coverage_summary()
+        finally:
+            model.close()
+
+    @app.get("/api/v1/projects/{project_id}/app-model/sitemap")
+    async def app_model_sitemap(
+        project_id: str,
+        maxNodes: int = Query(2000, ge=10, le=10000),
+    ) -> dict[str, Any]:
+        model = registry.app_model(project_id)
+        try:
+            return model.sitemap(max_nodes=maxNodes)
         finally:
             model.close()
 
@@ -327,6 +412,68 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
     @app.post("/api/v1/sessions/{session_id}/stop")
     async def stop_session(session_id: str) -> dict[str, Any]:
         return registry.update_session_status(session_id, "completed")
+
+    @app.post("/api/v1/sessions/{session_id}/run")
+    async def run_session(session_id: str, payload: SessionRunCreate) -> dict[str, Any]:
+        project, _, meta = registry.find_session(session_id)
+        entry = registry.provider_entry(payload.provider_id or meta.provider)
+        if entry is None:
+            raise HTTPException(
+                400,
+                "BAD_REQUEST: no provider configured; add one before running a session",
+            )
+        model = payload.model or meta.model
+        try:
+            provider_config = config_from_entry(entry, model=model)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"BAD_REQUEST: invalid provider config: {exc}") from exc
+        if not provider_config.base_url:
+            raise HTTPException(400, "BAD_REQUEST: provider has no base URL")
+        provider = OpenAICompatibleProvider(provider_config)
+        runtime = SessionRuntime(project.path, session_id)
+        store = registry.workbench(project.id)
+        try:
+            runner = Runner(
+                runtime,
+                store=store,
+                policy=registry.scope_policy(project.id),
+                provider=provider,
+                model=model or provider_config.model,
+                config=RunConfig(
+                    max_steps=payload.max_steps,
+                    context_window=payload.context_window,
+                    max_output_tokens=payload.max_output_tokens,
+                ),
+            )
+            registry.update_session_status(session_id, "running")
+            try:
+                result = await asyncio.to_thread(runner.run)
+            except Exception:
+                registry.update_session_status(session_id, "paused")
+                raise
+        finally:
+            store.close()
+            runtime.close()
+        registry.update_session_status(
+            session_id,
+            "completed" if result.finished else "paused",
+        )
+        return {
+            **result.to_dict(),
+            "sessionId": session_id,
+            "model": model or provider_config.model,
+        }
+
+    @app.get("/api/v1/providers/{provider_id}/health")
+    async def provider_health(provider_id: str) -> dict[str, Any]:
+        entry = registry.provider_entry(provider_id)
+        if entry is None:
+            raise HTTPException(404, f"NOT_FOUND: provider not found: {provider_id}")
+        provider = OpenAICompatibleProvider(config_from_entry(entry))
+        try:
+            return await asyncio.to_thread(provider.health)
+        except ProviderError as exc:
+            raise HTTPException(502, f"INTERNAL: {exc}") from exc
 
     @app.get("/api/v1/sessions/{session_id}/journal")
     async def journal(
@@ -456,12 +603,254 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         }
 
     @app.get("/api/v1/workbench/history")
-    async def workbench_history() -> dict[str, Any]:
-        return _page([], limit=100, offset=0)
+    async def workbench_history(
+        projectId: str = Query(""),
+        q: str = "",
+        host: str = "",
+        method: str = "",
+        status: str = "",
+        contentType: str = "",
+        auth: str = "",
+        tag: str = "",
+        inScopeOnly: bool = False,
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        if not projectId:
+            raise HTTPException(400, "BAD_REQUEST: projectId is required")
+        store = registry.workbench(projectId)
+        try:
+            items, total = store.list_flows(
+                q=q,
+                host=host,
+                method=method,
+                status=status,
+                content_type=contentType,
+                auth=auth,
+                tag=tag,
+                in_scope_only=inScopeOnly,
+                limit=limit,
+                offset=offset,
+            )
+        finally:
+            store.close()
+        next_offset = offset + len(items)
+        return {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "next": next_offset if next_offset < total else None,
+        }
+
+    @app.get("/api/v1/workbench/requests/{request_id}")
+    async def workbench_request(request_id: str) -> dict[str, Any]:
+        try:
+            _, store = registry.find_flow(request_id)
+        except FlowNotFound as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        try:
+            return store.require_flow(request_id).detail()
+        finally:
+            store.close()
+
+    @app.post("/api/v1/workbench/replay")
+    async def workbench_replay(payload: ReplayCreate) -> dict[str, Any]:
+        try:
+            project, store = registry.find_flow(payload.request_id)
+        except FlowNotFound as exc:
+            if not payload.project_id:
+                raise HTTPException(
+                    404,
+                    f"NOT_FOUND: {exc}; scratch requests require projectId, url, and method",
+                ) from exc
+            project = registry.get(payload.project_id)
+            store = registry.workbench(payload.project_id)
+        try:
+            policy = registry.scope_policy(project.id)
+            patch = payload.patch.model_dump(exclude_none=True, by_alias=True)
+            try:
+                return replay(
+                    store,
+                    payload.request_id,
+                    patch=patch,
+                    policy=policy,
+                    justification=payload.justification,
+                )
+            except ApprovalRequired as exc:
+                raise HTTPException(403, f"APPROVAL_REQUIRED: {exc}") from exc
+            except TransportFailed as exc:
+                raise HTTPException(502, f"INTERNAL: {exc}") from exc
+        finally:
+            store.close()
+
+    @app.post("/api/v1/workbench/compare")
+    async def workbench_compare(payload: CompareCreate) -> dict[str, Any]:
+        try:
+            _, store = registry.find_flow(payload.baseline_id)
+        except FlowNotFound as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        try:
+            try:
+                return compare(store, payload.baseline_id, payload.candidate_id)
+            except FlowNotFound as exc:
+                raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        finally:
+            store.close()
+
+    @app.post("/api/v1/workbench/evidence", status_code=201)
+    async def workbench_evidence(payload: EvidenceCreate) -> dict[str, Any]:
+        try:
+            project, store = registry.find_flow(payload.request_id)
+        except FlowNotFound as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        try:
+            if payload.session_id:
+                session_project, _, _ = registry.find_session(payload.session_id)
+                if session_project.id != project.id:
+                    raise HTTPException(
+                        400,
+                        "BAD_REQUEST: sessionId does not belong to the request's project",
+                    )
+            evidence = store.record_evidence(
+                request_id=payload.request_id,
+                response_id=payload.response_id,
+                hypothesis_id=payload.hypothesis_id,
+                task_id=payload.task_id,
+                note=payload.note,
+                session_id=payload.session_id,
+                artifact_dir=project.path / ".chainsaw" / "artifacts",
+            )
+        finally:
+            store.close()
+        if payload.session_id:
+            registry.record_evidence_event(payload.session_id, evidence)
+        return evidence
+
+    @app.post("/api/v1/workbench/import", status_code=202)
+    async def workbench_import(payload: ImportCreate) -> dict[str, Any]:
+        if not payload.project_id:
+            raise HTTPException(400, "BAD_REQUEST: projectId is required")
+        project = registry.get(payload.project_id)
+        store = registry.workbench(payload.project_id)
+        try:
+            try:
+                return import_file(
+                    store,
+                    fmt=payload.format,
+                    path=Path(payload.path).expanduser(),
+                    policy=registry.scope_policy(project.id),
+                )
+            except WorkbenchError as exc:
+                raise HTTPException(400, f"BAD_REQUEST: {exc}") from exc
+        finally:
+            store.close()
+
+    @app.get("/api/v1/workbench/export")
+    async def workbench_export(
+        projectId: str = Query(""),
+        format: str = Query("har"),
+    ) -> dict[str, Any]:
+        if not projectId:
+            raise HTTPException(400, "BAD_REQUEST: projectId is required")
+        if format not in {"har", "jsonl"}:
+            raise HTTPException(400, f"BAD_REQUEST: unsupported export format: {format}")
+        store = registry.workbench(projectId)
+        try:
+            data: Any = store.export_har() if format == "har" else store.export_jsonl()
+        finally:
+            store.close()
+        return {"format": format, "data": data}
+
+    @app.get("/api/v1/workbench/ca")
+    async def workbench_ca() -> dict[str, Any]:
+        return ca_status(registry.home.root)
+
+    @app.post("/api/v1/workbench/ca", status_code=201)
+    async def workbench_ca_create() -> dict[str, Any]:
+        ensure_ca(registry.home.root)
+        return ca_status(registry.home.root)
+
+    @app.post("/api/v1/workbench/proxy/start")
+    async def workbench_proxy_start(payload: ProxyStart) -> dict[str, Any]:
+        project = registry.get(payload.project_id)
+        try:
+            return proxies.start(
+                project_path=project.path,
+                project_id=project.id,
+                policy=registry.scope_policy(project.id),
+                host=payload.host,
+                port=payload.port,
+                verify_upstream=payload.verify_upstream,
+            )
+        except (OSError, ProxyError) as exc:
+            raise HTTPException(400, f"BAD_REQUEST: cannot start proxy: {exc}") from exc
+
+    @app.post("/api/v1/workbench/proxy/stop")
+    async def workbench_proxy_stop(payload: ProxyStop) -> dict[str, Any]:
+        registry.get(payload.project_id)
+        return proxies.stop(payload.project_id)
+
+    @app.get("/api/v1/workbench/proxy/status")
+    async def workbench_proxy_status(projectId: str = Query("")) -> dict[str, Any]:
+        if not projectId:
+            raise HTTPException(400, "BAD_REQUEST: projectId is required")
+        registry.get(projectId)
+        return proxies.status(projectId)
 
     @app.get("/api/v1/findings")
-    async def findings() -> dict[str, Any]:
-        return _page([], limit=100, offset=0)
+    async def findings(
+        projectId: str = Query(""),
+        sessionId: str = Query(""),
+        state: str = "",
+        severity: str = "",
+        q: str = "",
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        items = registry.findings(
+            project_id=projectId,
+            session_id=sessionId,
+            state=state,
+            severity=severity,
+            query=q,
+        )
+        page = _page(items, limit=limit, offset=offset)
+        return page
+
+    @app.get("/api/v1/findings/{finding_id}")
+    async def finding_detail(finding_id: str) -> dict[str, Any]:
+        try:
+            project, meta, finding = registry.find_finding(finding_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        evidence_ids = set(finding.get("evidenceIds") or [])
+        return {
+            "finding": {
+                **finding,
+                "projectId": project.id,
+                "sessionId": meta.id,
+            },
+            "evidence": [
+                item for item in registry.evidence(meta.id) if item["id"] in evidence_ids
+            ],
+        }
+
+    @app.post("/api/v1/findings/{finding_id}/transition")
+    async def finding_transition(
+        finding_id: str, payload: FindingTransition
+    ) -> dict[str, Any]:
+        try:
+            return registry.transition_finding(
+                finding_id,
+                state=payload.state,
+                reason=payload.reason,
+                evidence_ids=payload.evidence_ids,
+            )
+        except ProjectNotFoundError as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(400, f"BAD_REQUEST: {exc}") from exc
 
     @app.get("/api/v1/reports")
     async def reports() -> dict[str, Any]:

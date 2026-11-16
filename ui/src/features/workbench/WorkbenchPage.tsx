@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Terminal } from 'lucide-react';
-import { fetchJson } from '../../api/client';
+import { Terminal, AlertCircle, X } from 'lucide-react';
+import { fetchJson, isApiError } from '../../api/client';
 import { 
   ProjectSummary, 
   ProjectScopeResponse, 
@@ -27,19 +27,22 @@ export const WorkbenchPage: React.FC = () => {
   const { projectId: routeProjectId } = useParams<{ projectId: string }>();
   const queryClient = useQueryClient();
 
-  const projectId = routeProjectId || 'prj_demo';
+  const projectId = routeProjectId || '';
 
   // 1. Navigation & View State
   const [activeTab, setActiveTab] = useState<WorkbenchViewTab>('history');
   const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
 
-  // 2. Filter State
+  // 2. Filter & Pagination State
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedMethod, setSelectedMethod] = useState('ALL');
   const [selectedStatus, setSelectedStatus] = useState('ALL');
   const [selectedAuth, setSelectedAuth] = useState('ALL');
   const [selectedTag, setSelectedTag] = useState('ALL');
   const [isInScopeOnly, setIsInScopeOnly] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // 3. Modals State
   const [isCaModalOpen, setIsCaModalOpen] = useState(false);
@@ -101,7 +104,9 @@ export const WorkbenchPage: React.FC = () => {
       selectedStatus, 
       selectedAuth, 
       selectedTag, 
-      isInScopeOnly
+      isInScopeOnly,
+      currentPage,
+      pageSize,
     ],
     queryFn: () => {
       const params = new URLSearchParams();
@@ -112,12 +117,24 @@ export const WorkbenchPage: React.FC = () => {
       if (selectedAuth !== 'ALL') params.set('auth', selectedAuth);
       if (selectedTag !== 'ALL') params.set('tag', selectedTag);
       if (isInScopeOnly) params.set('inScopeOnly', 'true');
+      params.set('limit', String(pageSize));
+      params.set('offset', String((currentPage - 1) * pageSize));
       return fetchJson<Paginated<CapturedRequest>>(`/workbench/history?${params.toString()}`);
     },
+    enabled: Boolean(projectId),
   });
 
   const capturedRequests = historyData?.items || [];
   const totalCount = historyData?.total || 0;
+
+  // Derive dynamic auth options from captured requests
+  const authOptions = useMemo(() => {
+    const set = new Set<string>();
+    capturedRequests.forEach((r) => {
+      if (r.authContext) set.add(r.authContext);
+    });
+    return Array.from(set).sort();
+  }, [capturedRequests]);
 
   // Auto-select first request if none selected
   const activeSelectedId = selectedRequestId || (capturedRequests.length > 0 ? capturedRequests[0].id : null);
@@ -138,6 +155,7 @@ export const WorkbenchPage: React.FC = () => {
     setSelectedAuth('ALL');
     setSelectedTag('ALL');
     setIsInScopeOnly(false);
+    setCurrentPage(1);
   };
 
   const handleSendToRepeater = (req: CapturedRequest) => {
@@ -212,6 +230,7 @@ export const WorkbenchPage: React.FC = () => {
   };
 
   const handleExportHar = async () => {
+    setExportError(null);
     try {
       const data = await fetchJson<{ data: unknown }>(`/workbench/export?projectId=${projectId}&format=har`);
       const blob = new Blob([JSON.stringify(data.data, null, 2)], { type: 'application/json' });
@@ -223,15 +242,17 @@ export const WorkbenchPage: React.FC = () => {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-    } catch {
-      // Export handled
+    } catch (err) {
+      setExportError(isApiError(err) ? err.message : 'HAR export failed. Verify workbench data availability.');
     }
   };
 
   const handleExportJsonl = async () => {
+    setExportError(null);
     try {
-      const data = await fetchJson<{ data: unknown }>(`/workbench/export?projectId=${projectId}&format=jsonl`);
-      const blob = new Blob([JSON.stringify(data.data)], { type: 'application/x-ndjson' });
+      const data = await fetchJson<{ data: unknown[] }>(`/workbench/export?projectId=${projectId}&format=jsonl`);
+      const lines = (data.data || []).map((item) => JSON.stringify(item)).join('\n');
+      const blob = new Blob([lines + (lines ? '\n' : '')], { type: 'application/x-ndjson' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -240,8 +261,8 @@ export const WorkbenchPage: React.FC = () => {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-    } catch {
-      // Export handled
+    } catch (err) {
+      setExportError(isApiError(err) ? err.message : 'JSONL export failed. Verify workbench data availability.');
     }
   };
 
@@ -264,6 +285,23 @@ export const WorkbenchPage: React.FC = () => {
         isRefreshing={isHistoryFetching}
       />
 
+      {/* Export Error Banner */}
+      {exportError && (
+        <div className="bg-danger/15 border-b border-danger/30 px-4 py-2.5 flex items-center justify-between text-danger font-mono text-xs shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span><strong>Export Error:</strong> {exportError}</span>
+          </div>
+          <button
+            onClick={() => setExportError(null)}
+            className="p-1 rounded hover:bg-danger/20 text-danger"
+            aria-label="Dismiss error"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* 2. Main Work Surface */}
       <div className="flex-1 flex min-h-0 overflow-hidden relative">
         {activeTab === 'history' && (
@@ -271,20 +309,39 @@ export const WorkbenchPage: React.FC = () => {
             {/* Multi-axis Filter Bar */}
             <HistoryFilters
               searchQuery={searchQuery}
-              onSearchChange={setSearchQuery}
+              onSearchChange={(q) => {
+                setSearchQuery(q);
+                setCurrentPage(1);
+              }}
               selectedMethod={selectedMethod}
-              onSelectMethod={setSelectedMethod}
+              onSelectMethod={(m) => {
+                setSelectedMethod(m);
+                setCurrentPage(1);
+              }}
               selectedStatus={selectedStatus}
-              onSelectStatus={setSelectedStatus}
+              onSelectStatus={(s) => {
+                setSelectedStatus(s);
+                setCurrentPage(1);
+              }}
               selectedAuth={selectedAuth}
-              onSelectAuth={setSelectedAuth}
+              onSelectAuth={(a) => {
+                setSelectedAuth(a);
+                setCurrentPage(1);
+              }}
               selectedTag={selectedTag}
-              onSelectTag={setSelectedTag}
+              onSelectTag={(t) => {
+                setSelectedTag(t);
+                setCurrentPage(1);
+              }}
               isInScopeOnly={isInScopeOnly}
-              onToggleInScopeOnly={() => setIsInScopeOnly(!isInScopeOnly)}
+              onToggleInScopeOnly={() => {
+                setIsInScopeOnly(!isInScopeOnly);
+                setCurrentPage(1);
+              }}
               onResetFilters={handleResetFilters}
               totalCount={totalCount}
               filteredCount={capturedRequests.length}
+              authOptions={authOptions}
             />
 
             {/* Split: History Table (Left) + Split Request/Response Viewer (Right) */}
@@ -295,6 +352,14 @@ export const WorkbenchPage: React.FC = () => {
                   selectedRequest={selectedRequest}
                   onSelectRequest={(req) => setSelectedRequestId(req.id)}
                   onSendToRepeater={handleSendToRepeater}
+                  currentPage={currentPage}
+                  pageSize={pageSize}
+                  totalCount={totalCount}
+                  onPageChange={setCurrentPage}
+                  onPageSizeChange={(ps) => {
+                    setPageSize(ps);
+                    setCurrentPage(1);
+                  }}
                 />
               </div>
 
@@ -319,6 +384,7 @@ export const WorkbenchPage: React.FC = () => {
         {activeTab === 'repeater' && (
           <RepeaterWorkspace
             tabs={repeaterTabs}
+            projectId={projectId}
             activeTabId={activeRepeaterTabId}
             onSelectTab={setActiveRepeaterTabId}
             onAddTab={handleAddScratchTab}
@@ -347,6 +413,7 @@ export const WorkbenchPage: React.FC = () => {
       <ImportHarModal
         isOpen={isImportModalOpen}
         onClose={() => setIsImportModalOpen(false)}
+        projectId={projectId}
         onImportComplete={() => refetchHistory()}
       />
 
@@ -354,6 +421,7 @@ export const WorkbenchPage: React.FC = () => {
         isOpen={Boolean(evidenceRequest)}
         onClose={() => setEvidenceRequest(null)}
         request={evidenceRequest}
+        projectId={projectId}
         onSaved={(_evId) => {
           queryClient.invalidateQueries({ queryKey: ['evidence'] });
         }}

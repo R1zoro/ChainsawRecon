@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { 
-  ArrowUpDown, ShieldAlert, Check, Send, Inbox 
+  ArrowUpDown, ShieldAlert, Check, Send, Inbox, ChevronLeft, ChevronRight 
 } from 'lucide-react';
 import { CapturedRequest } from '../../../api/types';
 
@@ -9,6 +9,11 @@ interface WorkbenchHistoryTableProps {
   selectedRequest: CapturedRequest | null;
   onSelectRequest: (req: CapturedRequest) => void;
   onSendToRepeater: (req: CapturedRequest) => void;
+  currentPage?: number;
+  pageSize?: number;
+  totalCount?: number;
+  onPageChange?: (page: number) => void;
+  onPageSizeChange?: (pageSize: number) => void;
 }
 
 type SortField = 'id' | 'method' | 'host' | 'path' | 'status' | 'durationMs' | 'sizeBytes' | 'capturedAt';
@@ -19,6 +24,11 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
   selectedRequest,
   onSelectRequest,
   onSendToRepeater,
+  currentPage = 1,
+  pageSize = 50,
+  totalCount = requests.length,
+  onPageChange,
+  onPageSizeChange,
 }) => {
   const [sortField, setSortField] = useState<SortField>('id');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
@@ -85,6 +95,10 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
     return `${(bytes / 1024).toFixed(1)} KB`;
   };
 
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const startIndex = totalCount === 0 ? 0 : (currentPage - 1) * pageSize + 1;
+  const endIndex = Math.min(currentPage * pageSize, totalCount);
+
   if (requests.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-surface select-none space-y-2">
@@ -98,8 +112,9 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
   }
 
   return (
-    <div className="flex-1 overflow-auto bg-bg select-none font-sans text-xs">
-      <table className="w-full border-collapse text-left font-mono" role="table">
+    <div className="flex-1 flex flex-col min-h-0 bg-bg select-none font-sans text-xs">
+      <div className="flex-1 overflow-auto">
+        <table className="w-full border-collapse text-left font-mono" role="table">
         <thead className="bg-surface sticky top-0 z-10 border-b border-border shadow-sm text-[11px] text-text-muted">
           <tr>
             <th className="py-2 px-3 w-12 font-medium">
@@ -245,5 +260,57 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
         </tbody>
       </table>
     </div>
-  );
+
+    {/* Pagination Bar */}
+    {onPageChange && (
+      <div className="h-10 px-4 border-t border-border bg-surface flex items-center justify-between font-mono text-[11px] text-text-muted shrink-0 select-none">
+        <div className="flex items-center gap-2">
+          <span>
+            {totalCount > 0 ? (
+              <>Showing <strong className="text-text">{startIndex}-{endIndex}</strong> of {totalCount}</>
+            ) : (
+              '0 requests'
+            )}
+          </span>
+          {onPageSizeChange && (
+            <div className="flex items-center gap-1 ml-3 border-l border-border pl-3">
+              <span>Per page:</span>
+              <select
+                value={pageSize}
+                onChange={(e) => onPageSizeChange(Number(e.target.value))}
+                className="bg-bg border border-border rounded px-1.5 py-0.5 text-[11px] text-text font-mono focus:outline-none focus:border-accent"
+              >
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span>Page {currentPage} of {totalPages}</span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => onPageChange(currentPage - 1)}
+              disabled={currentPage <= 1}
+              className="p-1 rounded border border-border bg-bg hover:bg-surface-2 disabled:opacity-40 disabled:pointer-events-none text-text transition-colors"
+              title="Previous Page"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => onPageChange(currentPage + 1)}
+              disabled={currentPage >= totalPages}
+              className="p-1 rounded border border-border bg-bg hover:bg-surface-2 disabled:opacity-40 disabled:pointer-events-none text-text transition-colors"
+              title="Next Page"
+            >
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+  </div>
+);
 };

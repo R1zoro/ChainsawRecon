@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertCircle, RotateCw, Copy, Check, Plus, FolderKanban } from 'lucide-react';
+import { AlertCircle, RotateCw, Copy, Check, Plus, FolderKanban, X } from 'lucide-react';
 import { fetchJson, isApiError } from '../../api/client';
 import { 
   ProjectSummary, 
@@ -36,6 +36,7 @@ export const ProjectOverviewPage: React.FC = () => {
   const [maxNodes, setMaxNodes] = useState(300);
 
   const [copiedRequestId, setCopiedRequestId] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // 1. Fetch Project Details
   const { 
@@ -140,6 +141,33 @@ export const ProjectOverviewPage: React.FC = () => {
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error('[ProjectOverview] Export JSON failed', err);
+      setExportError('Could not export the application model as JSON.');
+    }
+  };
+
+  const handleExportImage = async (format: 'png' | 'svg') => {
+    const graph = document.querySelector('.react-flow') as HTMLElement | null;
+    if (!graph) {
+      setExportError('Switch to the graph view before exporting an image.');
+      return;
+    }
+    setExportError(null);
+    try {
+      const { toPng, toSvg } = await import('html-to-image');
+      const options = { backgroundColor: '#0D1015', cacheBust: true };
+      const dataUrl =
+        format === 'png'
+          ? await toPng(graph, { ...options, pixelRatio: 2 })
+          : await toSvg(graph, options);
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = `${project?.name || 'app-model'}_topology.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error(`[ProjectOverview] Export ${format.toUpperCase()} failed`, err);
+      setExportError(`Could not export the graph as ${format.toUpperCase()}.`);
     }
   };
 
@@ -261,8 +289,26 @@ export const ProjectOverviewPage: React.FC = () => {
         onToggleStaleFilter={() => setIsStaleOnly(!isStaleOnly)}
         onRefresh={handleRefresh}
         onExportJson={handleExportJson}
+        onExportPng={() => handleExportImage('png')}
+        onExportSvg={() => handleExportImage('svg')}
         isRefreshing={isProjectFetching || isGraphFetching || isEntitiesFetching}
       />
+
+      {exportError && (
+        <div className="bg-danger/15 border-b border-danger/30 px-6 py-1.5 flex items-center justify-between text-xs text-danger shrink-0">
+          <span className="flex items-center gap-2">
+            <AlertCircle className="w-3.5 h-3.5" />
+            {exportError}
+          </span>
+          <button
+            onClick={() => setExportError(null)}
+            className="p-0.5 rounded hover:bg-danger/20"
+            aria-label="Dismiss export error"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Root Focus Clear Banner (when double-click focused on a sub-neighborhood) */}
       {rootId && (

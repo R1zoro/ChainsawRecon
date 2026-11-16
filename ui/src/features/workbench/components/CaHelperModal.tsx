@@ -24,7 +24,7 @@ export const CaHelperModal: React.FC<CaHelperModalProps> = ({ isOpen, onClose, c
 
   if (!isOpen) return null;
 
-  const caPath = caStatus?.path || 'C:/Users/XYLA/.chainsaw/ca.crt';
+  const caPath = caStatus?.path || '';
 
   const handleCopyPath = () => {
     navigator.clipboard.writeText(caPath);
@@ -70,10 +70,11 @@ export const CaHelperModal: React.FC<CaHelperModalProps> = ({ isOpen, onClose, c
           <div className="p-3 bg-bg rounded-lg border border-border space-y-1.5">
             <span className="text-[10px] uppercase font-mono text-text-muted tracking-wider">CA Certificate File</span>
             <div className="flex items-center justify-between gap-2 bg-surface px-2.5 py-1.5 rounded border border-border font-mono text-xs text-text">
-              <span className="truncate">{caPath}</span>
+              <span className="truncate">{caPath || 'CA certificate has not been generated yet'}</span>
               <button
                 onClick={handleCopyPath}
-                className="flex items-center gap-1 text-[11px] text-accent hover:underline shrink-0"
+                disabled={!caPath}
+                className="flex items-center gap-1 text-[11px] text-accent hover:underline shrink-0 disabled:opacity-40 disabled:no-underline"
               >
                 {copiedPath ? <Check className="w-3.5 h-3.5 text-success" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>{copiedPath ? 'Copied' : 'Copy'}</span>

@@ -1,0 +1,452 @@
+"""Scope-aware local capture proxy.
+
+HTTP requests are forwarded and captured directly. HTTPS requests are tunneled
+with CONNECT, terminated with a per-host certificate signed by the local CA,
+then forwarded and captured. One request/response per connection keeps the
+implementation small and predictable.
+"""
+
+from __future__ import annotations
+
+import socket
+import socketserver
+import ssl
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from .ca import CertificateAuthority
+from .workbench import MAX_STORED_BODY, Flow, ScopePolicy, WorkbenchStore
+
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "expect",
+}
+MAX_HEADER_BYTES = 64 * 1024
+
+
+class ProxyError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _Request:
+    method: str
+    target: str
+    version: str
+    headers: list[tuple[str, str]]
+    body: bytes
+
+    def header(self, name: str, default: str = "") -> str:
+        lowered = name.lower()
+        for key, value in self.headers:
+            if key.lower() == lowered:
+                return value
+        return default
+
+
+class _BufferedSocket:
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buffer = b""
+
+    def read_until(self, marker: bytes, limit: int = MAX_HEADER_BYTES) -> bytes | None:
+        while marker not in self.buffer:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                return None
+            self.buffer += chunk
+            if len(self.buffer) > limit:
+                raise ProxyError("request headers exceed limit")
+        head, self.buffer = self.buffer.split(marker, 1)
+        return head
+
+    def read_exact(self, size: int) -> bytes:
+        while len(self.buffer) < size:
+            chunk = self.sock.recv(max(65536, size - len(self.buffer)))
+            if not chunk:
+                raise ProxyError("unexpected EOF in request body")
+            self.buffer += chunk
+        data, self.buffer = self.buffer[:size], self.buffer[size:]
+        return data
+
+    def read_chunked(self) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            line = self.read_until(b"\r\n")
+            if line is None:
+                raise ProxyError("unexpected EOF in chunked body")
+            size_text = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_text, 16)
+            except ValueError as exc:
+                raise ProxyError("invalid chunk size") from exc
+            if size == 0:
+                self.read_until(b"\r\n")
+                break
+            chunks.append(self.read_exact(size))
+            self.read_exact(2)
+        return b"".join(chunks)
+
+    def read_request(self) -> _Request | None:
+        head = self.read_until(b"\r\n\r\n")
+        if head is None or not head.strip():
+            return None
+        text = head.decode("latin-1")
+        lines = text.split("\r\n")
+        parts = lines[0].split(" ")
+        if len(parts) < 3:
+            raise ProxyError("malformed request line")
+        headers: list[tuple[str, str]] = []
+        for line in lines[1:]:
+            key, sep, value = line.partition(":")
+            if sep:
+                headers.append((key.strip(), value.strip()))
+        probe = _Request(parts[0].upper(), parts[1], parts[2], headers, b"")
+        body = b""
+        if "chunked" in probe.header("transfer-encoding").lower():
+            body = self.read_chunked()
+        else:
+            length_text = probe.header("content-length")
+            if length_text:
+                try:
+                    body = self.read_exact(int(length_text))
+                except ValueError as exc:
+                    raise ProxyError("invalid content-length") from exc
+        return _Request(parts[0].upper(), parts[1], parts[2], headers, body)
+
+
+def _split_host_port(value: str, default_port: int) -> tuple[str, int]:
+    value = value.strip()
+    if value.startswith("["):
+        host, _, rest = value[1:].partition("]")
+        port = int(rest.lstrip(":") or default_port)
+        return host, port
+    if ":" in value:
+        host, _, port_text = value.rpartition(":")
+        if port_text.isdigit():
+            return host, int(port_text)
+    return value, default_port
+
+
+def _target_url(request: _Request, *, scheme: str, tunnel_host: str = "") -> str:
+    if request.target.startswith(("http://", "https://")):
+        return request.target
+    host = tunnel_host or request.header("host")
+    if not host:
+        raise ProxyError("missing Host header")
+    return f"{scheme}://{host}{request.target}"
+
+
+def _headers_dict(headers: list[tuple[str, str]]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in headers:
+        if key.lower() not in HOP_BY_HOP and key.lower() not in {"host", "content-length"}:
+            result[key] = value
+    return result
+
+
+def _write_response(sock: socket.socket, status: int, reason: str, headers: list[tuple[str, str]], body: bytes) -> None:
+    filtered = [
+        (key, value)
+        for key, value in headers
+        if key.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    ]
+    filtered.append(("Content-Length", str(len(body))))
+    filtered.append(("Connection", "close"))
+    head = [f"HTTP/1.1 {status} {reason}", *[f"{key}: {value}" for key, value in filtered], "", ""]
+    sock.sendall("\r\n".join(head).encode("latin-1") + body)
+
+
+class _ProxyHandler(socketserver.BaseRequestHandler):
+    server: _ProxyServer
+
+    def handle(self) -> None:
+        proxy = self.server.capture_proxy
+        sock = self.request
+        sock.settimeout(proxy.timeout)
+        reader = _BufferedSocket(sock)
+        try:
+            request = reader.read_request()
+        except (ProxyError, OSError):
+            return
+        if request is None:
+            return
+        if request.method == "CONNECT":
+            self._handle_connect(proxy, request)
+            return
+        self._handle_http(proxy, sock, request)
+
+    def _handle_connect(self, proxy: CaptureProxy, request: _Request) -> None:
+        try:
+            host, port = _split_host_port(request.target, 443)
+        except ValueError:
+            return
+        try:
+            self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            context = proxy.ca.leaf_context(host)
+            tls_socket = context.wrap_socket(self.request, server_side=True)
+        except (OSError, ssl.SSLError, ValueError):
+            return
+        tls_socket.settimeout(proxy.timeout)
+        try:
+            reader = _BufferedSocket(tls_socket)
+            inner = reader.read_request()
+            if inner is None:
+                return
+            inner.headers.append(("Host", f"{host}:{port}" if port != 443 else host))
+            self._forward(proxy, tls_socket, inner, scheme="https")
+        except (ProxyError, OSError, ssl.SSLError):
+            return
+        finally:
+            try:
+                tls_socket.close()
+            except OSError:
+                pass
+
+    def _handle_http(self, proxy: CaptureProxy, sock: socket.socket, request: _Request) -> None:
+        self._forward(proxy, sock, request, scheme="http")
+
+    def _forward(self, proxy: CaptureProxy, sock: socket.socket, request: _Request, *, scheme: str) -> None:
+        try:
+            url = _target_url(request, scheme=scheme)
+        except ProxyError as exc:
+            _write_response(sock, 400, "Bad Request", [], str(exc).encode())
+            return
+        decision = proxy.policy.check(url)
+        if not decision.allowed:
+            body = f"Blocked by scope: {decision.reason}".encode()
+            self._record(proxy, request, url, 403, {}, body, 0, in_scope=False, tags=["scope-blocked"])
+            _write_response(sock, 403, "Forbidden", [("Content-Type", "text/plain")], body)
+            return
+
+        headers = _headers_dict(request.headers)
+        started = time.perf_counter()
+        try:
+            with httpx.Client(
+                follow_redirects=False,
+                timeout=proxy.timeout,
+                trust_env=False,
+                verify=proxy.verify_upstream,
+            ) as client:
+                response = client.request(
+                    request.method,
+                    url,
+                    headers=headers,
+                    content=request.body or None,
+                )
+        except httpx.HTTPError as exc:
+            body = f"Upstream request failed: {exc.__class__.__name__}".encode()
+            self._record(proxy, request, url, 502, {}, body, 0, in_scope=True, tags=["proxy-error"])
+            _write_response(sock, 502, "Bad Gateway", [("Content-Type", "text/plain")], body)
+            return
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        full_content = response.content
+        stored_content = full_content[:MAX_STORED_BODY]
+        response_headers = {str(key): str(value) for key, value in response.headers.items()}
+        self._record(
+            proxy,
+            request,
+            url,
+            response.status_code,
+            response_headers,
+            stored_content,
+            duration_ms,
+            in_scope=True,
+            tags=["proxy"],
+        )
+        _write_response(
+            sock,
+            response.status_code,
+            response.reason_phrase,
+            list(response.headers.multi_items()),
+            full_content,
+        )
+
+    def _record(
+        self,
+        proxy: CaptureProxy,
+        request: _Request,
+        url: str,
+        status: int,
+        response_headers: dict[str, str],
+        response_body: bytes,
+        duration_ms: int,
+        *,
+        in_scope: bool,
+        tags: list[str],
+    ) -> None:
+        flow = Flow(
+            id="req_" + uuid.uuid4().hex[:24],
+            project_id=proxy.project_id,
+            method=request.method,
+            url=url,
+            host="",
+            path="",
+            status=status,
+            request_headers={key: value for key, value in request.headers},
+            request_body=request.body.decode("utf-8", errors="replace")[:MAX_STORED_BODY],
+            response_headers=response_headers,
+            response_body=response_body.decode("utf-8", errors="replace"),
+            size_bytes=len(response_body),
+            duration_ms=duration_ms,
+            auth_context="",
+            tags=tags,
+            in_scope=in_scope,
+            source="capture",
+        )
+        try:
+            with WorkbenchStore(proxy.db_path, proxy.project_id) as store:
+                store.add_flow(flow)
+        except Exception:
+            return
+
+
+class _ProxyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    capture_proxy: CaptureProxy
+
+
+class CaptureProxy:
+    def __init__(
+        self,
+        *,
+        project_path: Path,
+        project_id: str,
+        policy: ScopePolicy,
+        ca: CertificateAuthority,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        timeout: float = 30.0,
+        verify_upstream: bool = True,
+    ) -> None:
+        self.project_path = project_path
+        self.project_id = project_id
+        self.policy = policy
+        self.ca = ca
+        self.host = host
+        self.requested_port = port
+        self.timeout = timeout
+        self.verify_upstream = verify_upstream
+        self.db_path = project_path / ".chainsaw" / "workbench.db"
+        self._server: _ProxyServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        if self._server is None:
+            return self.requested_port
+        return int(self._server.server_address[1])
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        server = _ProxyServer((self.host, self.requested_port), _ProxyHandler)
+        server.capture_proxy = self
+        self._server = server
+        self._thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        server, thread = self._server, self._thread
+        self._server = None
+        self._thread = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3)
+
+    def status(self) -> dict[str, Any]:
+        captured = 0
+        try:
+            with WorkbenchStore(self.db_path, self.project_id) as store:
+                _, captured = store.list_flows(limit=1, offset=0)
+        except Exception:
+            pass
+        return {
+            "running": self.running,
+            "projectId": self.project_id,
+            "host": self.host,
+            "port": self.port,
+            "proxyUrl": f"http://{self.host}:{self.port}",
+            "caPath": str(self.ca.cert_path) if self.ca.exists() else None,
+            "captured": captured,
+            "verifyUpstream": self.verify_upstream,
+        }
+
+
+class ProxyManager:
+    def __init__(self, ca_root: Path) -> None:
+        self.ca_root = ca_root
+        self._proxies: dict[str, CaptureProxy] = {}
+        self._lock = threading.Lock()
+
+    def start(
+        self,
+        *,
+        project_path: Path,
+        project_id: str,
+        policy: ScopePolicy,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        verify_upstream: bool = True,
+    ) -> dict[str, Any]:
+        with self._lock:
+            existing = self._proxies.get(project_id)
+            if existing is not None and existing.running:
+                return existing.status()
+            ca = CertificateAuthority(self.ca_root / "ca").ensure()
+            proxy = CaptureProxy(
+                project_path=project_path,
+                project_id=project_id,
+                policy=policy,
+                ca=ca,
+                host=host,
+                port=port,
+                verify_upstream=verify_upstream,
+            )
+            proxy.start()
+            self._proxies[project_id] = proxy
+            return proxy.status()
+
+    def stop(self, project_id: str) -> dict[str, Any]:
+        with self._lock:
+            proxy = self._proxies.pop(project_id, None)
+        if proxy is None:
+            return {"running": False, "projectId": project_id}
+        status = proxy.status()
+        proxy.stop()
+        return {**status, "running": False}
+
+    def status(self, project_id: str) -> dict[str, Any]:
+        proxy = self._proxies.get(project_id)
+        if proxy is None:
+            return {"running": False, "projectId": project_id}
+        return proxy.status()
+
+    def stop_all(self) -> None:
+        with self._lock:
+            proxies = list(self._proxies.values())
+            self._proxies.clear()
+        for proxy in proxies:
+            proxy.stop()

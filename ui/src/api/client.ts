@@ -208,6 +208,30 @@ export async function fetchJson<T>(path: string, options: RequestInit = {}): Pro
     if (urlPath === '/workbench/ca' && method === 'GET') {
       return mockService.fetchCaStatus() as unknown as T;
     }
+    // ── Milestone 4: Findings Routes ─────────────────────────────
+    if (urlPath === '/findings' && method === 'GET') {
+      const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
+      const params = new URLSearchParams(search);
+      const projectId = params.get('projectId') || undefined;
+      const sessionId = params.get('sessionId') || undefined;
+      const state = params.get('state') || undefined;
+      const severity = params.get('severity') || undefined;
+      const q = params.get('q') || undefined;
+      const limit = params.has('limit') ? parseInt(params.get('limit')!, 10) : undefined;
+      const offset = params.has('offset') ? parseInt(params.get('offset')!, 10) : undefined;
+      return mockService.fetchFindings({ projectId, sessionId, state, severity, q, limit, offset }) as unknown as T;
+    }
+    if (urlPath.startsWith('/findings/') && urlPath.endsWith('/transition') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const findingId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.transitionFinding(findingId, payload) as unknown as T;
+    }
+    if (urlPath.startsWith('/findings/') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const findingId = parts[2];
+      return mockService.fetchFindingDetail(findingId) as unknown as T;
+    }
     if (urlPath.startsWith('/projects/') && method === 'GET') {
       const parts = urlPath.split('/');
       const projectId = parts[2];

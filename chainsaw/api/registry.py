@@ -9,6 +9,7 @@ from typing import Any
 from ..appmodel import AppModel
 from ..journal import JournalWriter, read_journal
 from ..projection import SessionProjection
+from ..workbench import FlowNotFound, ScopePolicy, WorkbenchStore
 from ..workspace import (
     ChainsawHome,
     ProjectMeta,
@@ -186,6 +187,59 @@ class ProjectRegistry:
         project = self.get(project_id)
         return AppModel(project.path / ".chainsaw" / "knowledge.db", project.id)
 
+    def workbench(self, project_id: str) -> WorkbenchStore:
+        project = self.get(project_id)
+        return WorkbenchStore(project.path / ".chainsaw" / "workbench.db", project.id)
+
+    def scope_policy(self, project_id: str) -> ScopePolicy:
+        project = self.get(project_id)
+        return ScopePolicy.from_project(project.path)
+
+    def workbench_artifact_dir(self, project_id: str) -> Path:
+        project = self.get(project_id)
+        path = project.path / ".chainsaw" / "artifacts"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def find_flow(self, flow_id: str) -> tuple[ProjectMeta, WorkbenchStore]:
+        for summary in self.list_projects():
+            project = self.get(str(summary["id"]))
+            store = WorkbenchStore(project.path / ".chainsaw" / "workbench.db", project.id)
+            if store.get_flow(flow_id) is not None:
+                return project, store
+            store.close()
+        raise FlowNotFound(flow_id)
+
+    def record_evidence_event(self, session_id: str, evidence: dict[str, Any]) -> None:
+        """Mirror a workbench evidence row into the session journal/projection."""
+
+        _, paths, _ = self.find_session(session_id)
+        writer = JournalWriter(paths.journal_file, session_id)
+        writer.append(
+            "evidence/recorded",
+            {
+                "kind": evidence.get("kind", "http_pair"),
+                "summary": evidence.get("summary", ""),
+                "artifactId": evidence.get("artifactId", ""),
+                "hash": evidence.get("hash", ""),
+                "taskId": evidence.get("taskId") or None,
+                "hypothesisId": evidence.get("hypothesisId") or None,
+                "requestId": evidence.get("requestId") or None,
+                "responseId": evidence.get("responseId") or None,
+            },
+            actor="tool",
+            refs={
+                "evidence_id": str(evidence["id"]),
+                "task_id": str(evidence.get("taskId") or ""),
+                "hypothesis_id": str(evidence.get("hypothesisId") or ""),
+            },
+        )
+        projection = SessionProjection(paths.root / "state.db", session_id)
+        try:
+            projection.sync(paths.journal_file)
+        finally:
+            projection.close()
+
     def sessions(self, project_id: str) -> list[SessionMeta]:
         project = self.get(project_id)
         return list_sessions(project.path)
@@ -210,6 +264,17 @@ class ProjectRegistry:
             targets=payload.targets,
         )
         return self.session_summary(meta, paths)
+
+    def provider_entry(self, provider_id: str = "") -> dict[str, Any] | None:
+        for entry in self.providers.list():
+            if not provider_id:
+                return entry
+            if provider_id in {
+                str(entry.get("id", "")),
+                str(entry.get("name", "")),
+            }:
+                return entry
+        return None
 
     def project_summary(self, meta: ProjectMeta) -> dict[str, Any]:
         sessions = list_sessions(meta.path)
@@ -376,6 +441,134 @@ class ProjectRegistry:
             return projection.evidence()
         finally:
             projection.close()
+
+    def findings(
+        self,
+        *,
+        project_id: str = "",
+        session_id: str = "",
+        state: str = "",
+        severity: str = "",
+        query: str = "",
+    ) -> list[dict[str, Any]]:
+        sessions: list[tuple[ProjectMeta, SessionMeta]] = []
+        if session_id:
+            project, _, meta = self.find_session(session_id)
+            sessions.append((project, meta))
+        else:
+            for summary in self.list_projects():
+                project = self.get(str(summary["id"]))
+                if project_id and project.id != project_id:
+                    continue
+                sessions.extend((project, meta) for meta in list_sessions(project.path))
+        items: list[dict[str, Any]] = []
+        needle = query.lower()
+        for project, meta in sessions:
+            projection = SessionProjection(
+                project.path / ".chainsaw" / "sessions" / meta.id / "state.db",
+                meta.id,
+            )
+            try:
+                projection.sync(project.path / ".chainsaw" / "sessions" / meta.id / "journal.jsonl")
+                for item in projection.findings():
+                    if state and item.get("state") != state:
+                        continue
+                    if severity and item.get("severity") != severity:
+                        continue
+                    if needle and not any(
+                        needle in str(item.get(key, "")).lower()
+                        for key in ("title", "asset", "severity", "state")
+                    ):
+                        continue
+                    items.append(
+                        {
+                            **item,
+                            "projectId": project.id,
+                            "sessionId": meta.id,
+                        }
+                    )
+            finally:
+                projection.close()
+        items.sort(key=lambda item: str(item.get("updatedAt", "")), reverse=True)
+        return items
+
+    def find_finding(
+        self, finding_id: str
+    ) -> tuple[ProjectMeta, SessionMeta, dict[str, Any]]:
+        for summary in self.list_projects():
+            project = self.get(str(summary["id"]))
+            for meta in list_sessions(project.path):
+                paths = SessionPaths(project.path / ".chainsaw" / "sessions" / meta.id)
+                projection = SessionProjection(paths.root / "state.db", meta.id)
+                try:
+                    projection.sync(paths.journal_file)
+                    match = next(
+                        (item for item in projection.findings() if item["id"] == finding_id),
+                        None,
+                    )
+                finally:
+                    projection.close()
+                if match is not None:
+                    return project, meta, match
+        raise ProjectNotFoundError(f"finding not found: {finding_id}")
+
+    def transition_finding(
+        self,
+        finding_id: str,
+        *,
+        state: str,
+        reason: str,
+        evidence_ids: list[str],
+    ) -> dict[str, Any]:
+        if state not in {"candidate", "validated", "rejected"}:
+            raise ValueError("finding state must be candidate, validated, or rejected")
+        project, meta, finding = self.find_finding(finding_id)
+        current = str(finding.get("state", "candidate"))
+        allowed = {
+            "candidate": {"validated", "rejected"},
+            "validated": {"rejected"},
+            "rejected": {"candidate"},
+        }
+        if state == current:
+            return {**finding, "projectId": project.id, "sessionId": meta.id}
+        if state not in allowed.get(current, set()):
+            raise ValueError(f"invalid finding transition: {current} -> {state}")
+        linked = evidence_ids or list(finding.get("evidenceIds") or [])
+        if state == "validated":
+            known = {item["id"] for item in self.evidence(meta.id)}
+            if not (set(linked) & known):
+                raise ValueError(
+                    "a validated finding requires at least one recorded evidence id"
+                )
+        paths = SessionPaths(project.path / ".chainsaw" / "sessions" / meta.id)
+        writer = JournalWriter(paths.journal_file, meta.id)
+        writer.append(
+            f"finding/{state}",
+            {
+                "title": finding.get("title", ""),
+                "severity": finding.get("severity", ""),
+                "state": state,
+                "asset": finding.get("asset", ""),
+                "evidenceIds": linked,
+                "reason": reason,
+            },
+            actor="operator",
+            refs={
+                "finding_id": finding_id,
+                "hypothesis_id": str(finding.get("hypothesisId") or ""),
+                **({"evidence_id": linked[0]} if linked else {}),
+            },
+        )
+        projection = SessionProjection(paths.root / "state.db", meta.id)
+        try:
+            projection.sync(paths.journal_file)
+            updated = next(
+                (item for item in projection.findings() if item["id"] == finding_id),
+                {**finding, "state": state},
+            )
+        finally:
+            projection.close()
+        return {**updated, "projectId": project.id, "sessionId": meta.id}
 
     def context(self, session_id: str) -> list[dict[str, Any]]:
         projection = self.projection(session_id)

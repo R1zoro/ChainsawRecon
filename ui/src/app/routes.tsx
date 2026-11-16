@@ -4,6 +4,7 @@ import { EngagementWizardPage } from '../features/engagement-wizard/EngagementWi
 import { SessionWorkspacePage } from '../features/sessions/SessionWorkspacePage';
 import { ProjectOverviewPage } from '../features/app-model/ProjectOverviewPage';
 import { WorkbenchPage } from '../features/workbench/WorkbenchPage';
+import { FindingsPage } from '../features/findings/FindingsPage';
 import { RoutePlaceholder } from '../components/common/RoutePlaceholder';
 
 export const router = createBrowserRouter([
@@ -18,6 +19,18 @@ export const router = createBrowserRouter([
   {
     path: '/projects/:projectId',
     element: <ProjectOverviewPage />,
+  },
+  {
+    path: '/projects/:projectId/findings',
+    element: <FindingsPage />,
+  },
+  {
+    path: '/projects/:projectId/findings/:findingId',
+    element: <FindingsPage />,
+  },
+  {
+    path: '/findings',
+    element: <FindingsPage />,
   },
   {
     path: '/projects/:projectId/workbench',

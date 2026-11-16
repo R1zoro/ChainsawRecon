@@ -1,13 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { BookmarkPlus, X, Check } from 'lucide-react';
-import { CapturedRequest } from '../../../api/types';
-import { fetchJson } from '../../../api/client';
+import { useQuery } from '@tanstack/react-query';
+import { BookmarkPlus, X, Check, AlertCircle } from 'lucide-react';
+import { CapturedRequest, Paginated } from '../../../api/types';
+import { fetchJson, isApiError } from '../../../api/client';
 
 interface SaveEvidenceModalProps {
   isOpen: boolean;
   onClose: () => void;
   request: CapturedRequest | null;
   onSaved: (evidenceId: string) => void;
+  projectId?: string;
+  sessionId?: string;
 }
 
 export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
@@ -15,15 +18,33 @@ export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
   onClose,
   request,
   onSaved,
+  projectId,
+  sessionId,
 }) => {
-  const [hypothesisId, setHypothesisId] = useState('hyp_01');
-  const [taskId, setTaskId] = useState('tsk_idor_01');
+  const [selectedFindingId, setSelectedFindingId] = useState('');
+  const [selectedTaskId, setSelectedTaskId] = useState('');
   const [note, setNote] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Query findings for the project to link evidence
+  const { data: findingsData } = useQuery({
+    queryKey: ['findings', projectId],
+    queryFn: () => fetchJson<Paginated<{ id: string; title: string; severity: string }>>(`/findings${projectId ? `?projectId=${projectId}` : ''}`),
+    enabled: Boolean(isOpen),
+  });
+
+  // Query tasks for active session if available
+  const { data: tasksData } = useQuery({
+    queryKey: ['sessionTasks', sessionId],
+    queryFn: () => fetchJson<Paginated<{ id: string; title: string; kind: string }>>(`/sessions/${sessionId}/tasks`),
+    enabled: Boolean(isOpen && sessionId),
+  });
 
   useEffect(() => {
     if (isOpen && request) {
       setNote(`Observed HTTP ${request.method} ${request.path} [${request.status}]: confirmed behavior.`);
+      setSaveError(null);
     }
   }, [isOpen, request]);
 
@@ -42,6 +63,7 @@ export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
+    setSaveError(null);
     try {
       const res = await fetchJson<{ id: string }>('/workbench/evidence', {
         method: 'POST',
@@ -49,19 +71,23 @@ export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
         body: JSON.stringify({
           requestId: request.id,
           responseId: `resp_${request.id}`,
-          hypothesisId,
-          taskId: taskId || undefined,
+          hypothesisId: undefined, // Hypotheses not yet implemented (Phase 3)
+          findingId: selectedFindingId || undefined,
+          taskId: selectedTaskId || undefined,
           note,
         }),
       });
       onSaved(res.id);
       onClose();
-    } catch {
-      // Handled
+    } catch (err) {
+      setSaveError(isApiError(err) ? err.message : 'Failed to save evidence artifact.');
     } finally {
       setIsSubmitting(false);
     }
   };
+
+  const findingsList = findingsData?.items || [];
+  const tasksList = tasksData?.items || [];
 
   return (
     <div 
@@ -82,7 +108,7 @@ export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
                 Save as Artifact Evidence
               </h3>
               <p className="text-[11px] text-text-muted">
-                Pin HTTP capture to project hypotheses and audit trails
+                Pin HTTP capture to project findings and audit trails
               </p>
             </div>
           </div>
@@ -97,6 +123,16 @@ export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
 
         {/* Form Body */}
         <form onSubmit={handleSubmit} className="p-5 space-y-4 text-xs">
+          {saveError && (
+            <div className="bg-danger/15 border border-danger/30 rounded-lg p-2.5 flex items-start gap-2 text-danger font-mono text-xs">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Evidence Save Failed</p>
+                <p className="text-[11px] text-danger/80 pt-0.5">{saveError}</p>
+              </div>
+            </div>
+          )}
+
           {/* Target Request Info */}
           <div className="p-3 bg-bg rounded-lg border border-border font-mono text-[11px] space-y-1">
             <span className="text-[10px] text-text-muted uppercase">Captured Target</span>
@@ -107,30 +143,54 @@ export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
             </div>
           </div>
 
-          {/* Hypothesis Select */}
+          {/* Hypothesis Select - Disabled with honest state */}
           <div className="space-y-1">
-            <label className="text-xs font-medium text-text">Link to Hypothesis</label>
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-medium text-text">Link to Hypothesis</label>
+              <span className="text-[10px] text-text-muted font-mono bg-surface-2 px-1.5 py-0.5 rounded border border-border">
+                Not available yet (Phase 3)
+              </span>
+            </div>
             <select
-              value={hypothesisId}
-              onChange={(e) => setHypothesisId(e.target.value)}
-              className="w-full bg-bg border border-border rounded-lg px-2.5 py-1.5 text-xs text-text focus:outline-none focus:border-accent font-sans"
+              value=""
+              disabled
+              className="w-full bg-bg/50 border border-border/60 rounded-lg px-2.5 py-1.5 text-xs text-text-muted font-sans cursor-not-allowed opacity-75"
             >
-              <option value="hyp_01">hyp_01: Cross-tenant IDOR on /invoices</option>
-              <option value="hyp_02">hyp_02: Broken Object Level Authorization on /users</option>
-              <option value="hyp_03">hyp_03: Unauthenticated state-changing refund</option>
+              <option value="">(Hypothesis tracking not yet available)</option>
             </select>
           </div>
 
-          {/* Task Select */}
+          {/* Finding Picker */}
+          <div className="space-y-1">
+            <label className="text-xs font-medium text-text">Associated Finding (Optional)</label>
+            <select
+              value={selectedFindingId}
+              onChange={(e) => setSelectedFindingId(e.target.value)}
+              className="w-full bg-bg border border-border rounded-lg px-2.5 py-1.5 text-xs text-text focus:outline-none focus:border-accent font-sans"
+            >
+              <option value="">None / Standalone Evidence</option>
+              {findingsList.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.id}: {f.title} ({f.severity})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Task Select Picker */}
           <div className="space-y-1">
             <label className="text-xs font-medium text-text">Associated Task (Optional)</label>
             <select
-              value={taskId}
-              onChange={(e) => setTaskId(e.target.value)}
+              value={selectedTaskId}
+              onChange={(e) => setSelectedTaskId(e.target.value)}
               className="w-full bg-bg border border-border rounded-lg px-2.5 py-1.5 text-xs text-text focus:outline-none focus:border-accent font-sans"
             >
-              <option value="tsk_idor_01">tsk_idor_01: IDOR verification sweep</option>
               <option value="">None / Manual Analysis</option>
+              {tasksList.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.id}: {t.title} ({t.kind})
+                </option>
+              ))}
             </select>
           </div>
 
@@ -141,7 +201,7 @@ export const SaveEvidenceModal: React.FC<SaveEvidenceModalProps> = ({
               value={note}
               onChange={(e) => setNote(e.target.value)}
               rows={3}
-              placeholder="Detail the significance of this request/response for the final report..."
+              placeholder="Detail the significance of this request/response for the audit trail..."
               className="w-full bg-bg border border-border rounded-lg p-2.5 text-xs text-text placeholder:text-text-muted/60 focus:outline-none focus:border-accent font-sans"
             />
           </div>

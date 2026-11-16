@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Plus, X, Layers, AlertCircle, BookmarkPlus, Check, Copy, Send } from 'lucide-react';
 import { CapturedRequest, ReplayResult } from '../../../api/types';
-import { fetchJson } from '../../../api/client';
+import { fetchJson, isApiError } from '../../../api/client';
 import { RepeaterRequestEditor, EditableRequest } from './RepeaterRequestEditor';
 import { ScopeGateConfirmationModal } from './ScopeGateConfirmationModal';
 
@@ -17,6 +17,7 @@ export interface RepeaterTab {
 
 interface RepeaterWorkspaceProps {
   tabs: RepeaterTab[];
+  projectId: string;
   activeTabId: string;
   onSelectTab: (id: string) => void;
   onAddTab: () => void;
@@ -28,6 +29,7 @@ interface RepeaterWorkspaceProps {
 
 export const RepeaterWorkspace: React.FC<RepeaterWorkspaceProps> = ({
   tabs,
+  projectId,
   activeTabId,
   onSelectTab,
   onAddTab,
@@ -39,6 +41,7 @@ export const RepeaterWorkspace: React.FC<RepeaterWorkspaceProps> = ({
   const [isGateOpen, setIsGateOpen] = useState(false);
   const [pendingSendTabId, setPendingSendTabId] = useState<string | null>(null);
   const [copiedBody, setCopiedBody] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
 
@@ -58,14 +61,18 @@ export const RepeaterWorkspace: React.FC<RepeaterWorkspaceProps> = ({
     executeReplay(tabId);
   };
 
-  const executeReplay = async (tabId: string, _justification?: string) => {
+  const executeReplay = async (tabId: string, justification?: string) => {
     const tab = tabs.find((t) => t.id === tabId);
     if (!tab) return;
+    setReplayError(null);
 
     try {
       const headersMap: Record<string, string> = {};
       tab.editableRequest.headers.forEach((h) => {
-        if (h.key) headersMap[h.key] = h.value;
+        // Omit redacted sensitive headers from replay patch so backend does not receive literal placeholder tokens
+        if (h.key && !h.value.includes('«redacted»')) {
+          headersMap[h.key] = h.value;
+        }
       });
 
       const queryMap: Record<string, string> = {};
@@ -73,25 +80,31 @@ export const RepeaterWorkspace: React.FC<RepeaterWorkspaceProps> = ({
         if (q.key) queryMap[q.key] = q.value;
       });
 
-      const patch = {
+      const patch: Record<string, unknown> = {
         header: headersMap,
         query: queryMap,
         path: new URL(tab.editableRequest.url || 'https://api.example.com').pathname,
         json: tab.editableRequest.body ? JSON.parse(tab.editableRequest.body) : undefined,
       };
+      if (!tab.editableRequest.baselineId) {
+        patch.url = tab.editableRequest.url;
+        patch.method = tab.editableRequest.method;
+      }
 
       const result = await fetchJson<ReplayResult>('/workbench/replay', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           requestId: tab.editableRequest.baselineId || tab.editableRequest.id,
+          projectId,
           patch,
+          justification,
         }),
       });
 
       onTabReplayed(tabId, result);
-    } catch {
-      // Replay failure handled gracefully
+    } catch (err) {
+      setReplayError(isApiError(err) ? err.message : 'Replay failed.');
     }
   };
 
@@ -192,6 +205,17 @@ export const RepeaterWorkspace: React.FC<RepeaterWorkspaceProps> = ({
               </button>
             )}
           </div>
+
+          {/* Replay Error */}
+          {replayError && (
+            <div className="bg-danger/15 border-b border-danger/30 p-3 flex items-start gap-2 text-danger font-mono text-xs">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Replay Failed</p>
+                <p className="text-[11px] text-danger/80 pt-0.5">{replayError}</p>
+              </div>
+            </div>
+          )}
 
           {/* Scope Blocked Warning */}
           {activeTab.replayResult && !activeTab.replayResult.scope.allowed && (

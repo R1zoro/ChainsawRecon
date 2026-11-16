@@ -60,11 +60,11 @@ the current tree yet.
 |---|---|---|
 | CLI agent loop | ✅ legacy | replaced by deterministic controller |
 | Scope guard / sandboxed tools | ✅ legacy | native OS sandbox + optional container |
-| Journal / application model | 🟡 in progress | append-only journal + revisioned graph |
-| Multi-model role routing | 🟡 in progress | per-role provider/model selection |
-| Native HTTP workbench | ⏳ planned | capture/replay/diff/evidence |
+| Journal / application model | 🟢 journal, projection, app model | append-only journal + revisioned graph |
+| Multi-model role routing | 🟢 routing + context budgets | per-role provider/model selection |
+| Native HTTP workbench | 🟢 HTTP/HTTPS capture, replay, diff, evidence | proxy hardening + WebSockets |
 | Auth profiles / embedded auth browser | ⏳ planned | handover, sessions, multi-identity |
-| Desktop UI (Tauri) | ⏳ planned | project/session workspace |
+| Desktop UI (Tauri) | 🟡 React UI, M3 accepted | project/session workspace |
 
 ### v2 core already in the tree
 
@@ -77,13 +77,24 @@ the current tree yet.
   and context.
 - `chainsaw/runtime.py` — deterministic task lifecycle, approvals, observations, evidence, findings,
   and context events (the write seam for the controller).
+- `chainsaw/controller.py` — one-decision supervisor tick, bounded orchestrator/operator packets,
+  and a single-action executor that records evidence and advances task state.
+- `chainsaw/providers.py` — OpenAI-compatible chat/model client with retries, auth handling, and
+  safe JSON extraction.
+- `chainsaw/runner.py` — provider-backed supervisor/operator loop with bounded steps and task
+  failure recording.
+- `chainsaw/workbench.py` — native HTTP flow store, scope-gated replay, line diff, hashed evidence
+  artifacts, HAR/Burp import, HAR/JSONL export, CA status.
+- `chainsaw/ca.py` — local root CA and per-host leaf certificates for HTTPS interception.
+- `chainsaw/proxy.py` — scope-aware HTTP/HTTPS capture proxy with CONNECT/TLS termination.
 - `chainsaw/appmodel.py` — project-wide revisioned application model (apps, services, routes,
-  inputs, identities, technologies, findings, edges, notes).
+  inputs, identities, technologies, findings, edges, notes), plus a coverage ledger and hierarchical
+  sitemap projection.
 - `chainsaw/workspace.py` — global home, project layout, session layout, session creation.
 - `chainsaw/toolpacks.py` — pinned manifests, checksum-verified install plans, tool-pack status.
-- `chainsaw/api/` — local FastAPI/WebSocket API for projects, sessions, journal, providers, and
-  runtime placeholders.
-- `ui/` — Ready State UI; M0 review is in progress.
+- `chainsaw/api/` — local FastAPI/WebSocket API for projects, sessions, journal, providers,
+  application model, workbench, and runtime projections.
+- `ui/` — React UI; M2 app model and M3 workbench are accepted.
 
 ---
 
@@ -217,10 +228,13 @@ uv run chainsaw-serve
 ```
 
 The API currently provides project/session creation, the append-only journal, run controls, provider
-registration, a rebuildable projection for tasks/approvals/evidence/findings/context, and a
-project-wide application model (apps, services, routes, inputs, identities, technologies, edges).
-The runtime that produces those events is the next milestone. It is local-only and intended for the
-desktop UI.
+registration, a rebuildable projection for tasks/approvals/evidence/findings/context, a project-wide
+application model (apps, services, routes, inputs, identities, technologies, edges), the native
+workbench (history, request detail, scope-gated replay, compare, evidence, HAR/Burp import,
+HAR/JSONL export, HTTP/HTTPS capture proxy and local CA), findings list/detail/transition backed by
+session projections, and a provider-backed session runner (`POST /sessions/{id}/run`) that drives
+the deterministic supervisor/executor loop. Report generation, WebSocket capture, and the embedded
+auth browser are the next milestone. It is local-only and intended for the desktop UI.
 
 ---
 
@@ -232,6 +246,7 @@ ChainsawRecon v2 uses a project/session model:
 ~/.chainsawrecon/                 # global: providers, credentials, tool packs, index
   config.json
   credentials.json
+  ca/                             # local proxy CA (key + certificate)
   providers/
   tools/
   index.db
@@ -241,6 +256,8 @@ ChainsawRecon v2 uses a project/session model:
     project.json
     scope/
     knowledge.db                  # application model + validated findings
+    workbench.db                  # captured/imported/replayed HTTP flows
+    artifacts/                    # redacted evidence artifacts
     catalogs/
     reports/
     sessions/

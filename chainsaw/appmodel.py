@@ -23,6 +23,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+COVERAGE_OUTCOMES = {
+    "reported",
+    "no_issue_found",
+    "ruled_out",
+    "not_applicable",
+    "needs_follow_up",
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -127,10 +135,19 @@ class AppModel:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id TEXT NOT NULL,
                 content TEXT NOT NULL, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_coverage(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL, surface TEXT NOT NULL, risk_area TEXT NOT NULL,
+                outcome TEXT NOT NULL, evidence_id TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '', worker TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(entity_id, surface, risk_area)
+            );
             CREATE INDEX IF NOT EXISTS idx_app_entities_kind ON app_entities(kind);
             CREATE INDEX IF NOT EXISTS idx_app_entities_last ON app_entities(last_seen);
             CREATE INDEX IF NOT EXISTS idx_app_edges_source ON app_edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_app_edges_target ON app_edges(target_id);
+            CREATE INDEX IF NOT EXISTS idx_app_coverage_entity ON app_coverage(entity_id);
             """
         )
         self.conn.commit()
@@ -397,6 +414,119 @@ class AppModel:
             meta=_loads(row[9]),
         )
 
+    # ── coverage ledger ───────────────────────────────────────────────
+
+    def record_coverage(
+        self,
+        entity_id: str,
+        *,
+        risk_area: str,
+        outcome: str,
+        surface: str = "",
+        evidence_id: str = "",
+        reason: str = "",
+        worker: str = "",
+    ) -> dict[str, Any]:
+        entity = self.get(entity_id)
+        if entity is None:
+            raise KeyError(f"entity not found: {entity_id}")
+        outcome = outcome.strip().lower()
+        if outcome not in COVERAGE_OUTCOMES:
+            raise ValueError(
+                "coverage outcome must be one of " + ", ".join(sorted(COVERAGE_OUTCOMES))
+            )
+        risk_area = risk_area.strip().lower()
+        if not risk_area:
+            raise ValueError("risk_area is required")
+        surface = surface.strip() or entity.name
+        now = _now()
+        self.conn.execute(
+            "INSERT INTO app_coverage(project_id,entity_id,surface,risk_area,outcome,"
+            "evidence_id,reason,worker,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(entity_id,surface,risk_area) DO UPDATE SET outcome=excluded.outcome,"
+            "evidence_id=excluded.evidence_id,reason=excluded.reason,worker=excluded.worker,"
+            "updated_at=excluded.updated_at",
+            (
+                self.project_id,
+                entity_id,
+                surface,
+                risk_area,
+                outcome,
+                evidence_id,
+                reason,
+                worker,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT id,entity_id,surface,risk_area,outcome,evidence_id,reason,worker,"
+            "created_at,updated_at FROM app_coverage WHERE entity_id=? AND surface=? AND risk_area=?",
+            (entity_id, surface, risk_area),
+        ).fetchone()
+        return self._coverage_row(row) if row else {}
+
+    def coverage_for(self, entity_id: str) -> dict[str, Any]:
+        rows = self.conn.execute(
+            "SELECT id,entity_id,surface,risk_area,outcome,evidence_id,reason,worker,"
+            "created_at,updated_at FROM app_coverage WHERE project_id=? AND entity_id=? "
+            "ORDER BY updated_at DESC",
+            (self.project_id, entity_id),
+        ).fetchall()
+        return self._coverage_payload([self._coverage_row(row) for row in rows])
+
+    def coverage_summary(self) -> dict[str, Any]:
+        rows = self.conn.execute(
+            "SELECT id,entity_id,surface,risk_area,outcome,evidence_id,reason,worker,"
+            "created_at,updated_at FROM app_coverage WHERE project_id=? ORDER BY updated_at DESC",
+            (self.project_id,),
+        ).fetchall()
+        entries = [self._coverage_row(row) for row in rows]
+        outcomes: dict[str, int] = {}
+        gaps: list[dict[str, Any]] = []
+        for entry in entries:
+            outcome = str(entry["outcome"])
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            if outcome == "needs_follow_up":
+                gaps.append({"kind": "needs_follow_up", **entry})
+            elif outcome == "no_issue_found" and not entry["evidenceId"]:
+                gaps.append({"kind": "missing_evidence", **entry})
+            elif outcome in {"ruled_out", "not_applicable"} and not entry["reason"]:
+                gaps.append({"kind": "missing_reason", **entry})
+        return {
+            "entries": len(entries),
+            "tested": len({entry["entityId"] for entry in entries}),
+            "outcomes": outcomes,
+            "gaps": gaps,
+        }
+
+    def _coverage_row(self, row: Any) -> dict[str, Any]:
+        return {
+            "id": row[0],
+            "entityId": row[1],
+            "surface": row[2],
+            "riskArea": row[3],
+            "outcome": row[4],
+            "evidenceId": row[5],
+            "reason": row[6],
+            "worker": row[7],
+            "createdAt": row[8],
+            "updatedAt": row[9],
+        }
+
+    def _coverage_payload(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        outcomes: dict[str, int] = {}
+        for entry in entries:
+            outcome = str(entry["outcome"])
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        return {
+            "tested": bool(entries),
+            "outcomes": outcomes,
+            "lastTestedAt": max((str(entry["updatedAt"]) for entry in entries), default=None),
+            "entries": entries,
+        }
+
     def list_entities(
         self,
         *,
@@ -425,7 +555,50 @@ class AppModel:
         )
         params.extend([limit, offset])
         rows = self.conn.execute(sql, params).fetchall()
-        return [self._row_to_dict(row, older_than_days) for row in rows]
+        items = [self._row_to_dict(row, older_than_days) for row in rows]
+        return self._attach_coverage(items)
+
+    def _attach_coverage(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not items:
+            return items
+        coverage: dict[str, dict[str, Any]] = {}
+        for row in self.conn.execute(
+            "SELECT id,entity_id,surface,risk_area,outcome,evidence_id,reason,worker,"
+            "created_at,updated_at FROM app_coverage WHERE project_id=?",
+            (self.project_id,),
+        ):
+            entry = self._coverage_row(row)
+            coverage.setdefault(str(entry["entityId"]), {}).setdefault("entries", []).append(entry)
+        findings = [item for item in items if item["kind"] == "finding"]
+        for item in items:
+            payload = self._coverage_payload(list(coverage.get(item["id"], {}).get("entries", [])))
+            finding_count = self._finding_count(item, findings)
+            if finding_count:
+                payload["tested"] = True
+            item["coverage"] = payload
+            item["findingCount"] = finding_count
+        return items
+
+    def _finding_count(self, entity: dict[str, Any], findings: list[dict[str, Any]]) -> int:
+        if entity["kind"] == "finding":
+            return 0
+        keys = [str(entity.get("name", ""))]
+        meta = entity.get("meta") or {}
+        for key in ("url", "path", "host"):
+            value = meta.get(key)
+            if value:
+                keys.append(str(value))
+        keys = [key for key in keys if key and key != "/"]
+        if not keys:
+            return 0
+        count = 0
+        for finding in findings:
+            asset = str((finding.get("meta") or {}).get("asset", ""))
+            if not asset:
+                continue
+            if any(key in asset for key in keys):
+                count += 1
+        return count
 
     def _row_to_dict(self, row: Any, older_than_days: int) -> dict[str, Any]:
         last_seen = str(row[7])
@@ -510,6 +683,91 @@ class AppModel:
             "counts": counts,
             "staleAssets": len(self.list_entities(stale_only=True, limit=1000)),
             "edges": len(self.edges()),
+        }
+
+    def sitemap(self, *, max_nodes: int = 2000) -> dict[str, Any]:
+        """Hierarchical application -> service -> route -> input tree.
+
+        Nodes carry their coverage ledger and finding count. Side entities
+        (identities, technologies, findings, flows) are returned separately so
+        the map stays a sitemap rather than a hairball.
+        """
+
+        entities = self.list_entities(limit=max_nodes)
+        by_id = {item["id"]: item for item in entities}
+        edges = self.edges()
+        children: dict[str, list[str]] = {}
+        parents: set[str] = set()
+        for edge in edges:
+            source = by_id.get(edge["sourceId"])
+            target = by_id.get(edge["targetId"])
+            if not source or not target:
+                continue
+            if (source["kind"], target["kind"]) in {
+                ("application", "service"),
+                ("service", "route"),
+                ("route", "input"),
+            }:
+                children.setdefault(edge["sourceId"], []).append(edge["targetId"])
+                parents.add(edge["targetId"])
+
+        def node(entity_id: str, seen: set[str]) -> dict[str, Any]:
+            entity = by_id[entity_id]
+            if entity_id in seen:
+                return {"entity": entity, "children": []}
+            seen = {*seen, entity_id}
+            kids = sorted(
+                (node(child_id, seen) for child_id in children.get(entity_id, [])),
+                key=lambda item: (str(item["entity"]["kind"]), str(item["entity"]["name"])),
+            )
+            return {"entity": entity, "children": kids}
+
+        roots = [
+            node(item_id, set())
+            for item_id, item in by_id.items()
+            if item["kind"] == "application" and item_id not in parents
+        ]
+        if not roots:
+            roots = [
+                node(item_id, set())
+                for item_id, item in by_id.items()
+                if item_id not in parents and item["kind"] in {"service", "route"}
+            ]
+
+        def flatten(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            for entry in nodes:
+                result.append(entry["entity"])
+                result.extend(flatten(entry["children"]))
+            return result
+
+        flat = flatten(roots)
+        coverage = self.coverage_summary()
+        findings = [item for item in entities if item["kind"] == "finding"]
+        scoped = [item for item in flat if item["kind"] in {"service", "route", "input"}]
+        tested = [item for item in scoped if item.get("coverage", {}).get("tested")]
+        return {
+            "roots": roots,
+            "sideEntities": {
+                "identities": [item for item in entities if item["kind"] == "identity"],
+                "technologies": [item for item in entities if item["kind"] == "technology"],
+                "flows": [item for item in entities if item["kind"] == "flow"],
+                "findings": findings,
+            },
+            "stats": {
+                "applications": sum(1 for item in flat if item["kind"] == "application"),
+                "services": sum(1 for item in flat if item["kind"] == "service"),
+                "routes": sum(1 for item in flat if item["kind"] == "route"),
+                "inputs": sum(1 for item in flat if item["kind"] == "input"),
+                "inScope": len(scoped),
+                "tested": len(tested),
+                "untested": max(0, len(scoped) - len(tested)),
+                "findings": len(findings),
+                "coverageEntries": coverage["entries"],
+                "coverageGaps": len(coverage["gaps"]),
+            },
+            "coverage": coverage,
+            "truncated": len(by_id) >= max_nodes,
         }
 
     def add_note(self, entity_id: str, content: str) -> dict[str, Any]:

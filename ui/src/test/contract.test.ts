@@ -415,4 +415,104 @@ describe('Frontend API Contract & Fixture Conformance', () => {
       expect(typeof caRes.instructions).toBe('string');
     });
   });
+
+  // ── Milestone 4: Findings Contract Tests ───────────────────────
+  describe('Milestone 4: Security Findings Endpoints', () => {
+    it('GET /findings returns paginated finding items with schema invariants', async () => {
+      const res = await fetchJson<Paginated<any>>('/findings?projectId=prj_demo');
+      expect(res).toBeDefined();
+      expect(Array.isArray(res.items)).toBe(true);
+      expect(res.total).toBeGreaterThanOrEqual(1);
+
+      const finding = res.items[0];
+      expect(typeof finding.id).toBe('string');
+      expect(typeof finding.title).toBe('string');
+      expect(typeof finding.vrt).toBe('string');
+      expect(['critical', 'high', 'medium', 'low', 'info']).toContain(finding.severity);
+      expect(['candidate', 'validated', 'rejected', 'observed', 'suspected', 'experiment_planned', 'reproduced', 'deferred', 'blocked']).toContain(finding.state);
+      expect(typeof finding.asset).toBe('string');
+      expect(Array.isArray(finding.evidenceIds)).toBe(true);
+      expect(finding.gate).toBeDefined();
+      expect(Array.isArray(finding.gate.questions)).toBe(true);
+    });
+
+    it('GET /findings/{id} returns finding detail and linked evidence array', async () => {
+      const res = await fetchJson<{ finding: any; evidence: any[] }>('/findings/fnd_demo_01');
+      expect(res).toBeDefined();
+      expect(res.finding).toBeDefined();
+      expect(res.finding.id).toBe('fnd_demo_01');
+      expect(Array.isArray(res.evidence)).toBe(true);
+      expect(res.finding.securityQuestion).toBeDefined();
+      expect(res.finding.impact).toBeDefined();
+      expect(res.finding.remediation).toBeDefined();
+      expect(res.finding.lineage).toBeDefined();
+    });
+
+    it('POST /findings/{id}/transition validates finding with recorded evidence', async () => {
+      const res = await fetchJson<any>('/findings/fnd_demo_01/transition', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          state: 'validated',
+          reason: 'Independent verification confirmed by lead auditor',
+        }),
+      });
+
+      expect(res).toBeDefined();
+      expect(res.state).toBe('validated');
+      expect(res.lineage.validatedBy).toBeDefined();
+    });
+
+    it('POST /findings/{id}/transition refuses promotion to validated when zero evidence is attached', async () => {
+      try {
+        await fetchJson<any>('/findings/fnd_demo_03/transition', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            state: 'validated',
+            reason: 'Premature validation without evidence',
+          }),
+        });
+        expect.fail('Should have refused validation without evidence');
+      } catch (err: unknown) {
+        expect(isApiError(err)).toBe(true);
+        if (isApiError(err)) {
+          expect(err.message).toContain('at least one recorded evidence id');
+        }
+      }
+    });
+
+    it('POST /findings/{id}/transition refuses reject transition when reason is empty', async () => {
+      try {
+        await fetchJson<any>('/findings/fnd_demo_01/transition', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            state: 'rejected',
+            reason: '   ', // whitespace only
+          }),
+        });
+        expect.fail('Should have refused rejection without reason');
+      } catch (err: unknown) {
+        expect(isApiError(err)).toBe(true);
+        if (isApiError(err)) {
+          expect(err.message).toContain('requires a non-empty reason');
+        }
+      }
+    });
+
+    it('POST /findings/{id}/transition transitions to rejected with valid reason', async () => {
+      const res = await fetchJson<any>('/findings/fnd_demo_01/transition', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          state: 'rejected',
+          reason: 'Asset is out of engagement scope',
+        }),
+      });
+
+      expect(res).toBeDefined();
+      expect(res.state).toBe('rejected');
+    });
+  });
 });
