@@ -1,9 +1,0 @@
-# In-Scope Assets
-
-Paste program-approved domains, URLs, mobile apps, APIs, CIDRs, or package names here.
-
-Example:
-
-- example.com
-- *.example.com
-- https://api.example.com
