@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⛓️🪚 ChainsawRecon
+#  ChainsawRecon
 
 **A stateful, evidence-first pentesting harness for authorized security research.**
 
