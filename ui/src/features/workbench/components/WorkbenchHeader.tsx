@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
-  ArrowLeft, Shield, ShieldCheck, ShieldAlert, Download, 
-  Upload, Terminal, RotateCw, History, Layers, GitCompare 
+  ArrowLeft, Shield, ShieldAlert, Download, 
+  Upload, Terminal, RotateCw, History, Layers, GitCompare,
+  Play, Check, Copy, ShieldCheck
 } from 'lucide-react';
-import { ProjectSummary, ProjectScopeResponse, CaStatusResponse } from '../../../api/types';
+import { ProjectSummary, ProjectScopeResponse, CaStatusResponse, ProxyStatusResponse } from '../../../api/types';
 
 export type WorkbenchViewTab = 'history' | 'repeater' | 'compare';
 
@@ -12,6 +13,11 @@ interface WorkbenchHeaderProps {
   project?: ProjectSummary | null;
   scopeData?: ProjectScopeResponse | null;
   caStatus?: CaStatusResponse | null;
+  proxyStatus?: ProxyStatusResponse | null;
+  isStartingProxy?: boolean;
+  isStoppingProxy?: boolean;
+  onStartProxy?: () => void;
+  onStopProxy?: () => void;
   activeTab: WorkbenchViewTab;
   onChangeTab: (tab: WorkbenchViewTab) => void;
   historyCount: number;
@@ -28,6 +34,11 @@ export const WorkbenchHeader: React.FC<WorkbenchHeaderProps> = ({
   project,
   scopeData,
   caStatus,
+  proxyStatus,
+  isStartingProxy = false,
+  isStoppingProxy = false,
+  onStartProxy,
+  onStopProxy,
   activeTab,
   onChangeTab,
   historyCount,
@@ -41,6 +52,13 @@ export const WorkbenchHeader: React.FC<WorkbenchHeaderProps> = ({
 }) => {
   const navigate = useNavigate();
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [copiedProxyUrl, setCopiedProxyUrl] = useState(false);
+
+  const handleCopyProxyUrl = (url: string) => {
+    navigator.clipboard.writeText(url);
+    setCopiedProxyUrl(true);
+    setTimeout(() => setCopiedProxyUrl(false), 2000);
+  };
 
   return (
     <header className="border-b border-border bg-surface shrink-0 select-none font-sans">
@@ -91,18 +109,70 @@ export const WorkbenchHeader: React.FC<WorkbenchHeaderProps> = ({
             onClick={onOpenCaHelper}
             className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-[11px] font-mono shrink-0 transition-colors ${
               caStatus?.installed
+                ? 'bg-success/15 border-success/30 text-success hover:border-success'
+                : caStatus?.available
                 ? 'bg-surface-2 border-border text-text hover:border-accent'
                 : 'bg-warning/15 border-warning/40 text-warning hover:bg-warning/25'
             }`}
             title="Configure Proxy CA certificate"
           >
             {caStatus?.installed ? (
+              <ShieldCheck className="w-3 h-3 text-success" />
+            ) : caStatus?.available ? (
               <Shield className="w-3 h-3 text-accent" />
             ) : (
               <ShieldAlert className="w-3 h-3 text-warning" />
             )}
-            <span>CA: {caStatus?.installed ? 'Active' : 'Missing'}</span>
+            <span>CA: {caStatus?.installed ? 'Trusted' : caStatus?.available ? 'Generated' : 'Missing'}</span>
           </button>
+
+          {/* Capture Proxy Control */}
+          {proxyStatus?.running ? (
+            <div className="flex items-center gap-2 px-2.5 py-0.5 rounded-full border border-success/40 bg-success/10 font-mono text-xs shrink-0">
+              <span className="w-2 h-2 rounded-full bg-success animate-pulse shrink-0" aria-label="Proxy running" />
+              <span className="text-text font-medium text-[11px]">
+                {proxyStatus.proxyUrl || `http://127.0.0.1:${proxyStatus.port || 8080}`}
+              </span>
+              <span className="text-[10px] text-text-muted bg-surface/80 px-1.5 py-0.2 rounded border border-border">
+                {proxyStatus.captured ?? 0} captured
+              </span>
+              <button
+                onClick={() => handleCopyProxyUrl(proxyStatus.proxyUrl || `http://127.0.0.1:${proxyStatus.port || 8080}`)}
+                className="p-1 rounded hover:bg-surface-2 text-text-muted hover:text-text transition-colors"
+                title="Copy proxy URL"
+                aria-label="Copy proxy URL"
+              >
+                {copiedProxyUrl ? <Check className="w-3 h-3 text-success" /> : <Copy className="w-3 h-3" />}
+              </button>
+              <button
+                onClick={onStopProxy}
+                disabled={isStoppingProxy}
+                className="ml-0.5 px-2 py-0.5 rounded bg-danger/20 hover:bg-danger/30 text-danger border border-danger/40 text-[10px] font-medium transition-colors disabled:opacity-50"
+                title="Stop local capture proxy"
+              >
+                {isStoppingProxy ? 'Stopping…' : 'Stop Capture'}
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={onStartProxy}
+              disabled={isStartingProxy || isStoppingProxy}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-accent hover:bg-accent/80 text-white font-mono text-[11px] font-medium transition-colors disabled:opacity-50 shadow-sm shrink-0"
+              title="Start local HTTP/HTTPS capture proxy"
+            >
+              {isStartingProxy ? (
+                <>
+                  <RotateCw className="w-3 h-3 animate-spin" />
+                  <span>Starting…</span>
+                </>
+              ) : (
+                <>
+                  <Play className="w-3 h-3 fill-current" />
+                  <span>Start Capture</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
 
         {/* Right: Refresh, Import, Export */}

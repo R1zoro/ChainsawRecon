@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { ProjectOverviewPage } from '../features/app-model/ProjectOverviewPage';
@@ -270,6 +270,168 @@ describe('ProjectOverviewPage (Milestone 2: Application Model) Tests', () => {
     // Verify cap change triggers query refetch with new maxNodes
     await waitFor(() => {
       expect(screen.getByText('Acme Cloud Platform')).toBeInTheDocument();
+    });
+  });
+
+  // ── Milestone 2.5: Coverage-Aware Sitemap (Atlas) Tests ────────
+  it('renders View Switcher with Graph, Sitemap, and Table buttons', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Graph/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Sitemap/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Table/i })).toBeInTheDocument();
+    });
+  });
+
+  it('switches to Sitemap tab and displays coverage ribbon and hierarchical tree', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Sitemap/i })).toBeInTheDocument();
+    });
+
+    // Switch to Sitemap tab
+    fireEvent.click(screen.getByRole('button', { name: /Sitemap/i }));
+
+    // Coverage Ribbon check
+    await waitFor(() => {
+      expect(screen.getByText('In scope:')).toBeInTheDocument();
+      expect(screen.getByText('Tested:')).toBeInTheDocument();
+      expect(screen.getByText('Untested:')).toBeInTheDocument();
+      expect(screen.getByText('Findings:')).toBeInTheDocument();
+      expect(screen.getByText('Gaps:')).toBeInTheDocument();
+    });
+
+    // Hierarchical Tree check
+    await waitFor(() => {
+      expect(screen.getAllByText('Acme Cloud Platform').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('api.example.com').length).toBeGreaterThan(0);
+    });
+
+    // Breadcrumb / focus indicator in center graph
+    expect(screen.getByText(/Subtree focus:/i)).toBeInTheDocument();
+  });
+
+  it('sitemap tree filters by "Only untested" attack surfaces', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Sitemap/i })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Sitemap/i }));
+
+    const tree = await screen.findByTestId('sitemap-tree');
+
+    await waitFor(() => {
+      expect(within(tree).getByRole('button', { name: 'Only untested' })).toBeInTheDocument();
+    });
+
+    // Toggle "Untested" filter in tree
+    const untestedToggle = within(tree).getByRole('button', { name: 'Only untested' });
+    fireEvent.click(untestedToggle);
+
+    // Tested route /v1/billing/invoices should be hidden from tree; untested route /v1/users/me remains
+    await waitFor(() => {
+      expect(within(tree).queryByText('/v1/billing/invoices')).not.toBeInTheDocument();
+      expect(within(tree).getByText('/v1/users/me')).toBeInTheDocument();
+    });
+  });
+
+  it('sitemap tree filters by "Only gaps" toggle', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Sitemap/i })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Sitemap/i }));
+
+    const tree = await screen.findByTestId('sitemap-tree');
+
+    await waitFor(() => {
+      expect(within(tree).getByRole('button', { name: 'Only gaps' })).toBeInTheDocument();
+    });
+
+    // Toggle "Gaps" filter
+    const gapsToggle = within(tree).getByRole('button', { name: 'Only gaps' });
+    fireEvent.click(gapsToggle);
+
+    // Only nodes with verification gaps remain visible in tree (/v1/billing/invoices has missing_evidence)
+    await waitFor(() => {
+      expect(within(tree).getByText('/v1/billing/invoices')).toBeInTheDocument();
+      expect(within(tree).queryByText('/v1/auth/login')).not.toBeInTheDocument();
+      expect(within(tree).queryByText('/v1/users/me')).not.toBeInTheDocument();
+    });
+  });
+
+  it('clicking a node in sitemap tree opens detail drawer with coverage ledger and gap warnings', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Sitemap/i })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Sitemap/i }));
+
+    const tree = await screen.findByTestId('sitemap-tree');
+
+    await waitFor(() => {
+      expect(within(tree).getByText('/v1/billing/invoices')).toBeInTheDocument();
+    });
+
+    // Click on /v1/billing/invoices route (which has a missing evidence gap)
+    const routeItem = within(tree).getByText('/v1/billing/invoices');
+    fireEvent.click(routeItem);
+
+    // Verify detail drawer opened with coverage ledger & gap warning
+    await waitFor(() => {
+      expect(screen.getByText(/Coverage Ledger/i)).toBeInTheDocument();
+      expect(screen.getByText(/Coverage Gap \(Missing Evidence\)/i)).toBeInTheDocument();
+    });
+  });
+
+  it('records new coverage entry via drawer form and refreshes coverage state', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Sitemap/i })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Sitemap/i }));
+
+    const tree = await screen.findByTestId('sitemap-tree');
+
+    await waitFor(() => {
+      expect(within(tree).getByText('/v1/users/{id}')).toBeInTheDocument();
+    });
+
+    // Open detail drawer for /v1/users/{id}
+    fireEvent.click(within(tree).getByText('/v1/users/{id}'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Record/i })).toBeInTheDocument();
+    });
+
+    // Open Record Coverage form
+    fireEvent.click(screen.getByRole('button', { name: /Record/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Record Security Coverage/i)).toBeInTheDocument();
+    });
+
+    // Fill form
+    const riskInput = screen.getByPlaceholderText(/e\.g\. idor, sqli/i);
+    fireEvent.change(riskInput, { target: { value: 'sqli' } });
+
+    const evidenceInput = screen.getByPlaceholderText(/evd_\.\.\. or flow request ID/i);
+    fireEvent.change(evidenceInput, { target: { value: 'evd_test_sqli_clean' } });
+
+    // Submit form
+    const saveButton = screen.getByRole('button', { name: 'Record Coverage' });
+    fireEvent.click(saveButton);
+
+    // Verify form closes and check appears in coverage ledger
+    await waitFor(() => {
+      expect(screen.queryByText(/Record Security Coverage/i)).not.toBeInTheDocument();
+      expect(screen.getByText(/TESTED \(\d+ checks\)/i)).toBeInTheDocument();
     });
   });
 });

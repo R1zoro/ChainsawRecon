@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..appmodel import AppModel
+from ..auth import AuthSessionStore
 from ..journal import JournalWriter, read_journal
 from ..projection import SessionProjection
 from ..workbench import FlowNotFound, ScopePolicy, WorkbenchStore
@@ -19,6 +21,7 @@ from ..workspace import (
     init_project,
     list_sessions,
     load_project,
+    update_project,
     update_session,
 )
 from .models import ProjectCreate, ProviderCreate
@@ -275,6 +278,60 @@ class ProjectRegistry:
             }:
                 return entry
         return None
+
+    def auth_session_store(self) -> AuthSessionStore:
+        return AuthSessionStore(self.home.root)
+
+    def auth_profiles(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get(project_id)
+        return [
+            dict(item)
+            for item in ((project.settings or {}).get("authProfiles") or [])
+            if isinstance(item, dict)
+        ]
+
+    def save_auth_profile(self, project_id: str, profile: dict[str, Any]) -> dict[str, Any]:
+        project = self.get(project_id)
+        settings = dict(project.settings or {})
+        profiles = [
+            dict(item)
+            for item in (settings.get("authProfiles") or [])
+            if isinstance(item, dict)
+        ]
+        item = dict(profile)
+        if not item.get("id"):
+            item["id"] = "prf_" + uuid.uuid4().hex[:12]
+        item.setdefault("persistence", "session_only")
+        item.setdefault("kind", "form")
+        profiles = [entry for entry in profiles if entry.get("id") != item["id"]]
+        profiles.append(item)
+        settings["authProfiles"] = profiles
+        update_project(project.path, settings=settings)
+        return item
+
+    def delete_auth_profile(self, project_id: str, profile_id: str) -> bool:
+        project = self.get(project_id)
+        settings = dict(project.settings or {})
+        profiles = [
+            dict(item)
+            for item in (settings.get("authProfiles") or [])
+            if isinstance(item, dict) and item.get("id") != profile_id
+        ]
+        settings["authProfiles"] = profiles
+        update_project(project.path, settings=settings)
+        store = self.auth_session_store()
+        store.delete(project.id, profile_id)
+        return True
+
+    def find_auth_profile(
+        self, profile_id: str
+    ) -> tuple[ProjectMeta, dict[str, Any]]:
+        for summary in self.list_projects():
+            project = self.get(str(summary["id"]))
+            for profile in (project.settings or {}).get("authProfiles") or []:
+                if isinstance(profile, dict) and profile.get("id") == profile_id:
+                    return project, dict(profile)
+        raise ProjectNotFoundError(f"auth profile not found: {profile_id}")
 
     def project_summary(self, meta: ProjectMeta) -> dict[str, Any]:
         sessions = list_sessions(meta.path)

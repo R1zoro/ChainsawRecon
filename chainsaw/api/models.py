@@ -25,12 +25,20 @@ class AuthProfileInput(BaseModel):
     role: str = ""
     tenant: str = ""
     kind: str = "none"
+    adapter: Literal["auto", "http_form", "http_json", "browser", "headers", "operator"] = "auto"
     persistence: Literal["none", "session_only", "credentials"] = "session_only"
     target_patterns: list[str] = Field(default_factory=list, alias="targetPatterns")
     login_url: str = Field(default="", alias="loginUrl")
     verify_url: str = Field(default="", alias="verifyUrl")
     verify_indicator: str = Field(default="", alias="verifyIndicator")
     maintain_cookies: list[str] = Field(default_factory=list, alias="maintainCookies")
+    username_field: str = Field(default="", alias="usernameField")
+    password_field: str = Field(default="", alias="passwordField")
+    extra_fields: dict[str, str] = Field(default_factory=dict, alias="extraFields")
+    selectors: dict[str, Any] = Field(default_factory=dict)
+    timeout: float = 30.0
+    verify_tls: bool = Field(default=True, alias="verifyTls")
+    headless: bool = False
 
 
 class ProjectCreate(BaseModel):
@@ -71,6 +79,7 @@ class SessionRunCreate(BaseModel):
     max_output_tokens: int = Field(default=1024, ge=64, alias="maxOutputTokens")
     provider_id: str = Field(default="", alias="providerId")
     model: str = ""
+    noise_profile: str = Field(default="balanced", alias="noiseProfile")
 
 
 class ProviderCreate(BaseModel):
@@ -78,11 +87,15 @@ class ProviderCreate(BaseModel):
 
     name: str
     type: str = "openai-compatible"
+    engine: str = ""
     base_url: str = Field(default="", alias="baseUrl")
     api_key_ref: str = Field(default="", alias="apiKeyRef")
     models: list[dict[str, Any]] = Field(default_factory=list)
     status: str = "unknown"
     reliability: str = "stable"
+    profile_dir: str = Field(default="", alias="profileDir")
+    headless: bool = False
+    selectors: dict[str, Any] = Field(default_factory=dict)
 
 
 class MessageCreate(BaseModel):
@@ -107,6 +120,15 @@ class CoverageCreate(BaseModel):
     evidence_id: str = Field(default="", alias="evidenceId")
     reason: str = ""
     worker: str = ""
+
+
+class AuthLoginRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    username: str = ""
+    password: str = ""
+    adapter: str = ""
+    login_timeout: float = Field(default=300.0, alias="loginTimeout")
 
 
 class FindingTransition(BaseModel):
@@ -135,6 +157,7 @@ class ReplayCreate(BaseModel):
 
     request_id: str = Field(alias="requestId")
     project_id: str = Field(default="", alias="projectId")
+    auth_profile_id: str = Field(default="", alias="authProfileId")
     patch: ReplayPatch = Field(default_factory=ReplayPatch)
     session_id: str = Field(default="", alias="sessionId")
     justification: str = ""
@@ -173,6 +196,7 @@ class ProxyStart(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=0, le=65535)
     verify_upstream: bool = Field(default=True, alias="verifyUpstream")
+    noise_profile: str = Field(default="balanced", alias="noiseProfile")
 
 
 class ProxyStop(BaseModel):

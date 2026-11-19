@@ -235,11 +235,13 @@ class Executor:
         assembler: ContextAssembler,
         model: str = "",
         transport: Any | None = None,
+        governor: Any | None = None,
     ) -> None:
         self.runtime = runtime
         self.assembler = assembler
         self.model = model
         self.transport = transport
+        self.governor = governor
 
     def execute(
         self,
@@ -317,6 +319,7 @@ class Executor:
             policy=policy,
             justification=action.justification,
             transport=self.transport,
+            governor=self.governor,
         )
 
         if not result["scope"]["allowed"]:

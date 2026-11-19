@@ -158,6 +158,26 @@ export async function fetchJson<T>(path: string, options: RequestInit = {}): Pro
       const projectId = parts[2];
       return mockService.fetchScope(projectId) as unknown as T;
     }
+    if (urlPath.startsWith('/projects/') && urlPath.includes('/app-model/sitemap') && method === 'GET') {
+      const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
+      const params = new URLSearchParams(search);
+      const maxNodes = params.has('maxNodes') ? parseInt(params.get('maxNodes')!, 10) : 2000;
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.fetchAppModelSitemap(projectId, maxNodes) as unknown as T;
+    }
+    if (urlPath.startsWith('/projects/') && urlPath.endsWith('/app-model/coverage') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.fetchAppModelCoverage(projectId) as unknown as T;
+    }
+    if (urlPath.startsWith('/projects/') && urlPath.includes('/app-model/entities/') && urlPath.endsWith('/coverage') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const entityId = parts[5];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.recordAppModelCoverage(projectId, entityId, payload) as unknown as T;
+    }
     // ── Milestone 3: Workbench Routes ───────────────────────────
     if (urlPath === '/workbench/history' && method === 'GET') {
       const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
@@ -207,6 +227,23 @@ export async function fetchJson<T>(path: string, options: RequestInit = {}): Pro
     }
     if (urlPath === '/workbench/ca' && method === 'GET') {
       return mockService.fetchCaStatus() as unknown as T;
+    }
+    if (urlPath === '/workbench/ca' && method === 'POST') {
+      return mockService.generateCa() as unknown as T;
+    }
+    if (urlPath === '/workbench/proxy/status' && method === 'GET') {
+      const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
+      const params = new URLSearchParams(search);
+      const projectId = params.get('projectId') || undefined;
+      return mockService.fetchProxyStatus(projectId) as unknown as T;
+    }
+    if (urlPath === '/workbench/proxy/start' && method === 'POST') {
+      const body = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.startProxy(body) as unknown as T;
+    }
+    if (urlPath === '/workbench/proxy/stop' && method === 'POST') {
+      const body = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.stopProxy(body) as unknown as T;
     }
     // ── Milestone 4: Findings Routes ─────────────────────────────
     if (urlPath === '/findings' && method === 'GET') {

@@ -414,6 +414,43 @@ describe('Frontend API Contract & Fixture Conformance', () => {
       expect(typeof caRes.path).toBe('string');
       expect(typeof caRes.instructions).toBe('string');
     });
+
+    it('POST /workbench/ca generates CA and returns available status', async () => {
+      const genRes = await fetchJson<CaStatusResponse>('/workbench/ca', {
+        method: 'POST',
+      });
+      expect(genRes).toBeDefined();
+      expect(genRes.available).toBe(true);
+      expect(genRes.path).toContain('ca.crt');
+      expect(genRes.instructions).toBeDefined();
+    });
+
+    it('GET /workbench/proxy/status returns proxy status schema', async () => {
+      const status = await fetchJson<any>('/workbench/proxy/status?projectId=prj_demo');
+      expect(status).toBeDefined();
+      expect(typeof status.running).toBe('boolean');
+      expect(status.projectId).toBe('prj_demo');
+      expect(typeof status.captured).toBe('number');
+    });
+
+    it('POST /workbench/proxy/start and POST /workbench/proxy/stop manage proxy lifecycle', async () => {
+      const startRes = await fetchJson<any>('/workbench/proxy/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: 'prj_demo', port: 8080, verifyUpstream: true }),
+      });
+      expect(startRes).toBeDefined();
+      expect(startRes.running).toBe(true);
+      expect(startRes.proxyUrl).toBe('http://127.0.0.1:8080');
+
+      const stopRes = await fetchJson<any>('/workbench/proxy/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: 'prj_demo' }),
+      });
+      expect(stopRes).toBeDefined();
+      expect(stopRes.running).toBe(false);
+    });
   });
 
   // ── Milestone 4: Findings Contract Tests ───────────────────────
@@ -513,6 +550,127 @@ describe('Frontend API Contract & Fixture Conformance', () => {
 
       expect(res).toBeDefined();
       expect(res.state).toBe('rejected');
+    });
+  });
+
+  // ── Milestone 2.5: Coverage-Aware Sitemap (Atlas) Contract ──────
+  describe('Milestone 2.5: Coverage-Aware Sitemap (Atlas) Contract', () => {
+    const projectId = 'prj_demo';
+
+    it('GET /projects/:id/app-model/sitemap returns hierarchical tree, stats, and coverage summary', async () => {
+      const sitemap = await fetchJson<any>(`/projects/${projectId}/app-model/sitemap`);
+      expect(sitemap).toBeDefined();
+      expect(Array.isArray(sitemap.roots)).toBe(true);
+      expect(sitemap.roots.length).toBeGreaterThan(0);
+
+      // Hierarchical structure: Application -> Service -> Route -> Input
+      const rootAppNode = sitemap.roots[0];
+      expect(rootAppNode.entity.kind).toBe('application');
+      expect(Array.isArray(rootAppNode.children)).toBe(true);
+
+      const serviceNode = rootAppNode.children[0];
+      expect(serviceNode.entity.kind).toBe('service');
+      expect(Array.isArray(serviceNode.children)).toBe(true);
+
+      const routeNode = serviceNode.children.find((c: any) => c.entity.kind === 'route');
+      expect(routeNode).toBeDefined();
+      expect(routeNode.entity.coverage).toBeDefined();
+      expect(typeof routeNode.entity.coverage.tested).toBe('boolean');
+      expect(typeof routeNode.entity.coverage.outcomes).toBe('object');
+
+      // Side entities check
+      expect(sitemap.sideEntities).toBeDefined();
+      expect(Array.isArray(sitemap.sideEntities.identities)).toBe(true);
+      expect(Array.isArray(sitemap.sideEntities.technologies)).toBe(true);
+      expect(Array.isArray(sitemap.sideEntities.flows)).toBe(true);
+      expect(Array.isArray(sitemap.sideEntities.findings)).toBe(true);
+
+      // Coverage Ribbon Stats
+      expect(sitemap.stats).toBeDefined();
+      expect(typeof sitemap.stats.inScope).toBe('number');
+      expect(typeof sitemap.stats.tested).toBe('number');
+      expect(typeof sitemap.stats.untested).toBe('number');
+      expect(typeof sitemap.stats.findings).toBe('number');
+      expect(typeof sitemap.stats.coverageGaps).toBe('number');
+
+      // Summary
+      expect(sitemap.coverage).toBeDefined();
+      expect(typeof sitemap.coverage.entries).toBe('number');
+      expect(Array.isArray(sitemap.coverage.gaps)).toBe(true);
+    });
+
+    it('GET /projects/:id/app-model/coverage returns coverage entries, stats, and verification gaps', async () => {
+      const cov = await fetchJson<any>(`/projects/${projectId}/app-model/coverage`);
+      expect(cov).toBeDefined();
+      expect(Array.isArray(cov.entries)).toBe(true);
+      expect(typeof cov.tested).toBe('number');
+      expect(typeof cov.outcomes).toBe('object');
+      expect(Array.isArray(cov.gaps)).toBe(true);
+
+      // Gaps verification check (absence of evidence on no_issue_found constitutes a gap)
+      const missingEvidenceGap = cov.gaps.find((g: any) => g.kind === 'missing_evidence');
+      expect(missingEvidenceGap).toBeDefined();
+      expect(missingEvidenceGap.entityId).toBeDefined();
+    });
+
+    it('POST /projects/:id/app-model/entities/:id/coverage records new coverage entry and validates fields', async () => {
+      const payload = {
+        riskArea: 'idor',
+        outcome: 'no_issue_found',
+        surface: 'GET /v1/users/{id}',
+        evidenceId: 'evd_test_contract_01',
+        reason: 'Verified tenant-isolation barrier returns 403 on foreign tenant ID',
+        worker: 'contract_tester',
+      };
+
+      const res = await fetchJson<any>(`/projects/${projectId}/app-model/entities/rot_users_id/coverage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      expect(res).toBeDefined();
+      expect(res.id).toBeDefined();
+      expect(res.entityId).toBe('rot_users_id');
+      expect(res.riskArea).toBe('idor');
+      expect(res.outcome).toBe('no_issue_found');
+      expect(res.evidenceId).toBe('evd_test_contract_01');
+
+      // Verify validation: invalid outcome throws 400
+      try {
+        await fetchJson<any>(`/projects/${projectId}/app-model/entities/rot_users_id/coverage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            riskArea: 'sqli',
+            outcome: 'invalid_outcome_choice',
+          }),
+        });
+        expect.fail('Should have rejected invalid coverage outcome');
+      } catch (err: unknown) {
+        expect(isApiError(err)).toBe(true);
+        if (isApiError(err)) {
+          expect(err.message).toContain('coverage outcome must be one of');
+        }
+      }
+
+      // Verify validation: missing riskArea throws 400
+      try {
+        await fetchJson<any>(`/projects/${projectId}/app-model/entities/rot_users_id/coverage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            riskArea: '   ',
+            outcome: 'no_issue_found',
+          }),
+        });
+        expect.fail('Should have rejected missing riskArea');
+      } catch (err: unknown) {
+        expect(isApiError(err)).toBe(true);
+        if (isApiError(err)) {
+          expect(err.message).toContain('riskArea is required');
+        }
+      }
     });
   });
 });

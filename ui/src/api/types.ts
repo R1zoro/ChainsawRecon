@@ -462,9 +462,32 @@ export interface CreateEvidencePayload {
 
 export interface CaStatusResponse {
   available: boolean;
-  path?: string;
+  path?: string | null;
+  keyPath?: string | null;
   installed?: boolean;
   instructions: string;
+}
+
+export interface ProxyStatusResponse {
+  running: boolean;
+  projectId: string;
+  host?: string;
+  port?: number;
+  proxyUrl?: string;
+  caPath?: string | null;
+  captured?: number;
+  verifyUpstream?: boolean;
+}
+
+export interface ProxyStartPayload {
+  projectId: string;
+  host?: string;
+  port?: number;
+  verifyUpstream?: boolean;
+}
+
+export interface ProxyStopPayload {
+  projectId: string;
 }
 
 // ── Milestone 4: Findings Types ─────────────────────────────────
@@ -540,6 +563,100 @@ export interface FindingTransitionPayload {
   reason: string;
   evidence_ids?: string[];
   evidenceIds?: string[];
+}
+
+// ── Milestone 2.5: Coverage & Sitemap Types (Atlas) ─────────────
+
+export type CoverageOutcome =
+  | 'reported'
+  | 'no_issue_found'
+  | 'ruled_out'
+  | 'not_applicable'
+  | 'needs_follow_up';
+
+export interface CoverageEntry {
+  id: string | number;
+  entityId: string;
+  surface: string;
+  riskArea: string;
+  outcome: CoverageOutcome;
+  evidenceId?: string | null;
+  reason?: string;
+  worker?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CoverageGap {
+  kind?: string;
+  id?: string | number;
+  entityId: string;
+  surface?: string;
+  riskArea: string;
+  outcome?: string;
+  evidenceId?: string | null;
+  reason?: string;
+  worker?: string;
+}
+
+export interface SitemapNode {
+  entity: AppEntity & {
+    coverage?: {
+      tested: boolean;
+      outcomes: Record<string, number>;
+      lastTestedAt: string | null;
+      entries: CoverageEntry[];
+    };
+    findingCount?: number;
+  };
+  children: SitemapNode[];
+}
+
+export interface SitemapStats {
+  applications: number;
+  services: number;
+  routes: number;
+  inputs: number;
+  inScope: number;
+  tested: number;
+  untested: number;
+  findings: number;
+  coverageEntries: number;
+  coverageGaps: number;
+}
+
+export interface SitemapResponse {
+  roots: SitemapNode[];
+  sideEntities: {
+    identities: AppEntity[];
+    technologies: AppEntity[];
+    flows: AppEntity[];
+    findings: AppEntity[];
+  };
+  stats: SitemapStats;
+  coverage: {
+    entries: number;
+    tested: number;
+    outcomes: Record<string, number>;
+    gaps: CoverageGap[];
+  };
+  truncated: boolean;
+}
+
+export interface ProjectCoverageResponse {
+  entries: CoverageEntry[];
+  tested: number;
+  outcomes: Record<string, number>;
+  gaps: CoverageGap[];
+}
+
+export interface RecordCoveragePayload {
+  riskArea: string;
+  outcome: CoverageOutcome;
+  surface?: string;
+  evidenceId?: string;
+  reason?: string;
+  worker?: string;
 }
 
 

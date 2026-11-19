@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -13,11 +14,19 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from ..auth import (
+    AuthError,
+    AuthNeedsOperator,
+    browser_login,
+    detect_flows,
+    http_login,
+    verify_session,
+)
 from ..ca import ensure_ca
 from ..journal import read_journal, verify_journal
 from ..providers import (
-    OpenAICompatibleProvider,
     ProviderError,
+    build_provider,
     config_from_entry,
 )
 from ..proxy import ProxyError, ProxyManager
@@ -39,6 +48,8 @@ from ..workspace import (
 )
 from .models import (
     ApprovalDecision,
+    AuthLoginRequest,
+    AuthProfileInput,
     CompareCreate,
     CoverageCreate,
     EvidenceCreate,
@@ -237,6 +248,121 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         profiles = (project.settings or {}).get("authProfiles") or []
         return _page(list(profiles), limit=200, offset=0)
 
+    @app.post("/api/v1/projects/{project_id}/auth/detect")
+    async def auth_detect(project_id: str) -> dict[str, Any]:
+        store = registry.workbench(project_id)
+        try:
+            flows = store.raw_flows(limit=500)
+        finally:
+            store.close()
+        return detect_flows(flows).to_dict()
+
+    @app.get("/api/v1/projects/{project_id}/auth/profiles")
+    async def auth_profile_list(project_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        store = registry.auth_session_store()
+        items = []
+        for profile in registry.auth_profiles(project_id):
+            session = store.load(project.id, str(profile.get("id", "")))
+            items.append(
+                {
+                    **profile,
+                    "session": session.public() if session else {"status": "none"},
+                }
+            )
+        return _page(items, limit=200, offset=0)
+
+    @app.post("/api/v1/projects/{project_id}/auth/profiles", status_code=201)
+    async def auth_profile_save(
+        project_id: str, payload: AuthProfileInput
+    ) -> dict[str, Any]:
+        registry.get(project_id)
+        item = registry.save_auth_profile(
+            project_id, payload.model_dump(by_alias=False, exclude_none=True)
+        )
+        return item
+
+    @app.delete("/api/v1/projects/{project_id}/auth/profiles/{profile_id}", status_code=204)
+    async def auth_profile_delete(project_id: str, profile_id: str) -> None:
+        registry.delete_auth_profile(project_id, profile_id)
+        return None
+
+    @app.get("/api/v1/projects/{project_id}/auth/profiles/{profile_id}/session")
+    async def auth_profile_session(project_id: str, profile_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        session = registry.auth_session_store().load(project.id, profile_id)
+        return session.public() if session else {"status": "none", "profileId": profile_id}
+
+    @app.post("/api/v1/projects/{project_id}/auth/profiles/{profile_id}/login")
+    async def auth_profile_login(
+        project_id: str,
+        profile_id: str,
+        payload: AuthLoginRequest,
+    ) -> dict[str, Any]:
+        project = registry.get(project_id)
+        _, profile = registry.find_auth_profile(profile_id)
+        adapter = (payload.adapter or str(profile.get("adapter") or "auto")).lower()
+        if adapter == "auto":
+            adapter = "browser" if profile.get("kind") in {"oauth", "saml", "browser"} else "http_form"
+        try:
+            if adapter == "browser":
+                session = await asyncio.to_thread(
+                    browser_login,
+                    profile=profile,
+                    project_id=project.id,
+                    home_root=registry.home.root,
+                    username=payload.username,
+                    password=payload.password,
+                    policy=registry.scope_policy(project.id),
+                    login_timeout=payload.login_timeout,
+                )
+            elif adapter == "http_form":
+                session = await asyncio.to_thread(
+                    http_login,
+                    profile=profile,
+                    project_id=project.id,
+                    username=payload.username,
+                    password=payload.password,
+                    policy=registry.scope_policy(project.id),
+                )
+            else:
+                raise HTTPException(400, f"BAD_REQUEST: unsupported auth adapter: {adapter}")
+        except AuthNeedsOperator as exc:
+            raise HTTPException(409, f"CONFLICT: {exc}") from exc
+        except AuthError as exc:
+            raise HTTPException(400, f"BAD_REQUEST: {exc}") from exc
+        registry.auth_session_store().save(session)
+        return session.public()
+
+    @app.post("/api/v1/projects/{project_id}/auth/profiles/{profile_id}/verify")
+    async def auth_profile_verify(project_id: str, profile_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        _, profile = registry.find_auth_profile(profile_id)
+        store = registry.auth_session_store()
+        session = store.load(project.id, profile_id)
+        if session is None:
+            raise HTTPException(404, f"NOT_FOUND: no session for auth profile {profile_id}")
+        verified, reason = await asyncio.to_thread(
+            verify_session,
+            session,
+            verify_url=str(profile.get("verifyUrl") or ""),
+            indicator=str(profile.get("verifyIndicator") or ""),
+            policy=registry.scope_policy(project.id),
+        )
+        session.status = "active" if verified else "failed"
+        if verified and not session.verified_at:
+            session.verified_at = datetime.now(timezone.utc).isoformat()
+        session.warning = reason
+        store.save(session)
+        return {**session.public(), "reason": reason}
+
+    @app.post("/api/v1/projects/{project_id}/auth/profiles/{profile_id}/logout")
+    async def auth_profile_logout(project_id: str, profile_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        store = registry.auth_session_store()
+        store.delete(project.id, profile_id)
+        return {"profileId": profile_id, "status": "none"}
+
     @app.get("/api/v1/projects/{project_id}/scope")
     async def get_scope(project_id: str) -> dict[str, Any]:
         project = registry.get(project_id)
@@ -423,13 +549,20 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
                 "BAD_REQUEST: no provider configured; add one before running a session",
             )
         model = payload.model or meta.model
-        try:
-            provider_config = config_from_entry(entry, model=model)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(400, f"BAD_REQUEST: invalid provider config: {exc}") from exc
-        if not provider_config.base_url:
-            raise HTTPException(400, "BAD_REQUEST: provider has no base URL")
-        provider = OpenAICompatibleProvider(provider_config)
+        kind = str(entry.get("type") or entry.get("engine") or "").strip().lower()
+        selected_model = model
+        if kind in {"webui", "browser", "chatgpt-web", "deepseek-web", "web"}:
+            provider = build_provider(entry, model=model)
+            selected_model = model or str(entry.get("model") or entry.get("engine") or "webui")
+        else:
+            try:
+                provider_config = config_from_entry(entry, model=model)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, f"BAD_REQUEST: invalid provider config: {exc}") from exc
+            if not provider_config.base_url:
+                raise HTTPException(400, "BAD_REQUEST: provider has no base URL")
+            provider = build_provider(entry, model=model)
+            selected_model = model or provider_config.model
         runtime = SessionRuntime(project.path, session_id)
         store = registry.workbench(project.id)
         try:
@@ -438,11 +571,12 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
                 store=store,
                 policy=registry.scope_policy(project.id),
                 provider=provider,
-                model=model or provider_config.model,
+                model=selected_model,
                 config=RunConfig(
                     max_steps=payload.max_steps,
                     context_window=payload.context_window,
                     max_output_tokens=payload.max_output_tokens,
+                    noise_profile=payload.noise_profile,
                 ),
             )
             registry.update_session_status(session_id, "running")
@@ -454,6 +588,9 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         finally:
             store.close()
             runtime.close()
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
         registry.update_session_status(
             session_id,
             "completed" if result.finished else "paused",
@@ -461,7 +598,7 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         return {
             **result.to_dict(),
             "sessionId": session_id,
-            "model": model or provider_config.model,
+            "model": selected_model,
         }
 
     @app.get("/api/v1/providers/{provider_id}/health")
@@ -469,11 +606,34 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         entry = registry.provider_entry(provider_id)
         if entry is None:
             raise HTTPException(404, f"NOT_FOUND: provider not found: {provider_id}")
-        provider = OpenAICompatibleProvider(config_from_entry(entry))
+        provider = build_provider(entry)
         try:
-            return await asyncio.to_thread(provider.health)
+            result = await asyncio.to_thread(provider.health)
         except ProviderError as exc:
             raise HTTPException(502, f"INTERNAL: {exc}") from exc
+        finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+        return result
+
+    @app.post("/api/v1/providers/{provider_id}/calibrate")
+    async def provider_calibrate(provider_id: str) -> dict[str, Any]:
+        entry = registry.provider_entry(provider_id)
+        if entry is None:
+            raise HTTPException(404, f"NOT_FOUND: provider not found: {provider_id}")
+        provider = build_provider(entry)
+        calibrate = getattr(provider, "calibrate", None)
+        if not callable(calibrate):
+            raise HTTPException(400, "BAD_REQUEST: provider does not support calibration")
+        try:
+            return await asyncio.to_thread(calibrate)
+        except ProviderError as exc:
+            raise HTTPException(502, f"INTERNAL: {exc}") from exc
+        finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
 
     @app.get("/api/v1/sessions/{session_id}/journal")
     async def journal(
@@ -669,6 +829,19 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         try:
             policy = registry.scope_policy(project.id)
             patch = payload.patch.model_dump(exclude_none=True, by_alias=True)
+            auth_headers: dict[str, str] = {}
+            auth_cookies: dict[str, str] = {}
+            if payload.auth_profile_id:
+                session = registry.auth_session_store().load(
+                    project.id, payload.auth_profile_id
+                )
+                if session is None:
+                    raise HTTPException(
+                        400,
+                        f"BAD_REQUEST: no active session for auth profile {payload.auth_profile_id}",
+                    )
+                auth_headers = session.headers
+                auth_cookies = session.cookies
             try:
                 return replay(
                     store,
@@ -676,6 +849,8 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
                     patch=patch,
                     policy=policy,
                     justification=payload.justification,
+                    auth_headers=auth_headers,
+                    auth_cookies=auth_cookies,
                 )
             except ApprovalRequired as exc:
                 raise HTTPException(403, f"APPROVAL_REQUIRED: {exc}") from exc
@@ -782,6 +957,7 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
                 host=payload.host,
                 port=payload.port,
                 verify_upstream=payload.verify_upstream,
+                noise_profile=payload.noise_profile,
             )
         except (OSError, ProxyError) as exc:
             raise HTTPException(400, f"BAD_REQUEST: cannot start proxy: {exc}") from exc

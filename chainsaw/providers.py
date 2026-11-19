@@ -11,7 +11,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -60,6 +60,20 @@ class Completion:
             "completionTokens": self.completion_tokens,
             "finishReason": self.finish_reason,
         }
+
+
+class ChatProvider(Protocol):
+    def chat(
+        self,
+        messages: list[ChatMessage] | list[dict[str, str]],
+        *,
+        model: str = "",
+        temperature: float = 0.1,
+        max_tokens: int = 1024,
+        response_format: dict[str, Any] | None = None,
+    ) -> Completion: ...
+
+    def health(self) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -261,3 +275,15 @@ def extract_json_object(text: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ProviderResponseError("model JSON response must be an object")
     return parsed
+
+
+def build_provider(entry: dict[str, Any], *, model: str = "") -> ChatProvider:
+    """Build an API provider or a browser-backed web UI provider."""
+
+    kind = str(entry.get("type") or entry.get("engine") or "").strip().lower()
+    if kind in {"webui", "browser", "chatgpt-web", "deepseek-web", "web"}:
+        from .webui import WebUIChatProvider, WebUIConfig
+
+        return WebUIChatProvider(WebUIConfig.from_entry(entry, model=model))
+    return OpenAICompatibleProvider(config_from_entry(entry, model=model))
+

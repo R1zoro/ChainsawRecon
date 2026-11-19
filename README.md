@@ -8,6 +8,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-4B5563)](#)
 [![Sandbox](https://img.shields.io/badge/sandbox-native%20OS%20%C2%B7%20Docker%20optional-0F766E)](#execution-and-sandbox)
 [![Status](https://img.shields.io/badge/status-v2%20preview-7C3AED)](#project-status)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22C55E)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/R1zoro/ChainsawRecon?style=social)](https://github.com/R1zoro/ChainsawRecon)
 
 **If ChainsawRecon saves you time, please consider leaving a star — it helps other researchers find it.**
@@ -63,8 +64,9 @@ the current tree yet.
 | Journal / application model | 🟢 journal, projection, app model | append-only journal + revisioned graph |
 | Multi-model role routing | 🟢 routing + context budgets | per-role provider/model selection |
 | Native HTTP workbench | 🟢 HTTP/HTTPS capture, replay, diff, evidence | proxy hardening + WebSockets |
-| Auth profiles / embedded auth browser | ⏳ planned | handover, sessions, multi-identity |
-| Desktop UI (Tauri) | 🟡 React UI, M3 accepted | project/session workspace |
+| Auth profiles / embedded auth browser | 🟡 detection, HTTP login, browser handover | keychain + auth browser UI |
+| Desktop launcher | ⏳ planned | clone + double-click app |
+| Desktop UI (Tauri) | 🟡 React UI, M3/M4 accepted | project/session workspace |
 
 ### v2 core already in the tree
 
@@ -81,12 +83,17 @@ the current tree yet.
   and a single-action executor that records evidence and advances task state.
 - `chainsaw/providers.py` — OpenAI-compatible chat/model client with retries, auth handling, and
   safe JSON extraction.
+- `chainsaw/webui.py` — optional Playwright-backed ChatGPT/DeepSeek web provider with persistent
+  operator-logged-in profiles and configurable selectors.
 - `chainsaw/runner.py` — provider-backed supervisor/operator loop with bounded steps and task
   failure recording.
 - `chainsaw/workbench.py` — native HTTP flow store, scope-gated replay, line diff, hashed evidence
   artifacts, HAR/Burp import, HAR/JSONL export, CA status.
 - `chainsaw/ca.py` — local root CA and per-host leaf certificates for HTTPS interception.
 - `chainsaw/proxy.py` — scope-aware HTTP/HTTPS capture proxy with CONNECT/TLS termination.
+- `chainsaw/governor.py` — per-host token bucket, in-flight caps, jitter, and 429/503 backoff.
+- `chainsaw/auth.py` — auth mechanism/bot-protection detection, HTTP form login, browser handover,
+  verification with negative control, and encrypted session storage.
 - `chainsaw/appmodel.py` — project-wide revisioned application model (apps, services, routes,
   inputs, identities, technologies, findings, edges, notes), plus a coverage ledger and hierarchical
   sitemap projection.
@@ -236,6 +243,15 @@ session projections, and a provider-backed session runner (`POST /sessions/{id}/
 the deterministic supervisor/executor loop. Report generation, WebSocket capture, and the embedded
 auth browser are the next milestone. It is local-only and intended for the desktop UI.
 
+Optional browser-backed model provider for ChatGPT/DeepSeek web sessions:
+
+```bash
+uv sync --extra webui
+uv run playwright install chromium
+```
+
+It opens a real Chromium profile for manual login and never stores passwords or solves CAPTCHAs.
+
 ---
 
 ## Project and session layout
@@ -330,6 +346,10 @@ the public repository.
 - Keep changes scoped and include tests for behavior changes.
 - Never commit secrets, engagement data, or generated run artifacts.
 - For security issues, do not open a public issue; contact the maintainer privately.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ---
 

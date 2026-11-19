@@ -14,6 +14,10 @@ interface WorkbenchHistoryTableProps {
   totalCount?: number;
   onPageChange?: (page: number) => void;
   onPageSizeChange?: (pageSize: number) => void;
+  proxyRunning?: boolean;
+  proxyUrl?: string;
+  hasActiveFilters?: boolean;
+  onResetFilters?: () => void;
 }
 
 type SortField = 'id' | 'method' | 'host' | 'path' | 'status' | 'durationMs' | 'sizeBytes' | 'capturedAt';
@@ -29,6 +33,10 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
   totalCount = requests.length,
   onPageChange,
   onPageSizeChange,
+  proxyRunning = false,
+  proxyUrl,
+  hasActiveFilters = false,
+  onResetFilters,
 }) => {
   const [sortField, setSortField] = useState<SortField>('id');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
@@ -100,13 +108,45 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
   const endIndex = Math.min(currentPage * pageSize, totalCount);
 
   if (requests.length === 0) {
+    if (hasActiveFilters || totalCount > 0) {
+      return (
+        <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-surface select-none space-y-3 font-sans">
+          <div className="p-3 rounded-full bg-surface-2 text-text-muted">
+            <Inbox className="w-8 h-8 opacity-60" />
+          </div>
+          <div className="space-y-1 max-w-md">
+            <h3 className="text-sm font-semibold text-text">No requests match these filters</h3>
+            <p className="text-xs text-text-muted leading-relaxed">
+              No captured traffic matched the active search or filter criteria.
+            </p>
+          </div>
+          {onResetFilters && (
+            <button
+              onClick={onResetFilters}
+              className="px-3 py-1.5 rounded-lg bg-surface-2 hover:bg-surface-2/80 border border-border text-xs font-medium text-text transition-colors"
+            >
+              Reset filters
+            </button>
+          )}
+        </div>
+      );
+    }
+
     return (
-      <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-surface select-none space-y-2">
-        <Inbox className="w-8 h-8 opacity-40 text-text-muted" />
-        <h3 className="text-sm font-semibold text-text">No captured requests</h3>
-        <p className="text-xs text-text-muted max-w-sm">
-          Traffic will appear here as web requests are captured by scanning modules, the local proxy, or imported HAR files.
-        </p>
+      <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-surface select-none space-y-3 font-sans">
+        <div className={`p-3 rounded-full ${proxyRunning ? 'bg-success/10 text-success' : 'bg-surface-2 text-text-muted'}`}>
+          <Inbox className="w-8 h-8 opacity-60" />
+        </div>
+        <div className="space-y-1 max-w-md">
+          <h3 className="text-sm font-semibold text-text">
+            {proxyRunning ? 'Proxy is listening' : 'No traffic captured yet'}
+          </h3>
+          <p className="text-xs text-text-muted leading-relaxed font-mono">
+            {proxyRunning
+              ? `Proxy is listening. Configure your client to use ${proxyUrl || 'http://127.0.0.1:8080'}.`
+              : 'No traffic captured yet. Start the proxy, then point your browser or CLI at it, or import a HAR.'}
+          </p>
+        </div>
       </div>
     );
   }
@@ -221,8 +261,9 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
                       <Check className="w-3.5 h-3.5" />
                     </span>
                   ) : (
-                    <span className="inline-flex text-warning" title="Target outside scope">
-                      <ShieldAlert className="w-3.5 h-3.5" />
+                    <span className="inline-flex items-center gap-1 text-warning font-mono text-[10px]" title="Target outside scope — blocked by policy">
+                      <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                      <span className="text-[10px]">blocked</span>
                     </span>
                   )}
                 </td>
@@ -230,13 +271,18 @@ export const WorkbenchHistoryTable: React.FC<WorkbenchHistoryTableProps> = ({
                 {/* Tags */}
                 <td className="py-1.5 px-3">
                   <div className="flex items-center gap-1 overflow-hidden">
-                    {req.tags.slice(0, 2).map((tag) => (
+                    {!req.inScope && (
+                      <span className="px-1 py-0.2 rounded bg-warning/15 text-warning border border-warning/30 text-[10px] font-mono shrink-0">
+                        scope-blocked
+                      </span>
+                    )}
+                    {req.tags.filter((t) => t !== 'scope-blocked').slice(0, req.inScope ? 2 : 1).map((tag) => (
                       <span key={tag} className="px-1 py-0.2 rounded bg-surface-2 text-[10px] text-text-muted border border-border">
                         {tag}
                       </span>
                     ))}
-                    {req.tags.length > 2 && (
-                      <span className="text-[10px] text-text-muted">+{req.tags.length - 2}</span>
+                    {req.tags.filter((t) => t !== 'scope-blocked').length > (req.inScope ? 2 : 1) && (
+                      <span className="text-[10px] text-text-muted">+{req.tags.filter((t) => t !== 'scope-blocked').length - (req.inScope ? 2 : 1)}</span>
                     )}
                   </div>
                 </td>

@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from .ca import CertificateAuthority
+from .governor import RateLimitExceeded, RequestGovernor
 from .workbench import MAX_STORED_BODY, Flow, ScopePolicy, WorkbenchStore
 
 HOP_BY_HOP = {
@@ -236,6 +237,16 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
         headers = _headers_dict(request.headers)
         started = time.perf_counter()
         try:
+            if proxy.governor is not None:
+                proxy.governor.acquire(url, method=request.method)
+        except RateLimitExceeded as exc:
+            body = f"Rate limited by local governor: {exc}".encode()
+            self._record(
+                proxy, request, url, 429, {}, body, 0, in_scope=True, tags=["rate-limited"]
+            )
+            _write_response(sock, 429, "Too Many Requests", [("Content-Type", "text/plain")], body)
+            return
+        try:
             with httpx.Client(
                 follow_redirects=False,
                 timeout=proxy.timeout,
@@ -253,6 +264,11 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             self._record(proxy, request, url, 502, {}, body, 0, in_scope=True, tags=["proxy-error"])
             _write_response(sock, 502, "Bad Gateway", [("Content-Type", "text/plain")], body)
             return
+        finally:
+            if proxy.governor is not None:
+                proxy.governor.release(url)
+        if proxy.governor is not None:
+            proxy.governor.observe(url, response.status_code)
         duration_ms = int((time.perf_counter() - started) * 1000)
         full_content = response.content
         stored_content = full_content[:MAX_STORED_BODY]
@@ -334,6 +350,7 @@ class CaptureProxy:
         port: int = 8080,
         timeout: float = 30.0,
         verify_upstream: bool = True,
+        governor: RequestGovernor | None = None,
     ) -> None:
         self.project_path = project_path
         self.project_id = project_id
@@ -343,6 +360,7 @@ class CaptureProxy:
         self.requested_port = port
         self.timeout = timeout
         self.verify_upstream = verify_upstream
+        self.governor = governor
         self.db_path = project_path / ".chainsaw" / "workbench.db"
         self._server: _ProxyServer | None = None
         self._thread: threading.Thread | None = None
@@ -392,6 +410,15 @@ class CaptureProxy:
             "caPath": str(self.ca.cert_path) if self.ca.exists() else None,
             "captured": captured,
             "verifyUpstream": self.verify_upstream,
+            "rateLimit": (
+                {
+                    "requestsPerSecond": self.governor.policy.requests_per_second,
+                    "burst": self.governor.policy.burst,
+                    "maxInFlight": self.governor.policy.max_in_flight,
+                }
+                if self.governor is not None
+                else None
+            ),
         }
 
 
@@ -410,6 +437,7 @@ class ProxyManager:
         host: str = "127.0.0.1",
         port: int = 8080,
         verify_upstream: bool = True,
+        noise_profile: str = "balanced",
     ) -> dict[str, Any]:
         with self._lock:
             existing = self._proxies.get(project_id)
@@ -424,6 +452,7 @@ class ProxyManager:
                 host=host,
                 port=port,
                 verify_upstream=verify_upstream,
+                governor=RequestGovernor.from_profile(noise_profile),
             )
             proxy.start()
             self._proxies[project_id] = proxy

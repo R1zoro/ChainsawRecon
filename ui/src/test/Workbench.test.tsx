@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { WorkbenchPage } from '../features/workbench/WorkbenchPage';
-import { resetMockData, setMockServiceMode } from '../api/mockService';
+import { resetMockData, setMockServiceMode, setMockCaStatus, setMockProxyStatus } from '../api/mockService';
 
 function renderWorkbench(projectId = 'prj_demo') {
   const queryClient = new QueryClient({
@@ -38,7 +38,7 @@ describe('WorkbenchPage (Milestone 3: Native HTTP Workbench) Tests', () => {
     await waitFor(() => {
       expect(screen.getByText('HTTP Workbench')).toBeInTheDocument();
       expect(screen.getByText('Scope Enforced')).toBeInTheDocument();
-      expect(screen.getByText(/CA: Active/i)).toBeInTheDocument();
+      expect(screen.getByText(/CA: Generated/i)).toBeInTheDocument();
     });
 
     // Check View Switcher tabs
@@ -316,11 +316,11 @@ describe('WorkbenchPage (Milestone 3: Native HTTP Workbench) Tests', () => {
     renderWorkbench();
 
     await waitFor(() => {
-      expect(screen.getByText(/CA: Active/i)).toBeInTheDocument();
+      expect(screen.getByText(/CA: Generated/i)).toBeInTheDocument();
     });
 
     // Click CA button
-    const caBtn = screen.getByText(/CA: Active/i);
+    const caBtn = screen.getByText(/CA: Generated/i);
     fireEvent.click(caBtn);
 
     // Verify modal opens
@@ -336,16 +336,162 @@ describe('WorkbenchPage (Milestone 3: Native HTTP Workbench) Tests', () => {
     expect(screen.getByRole('button', { name: /CLI \/ Env/i })).toBeInTheDocument();
   });
 
-  it('renders honest empty state when zero requests are captured', async () => {
+  it('renders honest stopped empty state when zero requests are captured', async () => {
     setMockServiceMode('empty');
     renderWorkbench();
 
     await waitFor(() => {
-      expect(screen.getByText('No captured requests')).toBeInTheDocument();
+      expect(screen.getByText('No traffic captured yet')).toBeInTheDocument();
+      expect(
+        screen.getByText(/Start the proxy, then point your browser or CLI at it, or import a HAR/i)
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('renders running empty state differing from stopped when proxy is listening with zero requests', async () => {
+    setMockServiceMode('empty');
+    setMockProxyStatus({ running: true, proxyUrl: 'http://127.0.0.1:8080' });
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByText('Proxy is listening')).toBeInTheDocument();
+      expect(screen.getByText(/Configure your client to use/i)).toBeInTheDocument();
+      expect(screen.getByText('http://127.0.0.1:8080')).toBeInTheDocument();
+    });
+  });
+
+  it('starts capture proxy, displays running controls, and updates captured count', async () => {
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Start Capture/i })).toBeInTheDocument();
     });
 
-    expect(
-      screen.getByText(/Traffic will appear here as web requests are captured/i)
-    ).toBeInTheDocument();
+    // Click Start Capture
+    fireEvent.click(screen.getByRole('button', { name: /Start Capture/i }));
+
+    // Status changes to running
+    await waitFor(() => {
+      expect(screen.getByText('http://127.0.0.1:8080')).toBeInTheDocument();
+      expect(screen.getByText(/captured/i)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Stop Capture/i })).toBeInTheDocument();
+    });
+  });
+
+  it('stops capture proxy and returns to stopped state', async () => {
+    setMockProxyStatus({ running: true, proxyUrl: 'http://127.0.0.1:8080', captured: 5 });
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Stop Capture/i })).toBeInTheDocument();
+    });
+
+    // Click Stop Capture
+    fireEvent.click(screen.getByRole('button', { name: /Stop Capture/i }));
+
+    // Reverts to Start Capture button
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Start Capture/i })).toBeInTheDocument();
+    });
+  });
+
+  it('renders visible danger banner when start capture proxy fails and allows retry', async () => {
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Start Capture/i })).toBeInTheDocument();
+    });
+
+    // Set error mode
+    setMockServiceMode('error');
+
+    // Click Start Capture
+    fireEvent.click(screen.getByRole('button', { name: /Start Capture/i }));
+
+    // Error banner appears
+    await waitFor(() => {
+      expect(screen.getByText(/Proxy Error:/i)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument();
+    });
+  });
+
+  it('renders neutral CA modal when CA is unavailable without hardcoded path, generates CA, and refreshes', async () => {
+    setMockCaStatus({ available: false, path: null });
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByText(/CA: Missing/i)).toBeInTheDocument();
+    });
+
+    // Open CA modal
+    fireEvent.click(screen.getByText(/CA: Missing/i));
+
+    await waitFor(() => {
+      expect(screen.getByText('No local CA generated')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Generate CA/i })).toBeInTheDocument();
+      // Ensure path is NOT hardcoded
+      expect(screen.queryByText(/ca\.crt/i)).not.toBeInTheDocument();
+    });
+
+    // Click Generate CA
+    fireEvent.click(screen.getByRole('button', { name: /Generate CA/i }));
+
+    // Status refreshes to available
+    await waitFor(() => {
+      expect(screen.getAllByText(/ca\.crt/i).length).toBeGreaterThan(0);
+      expect(screen.getByText(/TLS Trust Warning/i)).toBeInTheDocument();
+    });
+  });
+
+  it('displays explicit TLS trust warning in CA modal and never exposes keyPath', async () => {
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByText(/CA: Generated/i)).toBeInTheDocument();
+    });
+
+    // Open CA modal
+    fireEvent.click(screen.getByText(/CA: Generated/i));
+
+    await waitFor(() => {
+      expect(screen.getByText(/TLS Trust Warning/i)).toBeInTheDocument();
+      expect(screen.getByText(/Traffic will fail TLS validation until this certificate is trusted/i)).toBeInTheDocument();
+      // Ensure keyPath/private key is never shown
+      expect(screen.queryByText(/ca\.key/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/PRIVATE KEY/i)).not.toBeInTheDocument();
+    });
+  });
+
+  it('renders "No requests match these filters" when filter yields 0 results and resets filters', async () => {
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByText('/api/v1/invoices/102')).toBeInTheDocument();
+    });
+
+    // Type non-matching search
+    const searchInput = screen.getByPlaceholderText(/Filter requests by URL/i);
+    fireEvent.change(searchInput, { target: { value: 'non_existent_search_query_xyz' } });
+
+    await waitFor(() => {
+      expect(screen.getByText('No requests match these filters')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Reset filters/i })).toBeInTheDocument();
+    });
+
+    // Click Reset filters
+    fireEvent.click(screen.getByRole('button', { name: /Reset filters/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('/api/v1/invoices/102')).toBeInTheDocument();
+    });
+  });
+
+  it('displays CA: Trusted badge when CA is verified installed', async () => {
+    setMockCaStatus({ available: true, installed: true });
+    renderWorkbench();
+
+    await waitFor(() => {
+      expect(screen.getByText(/CA: Trusted/i)).toBeInTheDocument();
+    });
   });
 });

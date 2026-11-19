@@ -23,6 +23,8 @@ from xml.etree import ElementTree
 
 import httpx
 
+from .governor import RateLimitExceeded, RequestGovernor
+
 REDACTED = "\u00abredacted\u00bb"
 SENSITIVE_HEADERS = {
     "authorization",
@@ -444,6 +446,14 @@ class WorkbenchStore:
         ).fetchone()
         return self._row_to_flow(row) if row else None
 
+    def raw_flows(self, *, limit: int = 500) -> list[Flow]:
+        rows = self.conn.execute(
+            f"SELECT {','.join(FLOW_COLUMNS)} FROM flows WHERE project_id=? "
+            "ORDER BY captured_at DESC LIMIT ?",
+            (self.project_id, max(1, min(limit, 5000))),
+        ).fetchall()
+        return [self._row_to_flow(row) for row in rows]
+
     def require_flow(self, flow_id: str) -> Flow:
         flow = self.get_flow(flow_id)
         if flow is None:
@@ -788,6 +798,9 @@ def replay(
     justification: str = "",
     transport: httpx.BaseTransport | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    governor: RequestGovernor | None = None,
+    auth_headers: dict[str, str] | None = None,
+    auth_cookies: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Replay exactly one request. Scope is checked before transport."""
 
@@ -814,8 +827,12 @@ def replay(
     decision = policy.check(url)
 
     headers = _merge_headers(baseline.request_headers, patch.get("header"))
+    if auth_headers:
+        headers = _merge_headers(headers, auth_headers)
     if patch.get("cookie"):
         headers = _apply_cookies(headers, dict(patch["cookie"]))
+    if auth_cookies:
+        headers = _apply_cookies(headers, auth_cookies)
     body = _replay_body(baseline, patch, headers)
 
     transient = Flow(
@@ -854,6 +871,11 @@ def replay(
         raise ApprovalRequired(method)
 
     started = time.perf_counter()
+    if governor is not None:
+        try:
+            governor.acquire(url, method=method)
+        except RateLimitExceeded as exc:
+            raise TransportFailed(str(exc)) from exc
     try:
         with httpx.Client(
             follow_redirects=False,
@@ -864,6 +886,11 @@ def replay(
             response = client.request(method, url, headers=headers, content=body)
     except httpx.HTTPError as exc:
         raise TransportFailed(f"replay transport failed: {exc}") from exc
+    finally:
+        if governor is not None:
+            governor.release(url)
+    if governor is not None:
+        governor.observe(url, response.status_code)
     duration_ms = int((time.perf_counter() - started) * 1000)
 
     content = response.content

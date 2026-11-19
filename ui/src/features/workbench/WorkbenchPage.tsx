@@ -7,6 +7,7 @@ import {
   ProjectSummary, 
   ProjectScopeResponse, 
   CaStatusResponse, 
+  ProxyStatusResponse,
   Paginated, 
   CapturedRequest, 
   RequestDetailResponse,
@@ -43,6 +44,11 @@ export const WorkbenchPage: React.FC = () => {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [proxyError, setProxyError] = useState<string | null>(null);
+  const [isStartingProxy, setIsStartingProxy] = useState(false);
+  const [isStoppingProxy, setIsStoppingProxy] = useState(false);
+  const [isGeneratingCa, setIsGeneratingCa] = useState(false);
+  const [lastProxyAction, setLastProxyAction] = useState<'start' | 'stop' | null>(null);
 
   // 3. Modals State
   const [isCaModalOpen, setIsCaModalOpen] = useState(false);
@@ -88,6 +94,14 @@ export const WorkbenchPage: React.FC = () => {
   const { data: caStatus } = useQuery({
     queryKey: ['caStatus'],
     queryFn: () => fetchJson<CaStatusResponse>('/workbench/ca'),
+  });
+
+  // Query: Proxy Runtime Status (Poll every 2s only while running)
+  const { data: proxyStatus } = useQuery({
+    queryKey: ['proxyStatus', projectId],
+    queryFn: () => fetchJson<ProxyStatusResponse>(`/workbench/proxy/status?projectId=${projectId}`),
+    enabled: Boolean(projectId),
+    refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
   });
 
   // Query: Captured Traffic History
@@ -266,6 +280,67 @@ export const WorkbenchPage: React.FC = () => {
     }
   };
 
+  const handleStartProxy = async () => {
+    setProxyError(null);
+    setIsStartingProxy(true);
+    setLastProxyAction('start');
+    try {
+      await fetchJson<ProxyStatusResponse>('/workbench/proxy/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, port: 8080, verifyUpstream: true }),
+      });
+      queryClient.invalidateQueries({ queryKey: ['proxyStatus', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['caStatus'] });
+      refetchHistory();
+    } catch (err) {
+      setProxyError(isApiError(err) ? err.message : 'Failed to start capture proxy. Verify local port availability.');
+    } finally {
+      setIsStartingProxy(false);
+    }
+  };
+
+  const handleStopProxy = async () => {
+    setProxyError(null);
+    setIsStoppingProxy(true);
+    setLastProxyAction('stop');
+    try {
+      await fetchJson<ProxyStatusResponse>('/workbench/proxy/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId }),
+      });
+      queryClient.invalidateQueries({ queryKey: ['proxyStatus', projectId] });
+    } catch (err) {
+      setProxyError(isApiError(err) ? err.message : 'Failed to stop capture proxy.');
+    } finally {
+      setIsStoppingProxy(false);
+    }
+  };
+
+  const handleGenerateCa = async () => {
+    setIsGeneratingCa(true);
+    try {
+      await fetchJson<CaStatusResponse>('/workbench/ca', {
+        method: 'POST',
+      });
+      queryClient.invalidateQueries({ queryKey: ['caStatus'] });
+      queryClient.invalidateQueries({ queryKey: ['proxyStatus', projectId] });
+    } catch (err) {
+      setProxyError(isApiError(err) ? err.message : 'Failed to generate Root CA certificate.');
+    } finally {
+      setIsGeneratingCa(false);
+    }
+  };
+
+  const handleRetryProxyAction = () => {
+    if (lastProxyAction === 'start') {
+      handleStartProxy();
+    } else if (lastProxyAction === 'stop') {
+      handleStopProxy();
+    }
+  };
+
   return (
     <div className="h-screen bg-bg text-text flex flex-col font-sans overflow-hidden select-none selection:bg-accent/20 selection:text-accent">
       {/* 1. Top Workbench Header */}
@@ -273,6 +348,11 @@ export const WorkbenchPage: React.FC = () => {
         project={project}
         scopeData={scopeData}
         caStatus={caStatus}
+        proxyStatus={proxyStatus}
+        isStartingProxy={isStartingProxy}
+        isStoppingProxy={isStoppingProxy}
+        onStartProxy={handleStartProxy}
+        onStopProxy={handleStopProxy}
         activeTab={activeTab}
         onChangeTab={setActiveTab}
         historyCount={capturedRequests.length}
@@ -284,6 +364,29 @@ export const WorkbenchPage: React.FC = () => {
         onRefresh={() => refetchHistory()}
         isRefreshing={isHistoryFetching}
       />
+
+      {/* Proxy Error Banner */}
+      {proxyError && (
+        <div className="bg-danger/15 border-b border-danger/30 px-4 py-2.5 flex items-center justify-between text-danger font-mono text-xs shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span><strong>Proxy Error:</strong> {proxyError}</span>
+            <button
+              onClick={handleRetryProxyAction}
+              className="ml-2 px-2 py-0.5 rounded bg-danger/20 hover:bg-danger/30 underline font-sans text-xs"
+            >
+              Retry
+            </button>
+          </div>
+          <button
+            onClick={() => setProxyError(null)}
+            className="p-1 rounded hover:bg-danger/20 text-danger"
+            aria-label="Dismiss error"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Export Error Banner */}
       {exportError && (
@@ -360,6 +463,17 @@ export const WorkbenchPage: React.FC = () => {
                     setPageSize(ps);
                     setCurrentPage(1);
                   }}
+                  proxyRunning={Boolean(proxyStatus?.running)}
+                  proxyUrl={proxyStatus?.proxyUrl}
+                  hasActiveFilters={Boolean(
+                    searchQuery ||
+                    selectedMethod !== 'ALL' ||
+                    selectedStatus !== 'ALL' ||
+                    selectedAuth !== 'ALL' ||
+                    selectedTag !== 'ALL' ||
+                    isInScopeOnly
+                  )}
+                  onResetFilters={handleResetFilters}
                 />
               </div>
 
@@ -408,6 +522,8 @@ export const WorkbenchPage: React.FC = () => {
         isOpen={isCaModalOpen}
         onClose={() => setIsCaModalOpen(false)}
         caStatus={caStatus}
+        onGenerateCa={handleGenerateCa}
+        isGenerating={isGeneratingCa}
       />
 
       <ImportHarModal

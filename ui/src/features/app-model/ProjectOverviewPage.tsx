@@ -10,11 +10,15 @@ import {
   Paginated, 
   AppEntity, 
   EntityDetailResponse, 
-  NoteItem 
+  NoteItem,
+  SitemapResponse,
+  SitemapNode,
+  RecordCoveragePayload
 } from '../../api/types';
 import { ProjectHeader, AppModelViewTab } from './components/ProjectHeader';
 import { AppModelGraphView } from './components/AppModelGraphView';
 import { AppModelTableView } from './components/AppModelTableView';
+import { AppModelSitemapView } from './components/AppModelSitemapView';
 import { EntityDetailDrawer } from './components/EntityDetailDrawer';
 
 export const ProjectOverviewPage: React.FC = () => {
@@ -96,6 +100,17 @@ export const ProjectOverviewPage: React.FC = () => {
     enabled: Boolean(projectId && selectedEntityId),
   });
 
+  // 6. Fetch Hierarchical Coverage-Aware Sitemap
+  const {
+    data: sitemapData,
+    refetch: refetchSitemap,
+    isFetching: isSitemapFetching,
+  } = useQuery({
+    queryKey: ['appModelSitemap', projectId],
+    queryFn: () => fetchJson<SitemapResponse>(`/projects/${projectId}/app-model/sitemap?maxNodes=2000`),
+    enabled: Boolean(projectId),
+  });
+
   // Entities & Edges collections
   const entities = useMemo(() => {
     return entitiesData?.items?.length ? entitiesData.items : (graphData?.entities ?? []);
@@ -105,11 +120,30 @@ export const ProjectOverviewPage: React.FC = () => {
     return graphData?.edges || [];
   }, [graphData]);
 
+  // Helper to find entity with coverage in sitemap tree
+  const sitemapEntity = useMemo(() => {
+    if (!selectedEntityId || !sitemapData?.roots) return null;
+    const findInTree = (nodes: SitemapNode[]): (AppEntity & { coverage?: any; findingCount?: number }) | null => {
+      for (const n of nodes) {
+        if (n.entity.id === selectedEntityId) return n.entity;
+        const found = findInTree(n.children);
+        if (found) return found;
+      }
+      return null;
+    };
+    return findInTree(sitemapData.roots);
+  }, [selectedEntityId, sitemapData]);
+
   // Selected Entity object
   const selectedEntity = useMemo(() => {
     if (!selectedEntityId) return null;
-    return entities.find((e) => e.id === selectedEntityId) || entityDetailData?.entity || null;
-  }, [selectedEntityId, entities, entityDetailData]);
+    return (
+      sitemapEntity ||
+      entities.find((e) => e.id === selectedEntityId) ||
+      entityDetailData?.entity ||
+      null
+    );
+  }, [selectedEntityId, sitemapEntity, entities, entityDetailData]);
 
   const staleCount = useMemo(() => {
     return entities.filter((e) => e.stale).length;
@@ -121,6 +155,21 @@ export const ProjectOverviewPage: React.FC = () => {
       refetchProject(),
       refetchGraph(),
       refetchEntities(),
+      refetchSitemap(),
+    ]);
+  };
+
+  const handleRecordCoverage = async (entityId: string, payload: RecordCoveragePayload) => {
+    if (!projectId) return;
+    await fetchJson(`/projects/${projectId}/app-model/entities/${entityId}/coverage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['appModelSitemap', projectId] }),
+      queryClient.invalidateQueries({ queryKey: ['appModelEntities', projectId] }),
+      queryClient.invalidateQueries({ queryKey: ['entityDetail', projectId, entityId] }),
     ]);
   };
 
@@ -273,7 +322,7 @@ export const ProjectOverviewPage: React.FC = () => {
   }
 
   // Honest Empty State: Project exists, but no application model entities seeded or mapped yet
-  const hasNoEntities = entities.length === 0 && (!graphData || graphData.entities.length === 0);
+  const hasNoEntities = entities.length === 0 && (!graphData || graphData.entities.length === 0) && (!sitemapData || sitemapData.roots.length === 0);
 
   return (
     <div className="h-screen bg-bg text-text flex flex-col font-sans overflow-hidden select-none selection:bg-accent/20 selection:text-accent">
@@ -291,7 +340,7 @@ export const ProjectOverviewPage: React.FC = () => {
         onExportJson={handleExportJson}
         onExportPng={() => handleExportImage('png')}
         onExportSvg={() => handleExportImage('svg')}
-        isRefreshing={isProjectFetching || isGraphFetching || isEntitiesFetching}
+        isRefreshing={isProjectFetching || isGraphFetching || isEntitiesFetching || isSitemapFetching}
       />
 
       {exportError && (
@@ -323,7 +372,7 @@ export const ProjectOverviewPage: React.FC = () => {
         </div>
       )}
 
-      {/* 2. Main Work Surface (Graph vs Table + Slide-over Detail Drawer) */}
+      {/* 2. Main Work Surface (Graph vs Sitemap vs Table + Slide-over Detail Drawer) */}
       <div className="flex-1 flex min-h-0 overflow-hidden relative">
         {hasNoEntities ? (
           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-3 bg-[#0A0D12]">
@@ -368,6 +417,19 @@ export const ProjectOverviewPage: React.FC = () => {
                 maxNodes={maxNodes}
                 onChangeMaxNodes={setMaxNodes}
               />
+            ) : activeTab === 'sitemap' ? (
+              <AppModelSitemapView
+                sitemapData={sitemapData}
+                edges={edges}
+                notes={entityDetailData?.notes || []}
+                allEntities={entities}
+                selectedEntity={selectedEntity}
+                onSelectEntity={(entity) => setSelectedEntityId(entity?.id || null)}
+                onAddNote={handleAddNote}
+                onRecordCoverage={handleRecordCoverage}
+                onRefresh={handleRefresh}
+                isRefreshing={isProjectFetching || isSitemapFetching}
+              />
             ) : (
               <AppModelTableView
                 entities={entities}
@@ -382,17 +444,19 @@ export const ProjectOverviewPage: React.FC = () => {
               />
             )}
 
-            {/* Slide-over Entity Detail Drawer */}
-            {selectedEntity && (
+            {/* Slide-over Entity Detail Drawer (for Graph & Table views; Sitemap embeds its own 3rd pane) */}
+            {activeTab !== 'sitemap' && selectedEntity && (
               <EntityDetailDrawer
                 entity={selectedEntity}
                 edges={edges}
                 notes={entityDetailData?.notes || []}
                 allEntities={entities}
+                coverageData={sitemapData?.coverage || null}
                 onClose={() => setSelectedEntityId(null)}
                 onSelectEntity={(entity) => setSelectedEntityId(entity.id)}
                 onFilterGraphToNeighbors={handleFocusNeighbors}
                 onAddNote={handleAddNote}
+                onRecordCoverage={handleRecordCoverage}
               />
             )}
           </>

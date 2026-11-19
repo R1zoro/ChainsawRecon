@@ -2,6 +2,8 @@
 name = "bounty-agent"
 version = "0.1.0"
 description = "Scope-aware bug bounty triage agent with sandboxed tool execution."
+license = { text = "MIT" }
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115",
@@ -16,6 +18,9 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
     "mypy>=1.13",
+]
+webui = [
+    "playwright>=1.49",
 ]
 
 [build-system]

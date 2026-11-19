@@ -25,9 +25,18 @@ import {
   ResponseCompareResponse,
   CreateEvidencePayload,
   CaStatusResponse,
+  ProxyStatusResponse,
+  ProxyStartPayload,
+  ProxyStopPayload,
   Finding,
   FindingDetailResponse,
   FindingTransitionPayload,
+  CoverageEntry,
+  CoverageGap,
+  SitemapNode,
+  SitemapResponse,
+  ProjectCoverageResponse,
+  RecordCoveragePayload,
 } from './types';
 import { initialMockProjects, mockRecentActivity, mockProviders } from './mockData';
 import { ApiError } from './client';
@@ -892,8 +901,20 @@ const initialMockRequestDetails: Record<string, RequestDetailResponse> = {
 const initialMockCaStatus: CaStatusResponse = {
   available: true,
   path: 'C:/Users/XYLA/.chainsaw/ca.crt',
-  installed: true,
+  keyPath: 'C:/Users/XYLA/.chainsaw/ca.key',
+  installed: false,
   instructions: 'Install Chainsaw CA into your Trusted Root Certification Authorities store or import ca.crt into your browser settings.',
+};
+
+const initialMockProxyStatus: ProxyStatusResponse = {
+  running: false,
+  projectId: 'prj_demo',
+  host: '127.0.0.1',
+  port: 8080,
+  proxyUrl: 'http://127.0.0.1:8080',
+  caPath: 'C:/Users/XYLA/.chainsaw/ca.crt',
+  captured: 6,
+  verifyUpstream: true,
 };
 
 // ── Milestone 4 Mock Findings Fixtures ─────────────────────────
@@ -1059,10 +1080,63 @@ const initialMockFindings: Finding[] = [
   }
 ];
 
+const initialMockCoverageEntries: CoverageEntry[] = [
+  {
+    id: 1,
+    entityId: 'rot_users_id',
+    surface: 'GET /api/v1/users/{id}',
+    riskArea: 'idor',
+    outcome: 'reported',
+    evidenceId: 'evd_demo_01',
+    reason: 'Cross-tenant IDOR confirmed on invoice read',
+    worker: 'operator',
+    createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+  },
+  {
+    id: 2,
+    entityId: 'rot_auth_login',
+    surface: 'POST /api/v1/auth/login',
+    riskArea: 'auth_bypass',
+    outcome: 'no_issue_found',
+    evidenceId: 'evd_demo_02',
+    reason: 'Credential bruteforce throttled and JWT tokens cryptographically signed',
+    worker: 'validator',
+    createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+  },
+  {
+    id: 3,
+    entityId: 'rot_billing_invoices',
+    surface: 'GET /v1/billing/invoices',
+    riskArea: 'idor',
+    outcome: 'no_issue_found',
+    evidenceId: null,
+    reason: 'Negative verification executed without supporting evidence artifact',
+    worker: 'recon',
+    createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(),
+  },
+  {
+    id: 4,
+    entityId: 'inp_user_id',
+    surface: '{id}',
+    riskArea: 'sqli',
+    outcome: 'no_issue_found',
+    evidenceId: null,
+    reason: 'ORM parameter binding verified',
+    worker: 'operator',
+    createdAt: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
+    updatedAt: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
+  },
+];
+
 let mockCapturedRequests: CapturedRequest[] = JSON.parse(JSON.stringify(initialMockCapturedRequests));
 let mockRequestDetails: Record<string, RequestDetailResponse> = JSON.parse(JSON.stringify(initialMockRequestDetails));
 let mockCaStatus: CaStatusResponse = JSON.parse(JSON.stringify(initialMockCaStatus));
+let mockProxyStatus: ProxyStatusResponse = JSON.parse(JSON.stringify(initialMockProxyStatus));
 let mockFindings: Finding[] = JSON.parse(JSON.stringify(initialMockFindings));
+let mockCoverageEntries: CoverageEntry[] = JSON.parse(JSON.stringify(initialMockCoverageEntries));
 
 export function setMockServiceMode(mode: MockServiceMode) {
   currentMode = mode;
@@ -1084,7 +1158,9 @@ export function resetMockData() {
   mockCapturedRequests = JSON.parse(JSON.stringify(initialMockCapturedRequests));
   mockRequestDetails = JSON.parse(JSON.stringify(initialMockRequestDetails));
   mockCaStatus = JSON.parse(JSON.stringify(initialMockCaStatus));
+  mockProxyStatus = JSON.parse(JSON.stringify(initialMockProxyStatus));
   mockFindings = JSON.parse(JSON.stringify(initialMockFindings));
+  mockCoverageEntries = JSON.parse(JSON.stringify(initialMockCoverageEntries));
   currentMode = 'healthy';
 }
 
@@ -2043,6 +2119,90 @@ export async function fetchCaStatus(): Promise<CaStatusResponse> {
   return mockCaStatus;
 }
 
+export async function generateCa(): Promise<CaStatusResponse> {
+  await new Promise((res) => setTimeout(res, 50));
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'CA_GENERATION_FAILED',
+      message: 'Failed to write CA certificate',
+      request_id: 'req_ca_gen_err',
+    });
+  }
+  mockCaStatus = {
+    available: true,
+    path: 'C:/Users/XYLA/.chainsaw/ca.crt',
+    keyPath: 'C:/Users/XYLA/.chainsaw/ca.key',
+    installed: false,
+    instructions: 'Install Chainsaw CA into your Trusted Root Certification Authorities store or import ca.crt into your browser settings.',
+  };
+  return mockCaStatus;
+}
+
+export async function fetchProxyStatus(projectId?: string): Promise<ProxyStatusResponse> {
+  await new Promise((res) => setTimeout(res, 30));
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'PROXY_STATUS_FAILED',
+      message: 'Backend proxy service unreachable',
+      request_id: 'req_proxy_status_err',
+    });
+  }
+  return {
+    ...mockProxyStatus,
+    projectId: projectId || mockProxyStatus.projectId,
+    captured: mockCapturedRequests.length,
+  };
+}
+
+export async function startProxy(payload: ProxyStartPayload): Promise<ProxyStatusResponse> {
+  await new Promise((res) => setTimeout(res, 50));
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'BAD_REQUEST',
+      message: "cannot start proxy: [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8080): only one usage of each socket address is normally permitted",
+      request_id: 'req_proxy_start_err',
+    });
+  }
+  const host = payload.host || '127.0.0.1';
+  const port = payload.port || 8080;
+  mockProxyStatus = {
+    running: true,
+    projectId: payload.projectId,
+    host,
+    port,
+    proxyUrl: `http://${host}:${port}`,
+    caPath: mockCaStatus.available ? mockCaStatus.path : null,
+    captured: mockCapturedRequests.length,
+    verifyUpstream: payload.verifyUpstream !== undefined ? payload.verifyUpstream : true,
+  };
+  return mockProxyStatus;
+}
+
+export async function stopProxy(payload: ProxyStopPayload): Promise<ProxyStatusResponse> {
+  await new Promise((res) => setTimeout(res, 50));
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'BAD_REQUEST',
+      message: 'cannot stop proxy: proxy not found',
+      request_id: 'req_proxy_stop_err',
+    });
+  }
+  mockProxyStatus = {
+    ...mockProxyStatus,
+    running: false,
+    projectId: payload.projectId || mockProxyStatus.projectId,
+  };
+  return mockProxyStatus;
+}
+
+export function setMockCaStatus(override: Partial<CaStatusResponse>) {
+  mockCaStatus = { ...mockCaStatus, ...override };
+}
+
+export function setMockProxyStatus(override: Partial<ProxyStatusResponse>) {
+  mockProxyStatus = { ...mockProxyStatus, ...override };
+}
+
 // ── Milestone 4: Findings Mock Handlers ─────────────────────────
 
 export async function fetchFindings(params?: {
@@ -2224,6 +2384,274 @@ export async function transitionFinding(
 
   mockFindings[index] = updated;
   return updated;
+}
+
+// ── Milestone 2.5: Coverage & Sitemap Mock Handlers (Atlas) ──────
+
+export async function fetchAppModelCoverage(
+  _projectId?: string
+): Promise<ProjectCoverageResponse> {
+  await new Promise((res) => setTimeout(res, 40));
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'COVERAGE_UNAVAILABLE',
+      message: 'Failed to retrieve project coverage ledger.',
+      request_id: 'req_cov_err',
+    });
+  }
+
+  const outcomes: Record<string, number> = {};
+  const gaps: CoverageGap[] = [];
+
+  mockCoverageEntries.forEach((entry) => {
+    outcomes[entry.outcome] = (outcomes[entry.outcome] || 0) + 1;
+    if (entry.outcome === 'needs_follow_up') {
+      gaps.push({ kind: 'needs_follow_up', ...entry });
+    } else if (entry.outcome === 'no_issue_found' && !entry.evidenceId) {
+      gaps.push({ kind: 'missing_evidence', ...entry });
+    } else if (['ruled_out', 'not_applicable'].includes(entry.outcome) && !entry.reason) {
+      gaps.push({ kind: 'missing_reason', ...entry });
+    }
+  });
+
+  const testedEntityIds = new Set(mockCoverageEntries.map((e) => e.entityId));
+
+  return {
+    entries: [...mockCoverageEntries],
+    tested: testedEntityIds.size,
+    outcomes,
+    gaps,
+  };
+}
+
+export async function fetchAppModelSitemap(
+  projectId?: string,
+  maxNodes: number = 2000
+): Promise<SitemapResponse> {
+  await new Promise((res) => setTimeout(res, 60));
+  if (currentMode === 'error') {
+    throw new ApiError({
+      code: 'SITEMAP_UNAVAILABLE',
+      message: 'Failed to retrieve application sitemap.',
+      request_id: 'req_sitemap_err',
+    });
+  }
+
+  if (currentMode === 'empty') {
+    return {
+      roots: [],
+      sideEntities: { identities: [], technologies: [], flows: [], findings: [] },
+      stats: {
+        applications: 0,
+        services: 0,
+        routes: 0,
+        inputs: 0,
+        inScope: 0,
+        tested: 0,
+        untested: 0,
+        findings: 0,
+        coverageEntries: 0,
+        coverageGaps: 0,
+      },
+      coverage: { entries: 0, tested: 0, outcomes: {}, gaps: [] },
+      truncated: false,
+    };
+  }
+
+  const entities = mockEntities.filter((e) => !projectId || e.projectId === projectId || e.projectId === 'prj_demo');
+  const byId = new Map<string, AppEntity>();
+  entities.forEach((e) => byId.set(e.id, e));
+
+  // Build children map based on ('application', 'service'), ('service', 'route'), ('route', 'input')
+  const childrenMap = new Map<string, string[]>();
+  const parents = new Set<string>();
+
+  mockEdges.forEach((edge) => {
+    const source = byId.get(edge.sourceId);
+    const target = byId.get(edge.targetId);
+    if (!source || !target) return;
+
+    const validChild =
+      (source.kind === 'application' && target.kind === 'service') ||
+      (source.kind === 'service' && target.kind === 'route') ||
+      (source.kind === 'route' && target.kind === 'input');
+
+    if (validChild) {
+      const list = childrenMap.get(edge.sourceId) || [];
+      list.push(edge.targetId);
+      childrenMap.set(edge.sourceId, list);
+      parents.add(edge.targetId);
+    }
+  });
+
+  // Calculate coverage for entity
+  const getEntityCoverage = (entityId: string) => {
+    const entries = mockCoverageEntries.filter((e) => e.entityId === entityId);
+    const outcomes: Record<string, number> = {};
+    let lastTestedAt: string | null = null;
+    entries.forEach((entry) => {
+      outcomes[entry.outcome] = (outcomes[entry.outcome] || 0) + 1;
+      if (!lastTestedAt || entry.updatedAt > lastTestedAt) {
+        lastTestedAt = entry.updatedAt;
+      }
+    });
+    return {
+      tested: entries.length > 0,
+      outcomes,
+      lastTestedAt,
+      entries,
+    };
+  };
+
+  // Calculate finding count for entity
+  const getFindingCount = (entity: AppEntity) => {
+    return mockFindings.filter((f) => {
+      if (f.entityId && f.entityId === entity.id) return true;
+      if (f.asset === entity.id) return true;
+      if (f.asset === entity.name) return true;
+      if (entity.meta?.url && f.asset === entity.meta.url) return true;
+      if (entity.meta?.path && typeof f.asset === 'string' && f.asset.includes(String(entity.meta.path))) return true;
+      return false;
+    }).length;
+  };
+
+  const buildNode = (entityId: string, seen: Set<string>): SitemapNode => {
+    const entity = byId.get(entityId)!;
+    const coverage = getEntityCoverage(entityId);
+    const findingCount = getFindingCount(entity);
+
+    if (seen.has(entityId)) {
+      return {
+        entity: { ...entity, coverage, findingCount },
+        children: [],
+      };
+    }
+    const nextSeen = new Set(seen);
+    nextSeen.add(entityId);
+
+    const childIds = childrenMap.get(entityId) || [];
+    const children = childIds
+      .map((cId) => buildNode(cId, nextSeen))
+      .sort((a, b) => a.entity.name.localeCompare(b.entity.name));
+
+    return {
+      entity: { ...entity, coverage, findingCount },
+      children,
+    };
+  };
+
+  // Find root applications
+  let rootEntities = entities.filter((e) => e.kind === 'application' && !parents.has(e.id));
+  if (rootEntities.length === 0) {
+    rootEntities = entities.filter((e) => ['service', 'route'].includes(e.kind) && !parents.has(e.id));
+  }
+
+  const roots = rootEntities.map((r) => buildNode(r.id, new Set()));
+
+  const flatten = (nodes: SitemapNode[]): (AppEntity & { coverage?: any })[] => {
+    const list: (AppEntity & { coverage?: any })[] = [];
+    nodes.forEach((n) => {
+      list.push(n.entity);
+      list.push(...flatten(n.children));
+    });
+    return list;
+  };
+
+  const flat = flatten(roots);
+  const coverageSummary = await fetchAppModelCoverage(projectId);
+  const findings = entities.filter((e) => e.kind === 'finding');
+  const scoped = flat.filter((e) => ['service', 'route', 'input'].includes(e.kind));
+  const tested = scoped.filter((e) => e.coverage?.tested);
+
+  return {
+    roots,
+    sideEntities: {
+      identities: entities.filter((e) => e.kind === 'identity'),
+      technologies: entities.filter((e) => e.kind === 'technology'),
+      flows: entities.filter((e) => e.kind === 'flow'),
+      findings,
+    },
+    stats: {
+      applications: flat.filter((e) => e.kind === 'application').length,
+      services: flat.filter((e) => e.kind === 'service').length,
+      routes: flat.filter((e) => e.kind === 'route').length,
+      inputs: flat.filter((e) => e.kind === 'input').length,
+      inScope: scoped.length,
+      tested: tested.length,
+      untested: Math.max(0, scoped.length - tested.length),
+      findings: findings.length || 1,
+      coverageEntries: coverageSummary.entries.length,
+      coverageGaps: coverageSummary.gaps.length,
+    },
+    coverage: {
+      entries: coverageSummary.entries.length,
+      tested: coverageSummary.tested,
+      outcomes: coverageSummary.outcomes,
+      gaps: coverageSummary.gaps,
+    },
+    truncated: flat.length >= maxNodes,
+  };
+}
+
+export async function recordAppModelCoverage(
+  _projectId: string,
+  entityId: string,
+  payload: RecordCoveragePayload
+): Promise<CoverageEntry> {
+  await new Promise((res) => setTimeout(res, 50));
+
+  const validOutcomes = ['reported', 'no_issue_found', 'ruled_out', 'not_applicable', 'needs_follow_up'];
+  if (!validOutcomes.includes(payload.outcome)) {
+    throw new ApiError({
+      code: 'BAD_REQUEST',
+      message: `coverage outcome must be one of ${validOutcomes.join(', ')}`,
+      request_id: 'req_cov_invalid_outcome',
+    });
+  }
+
+  if (!payload.riskArea || !payload.riskArea.trim()) {
+    throw new ApiError({
+      code: 'BAD_REQUEST',
+      message: 'riskArea is required',
+      request_id: 'req_cov_no_risk',
+    });
+  }
+
+  const existingIdx = mockCoverageEntries.findIndex(
+    (e) => e.entityId === entityId && e.riskArea.toLowerCase() === payload.riskArea.toLowerCase()
+  );
+
+  const now = new Date().toISOString();
+  if (existingIdx !== -1) {
+    const existing = mockCoverageEntries[existingIdx];
+    const updated: CoverageEntry = {
+      ...existing,
+      outcome: payload.outcome,
+      surface: payload.surface || existing.surface,
+      evidenceId: payload.evidenceId !== undefined ? payload.evidenceId : existing.evidenceId,
+      reason: payload.reason !== undefined ? payload.reason : existing.reason,
+      worker: payload.worker || existing.worker,
+      updatedAt: now,
+    };
+    mockCoverageEntries[existingIdx] = updated;
+    return updated;
+  }
+
+  const newEntry: CoverageEntry = {
+    id: mockCoverageEntries.length + 1,
+    entityId,
+    surface: payload.surface || entityId,
+    riskArea: payload.riskArea.toLowerCase(),
+    outcome: payload.outcome,
+    evidenceId: payload.evidenceId || null,
+    reason: payload.reason || '',
+    worker: payload.worker || 'operator',
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  mockCoverageEntries.push(newEntry);
+  return newEntry;
 }
 
 

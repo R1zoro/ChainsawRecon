@@ -20,9 +20,10 @@ from .controller import (
     ReplayAction,
     SupervisorDecision,
 )
+from .governor import RequestGovernor
 from .providers import (
     ChatMessage,
-    OpenAICompatibleProvider,
+    ChatProvider,
     ProviderResponseError,
     extract_json_object,
 )
@@ -62,6 +63,7 @@ class RunConfig:
     context_window: int = 8192
     max_output_tokens: int = 1024
     temperature: float = 0.1
+    noise_profile: str = "balanced"
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,7 @@ def parse_decision(payload: dict[str, Any]) -> SupervisorDecision:
 class LLMDecisionProvider:
     def __init__(
         self,
-        provider: OpenAICompatibleProvider,
+        provider: ChatProvider,
         *,
         model: str = "",
         temperature: float = 0.1,
@@ -168,7 +170,7 @@ class LLMDecisionProvider:
 class LLMActionProvider:
     def __init__(
         self,
-        provider: OpenAICompatibleProvider,
+        provider: ChatProvider,
         store: WorkbenchStore,
         *,
         model: str = "",
@@ -262,7 +264,7 @@ class Runner:
         *,
         store: WorkbenchStore,
         policy: ScopePolicy,
-        provider: OpenAICompatibleProvider | None = None,
+        provider: ChatProvider | None = None,
         model: str = "",
         config: RunConfig | None = None,
         decision_provider: DecisionProvider | None = None,
@@ -318,6 +320,7 @@ class Runner:
             assembler=assembler,
             model=self.model,
             transport=self.transport,
+            governor=RequestGovernor.from_profile(self.config.noise_profile),
         )
 
         ticks: list[dict[str, Any]] = []

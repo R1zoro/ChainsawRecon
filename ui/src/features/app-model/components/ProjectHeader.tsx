@@ -2,11 +2,11 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
   ArrowLeft, Copy, Check, Shield, ShieldAlert, 
-  Network, Table, Download, RotateCw, Play, AlertTriangle, Terminal 
+  Network, Table, Download, RotateCw, Play, AlertTriangle, Terminal, Layers 
 } from 'lucide-react';
 import { ProjectSummary, ProjectScopeResponse, ActiveSessionSummary } from '../../../api/types';
 
-export type AppModelViewTab = 'graph' | 'table';
+export type AppModelViewTab = 'graph' | 'sitemap' | 'table';
 
 interface ProjectHeaderProps {
   project?: ProjectSummary | null;
@@ -141,7 +141,7 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
             </button>
           )}
 
-          {/* View Switcher (Graph vs Table) */}
+          {/* View Switcher (Graph vs Sitemap vs Table) */}
           <div className="flex items-center bg-bg p-0.5 rounded-lg border border-border">
             <button
               onClick={() => onChangeTab('graph')}
@@ -154,6 +154,18 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
             >
               <Network className="w-3.5 h-3.5" />
               <span>Graph</span>
+            </button>
+            <button
+              onClick={() => onChangeTab('sitemap')}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                activeTab === 'sitemap'
+                  ? 'bg-surface-2 text-text shadow-sm border border-border'
+                  : 'text-text-muted hover:text-text'
+              }`}
+              title="Coverage-aware hierarchical sitemap"
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>Sitemap</span>
             </button>
             <button
               onClick={() => onChangeTab('table')}
