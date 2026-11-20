@@ -80,6 +80,19 @@ class SessionRunCreate(BaseModel):
     provider_id: str = Field(default="", alias="providerId")
     model: str = ""
     noise_profile: str = Field(default="balanced", alias="noiseProfile")
+    roles: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionToolRunCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    prompt: str
+    max_steps: int = Field(default=12, ge=1, le=100, alias="maxSteps")
+    provider_id: str = Field(default="", alias="providerId")
+    model: str = ""
+    noise_profile: str = Field(default="balanced", alias="noiseProfile")
+    auth_profile_id: str = Field(default="", alias="authProfileId")
+    allow_shell: bool = Field(default=False, alias="allowShell")
 
 
 class ProviderCreate(BaseModel):
@@ -111,6 +124,23 @@ class NoteCreate(BaseModel):
     content: str
 
 
+class HypothesisCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: str = ""
+    title: str
+    security_question: str = Field(alias="securityQuestion")
+    surface: str = ""
+    state: str = "suspected"
+    confidence: str = "candidate"
+    required_evidence: list[str] = Field(default_factory=list, alias="requiredEvidence")
+
+
+class HypothesisTransition(BaseModel):
+    state: str
+    reason: str = ""
+
+
 class CoverageCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -137,6 +167,19 @@ class FindingTransition(BaseModel):
     state: str
     reason: str = ""
     evidence_ids: list[str] = Field(default_factory=list, alias="evidenceIds")
+
+
+class FindingEvidenceBind(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    evidence_id: str = Field(alias="evidenceId")
+    role: str = "supporting"
+    note: str = ""
+    position: int = 0
+
+
+class FindingEvidenceOrder(BaseModel):
+    evidence_ids: list[str] = Field(alias="evidenceIds")
 
 
 class ReplayPatch(BaseModel):
@@ -203,3 +246,30 @@ class ProxyStop(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     project_id: str = Field(alias="projectId")
+
+
+class OASTStart(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = Field(default=0, ge=0, le=65535)
+    dns_port: int = Field(default=0, ge=0, le=65535, alias="dnsPort")
+    dns_domain: str = Field(default="oast.local", alias="dnsDomain")
+    answer_ip: str = Field(default="127.0.0.1", alias="answerIp")
+
+
+class OASTTokenCreate(BaseModel):
+    note: str = ""
+
+
+class OASTPromote(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    session_id: str = Field(default="", alias="sessionId")
+    hypothesis_id: str = Field(default="", alias="hypothesisId")
+    task_id: str = Field(default="", alias="taskId")
+    note: str = ""
+
+
+class ArchiveCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    include_workspace: bool = Field(default=False, alias="includeWorkspace")

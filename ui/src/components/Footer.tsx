@@ -1,5 +1,5 @@
 import React from 'react';
-import { ShieldCheck, Book, Command, Star } from 'lucide-react';
+import { ShieldCheck, Book, Command } from 'lucide-react';
 
 interface FooterProps {
   onOpenShortcuts?: () => void;
@@ -35,16 +35,6 @@ export const Footer: React.FC<FooterProps> = ({ onOpenShortcuts }) => {
             <Command className="w-3.5 h-3.5" />
             <span>Shortcuts</span>
           </button>
-
-          <a
-            href="https://github.com/R1zoro/ChainsawRecon"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:text-warning flex items-center gap-1 transition-colors"
-          >
-            <Star className="w-3.5 h-3.5" />
-            <span>Star</span>
-          </a>
         </div>
       </div>
     </footer>

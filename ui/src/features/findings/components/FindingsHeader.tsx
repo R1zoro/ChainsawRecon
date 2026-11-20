@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Shield, ShieldAlert, Terminal, Layers, ArrowLeft, RefreshCw } from 'lucide-react';
+import { Shield, ShieldAlert, Terminal, Layers, ArrowLeft, RefreshCw, FileText } from 'lucide-react';
 import { ProjectSummary, ProjectScopeResponse } from '../../../api/types';
 
 interface FindingsHeaderProps {
@@ -97,6 +97,15 @@ export const FindingsHeader: React.FC<FindingsHeaderProps> = ({
         >
           <Terminal className="w-3.5 h-3.5 text-accent" />
           <span>Workbench</span>
+        </Link>
+
+        <Link
+          to={`/projects/${projectId}/reports`}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-border bg-bg hover:bg-surface-2 text-xs text-text transition-colors"
+          title="Open Assessment Reports"
+        >
+          <FileText className="w-3.5 h-3.5 text-accent" />
+          <span>Reports</span>
         </Link>
 
         <Link

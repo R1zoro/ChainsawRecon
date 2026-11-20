@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertCircle, RotateCw, Copy, Check } from 'lucide-react';
+import { AlertCircle, RotateCw, Copy, Check, Bot, Activity, HelpCircle, FileText } from 'lucide-react';
 import { fetchJson, isApiError } from '../../api/client';
 import { eventClient, ConnectionState } from '../../api/events';
 import { 
@@ -22,6 +22,10 @@ import { JournalTimeline } from './components/JournalTimeline';
 import { OperatorComposer } from './components/OperatorComposer';
 import { SessionInspector } from './components/SessionInspector';
 import { SessionStatusBar } from './components/SessionStatusBar';
+import { ToolRunTab } from './components/ToolRunTab';
+import { SessionRunModal } from './components/SessionRunPanel';
+import { HypothesesTab } from '../hypotheses/HypothesesTab';
+import { ReportsTab } from '../reports/ReportsTab';
 
 export const SessionWorkspacePage: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -31,6 +35,7 @@ export const SessionWorkspacePage: React.FC = () => {
   // Selected event for inspector
   const [selectedEvent, setSelectedEvent] = useState<JournalEvent | null>(null);
   const [isInspectorOpen, setIsInspectorOpen] = useState(true);
+  const [activeCenterTab, setActiveCenterTab] = useState<'journal' | 'tool_run' | 'hypotheses' | 'reports'>('journal');
 
   // Connection & Seq State
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
@@ -38,6 +43,7 @@ export const SessionWorkspacePage: React.FC = () => {
   const [events, setEvents] = useState<JournalEvent[]>([]);
   const [isActionLoading, setIsActionLoading] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [isRunConfigOpen, setIsRunConfigOpen] = useState(false);
   const [copiedRequestId, setCopiedRequestId] = useState(false);
 
   // 1. Fetch Session Metadata
@@ -342,6 +348,7 @@ export const SessionWorkspacePage: React.FC = () => {
         onPause={() => handleRunAction('pause')}
         onResume={() => handleRunAction('resume')}
         onStop={() => handleRunAction('stop')}
+        onOpenRunConfig={() => setIsRunConfigOpen(true)}
         isActionLoading={isActionLoading}
       />
 
@@ -360,18 +367,97 @@ export const SessionWorkspacePage: React.FC = () => {
           onDenyApproval={handleDenyApproval}
         />
 
-        {/* Center Column: Live Journal Timeline + Operator Composer */}
+        {/* Center Column: Live Journal Timeline + Operator Composer OR Tool Agent Run */}
         <div className="flex-1 flex flex-col min-w-0 bg-bg overflow-hidden">
-          <JournalTimeline
-            events={events}
-            selectedEvent={selectedEvent}
-            onSelectEvent={handleSelectEvent}
-          />
+          {/* Center Tabs Header */}
+          <div className="h-10 px-4 border-b border-border bg-surface flex items-center justify-between shrink-0">
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setActiveCenterTab('journal')}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                  activeCenterTab === 'journal'
+                    ? 'bg-surface-2 text-text shadow-sm border border-border'
+                    : 'text-text-muted hover:text-text'
+                }`}
+              >
+                <Activity className="w-3.5 h-3.5" />
+                <span>Journal</span>
+              </button>
+              <button
+                onClick={() => setActiveCenterTab('tool_run')}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                  activeCenterTab === 'tool_run'
+                    ? 'bg-surface-2 text-text shadow-sm border border-border'
+                    : 'text-text-muted hover:text-text'
+                }`}
+              >
+                <Bot className="w-3.5 h-3.5 text-accent" />
+                <span>Agent Run</span>
+              </button>
+              <button
+                onClick={() => setActiveCenterTab('hypotheses')}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                  activeCenterTab === 'hypotheses'
+                    ? 'bg-surface-2 text-text shadow-sm border border-border'
+                    : 'text-text-muted hover:text-text'
+                }`}
+              >
+                <HelpCircle className="w-3.5 h-3.5 text-warning" />
+                <span>Hypotheses</span>
+              </button>
+              <button
+                onClick={() => setActiveCenterTab('reports')}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                  activeCenterTab === 'reports'
+                    ? 'bg-surface-2 text-text shadow-sm border border-border'
+                    : 'text-text-muted hover:text-text'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5 text-accent" />
+                <span>Reports</span>
+              </button>
+            </div>
+          </div>
 
-          <OperatorComposer
-            onSendMessage={handleSendMessage}
-            disabled={session?.status === 'completed' || session?.status === 'failed'}
-          />
+          {activeCenterTab === 'journal' && (
+            <>
+              <JournalTimeline
+                events={events}
+                selectedEvent={selectedEvent}
+                onSelectEvent={handleSelectEvent}
+              />
+              <OperatorComposer
+                onSendMessage={handleSendMessage}
+                disabled={session?.status === 'completed' || session?.status === 'failed'}
+              />
+            </>
+          )}
+
+          {activeCenterTab === 'tool_run' && (
+            <ToolRunTab
+              sessionId={sessionId || ''}
+              projectId={session?.projectId || projectData?.id || 'prj_demo'}
+              defaultProviderId={session?.provider}
+              defaultModel={session?.model}
+              onToolRunComplete={() => {
+                fetchJournalHistory(lastSeq);
+              }}
+            />
+          )}
+
+          {activeCenterTab === 'hypotheses' && (
+            <HypothesesTab
+              sessionId={sessionId || ''}
+              projectId={session?.projectId || projectData?.id || 'prj_demo'}
+            />
+          )}
+
+          {activeCenterTab === 'reports' && (
+            <ReportsTab
+              sessionId={sessionId || ''}
+              projectId={session?.projectId || projectData?.id || 'prj_demo'}
+            />
+          )}
         </div>
 
         {/* Right Column: Inspector Panel */}
@@ -391,6 +477,20 @@ export const SessionWorkspacePage: React.FC = () => {
         sandbox="native"
         elapsedSeconds={elapsedSeconds}
         scopeValid={scopeData?.valid}
+      />
+
+      {/* 4. Session Run & Role Matrix Modal */}
+      <SessionRunModal
+        isOpen={isRunConfigOpen}
+        onClose={() => setIsRunConfigOpen(false)}
+        sessionId={sessionId || ''}
+        projectId={session?.projectId}
+        sessionProvider={session?.provider}
+        sessionModel={session?.model}
+        onRunComplete={async () => {
+          await queryClient.invalidateQueries({ queryKey: ['session', sessionId] });
+          await queryClient.invalidateQueries({ queryKey: ['sessionJournal', sessionId] });
+        }}
       />
     </div>
   );

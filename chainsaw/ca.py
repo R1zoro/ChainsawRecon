@@ -10,7 +10,10 @@ import ipaddress
 import os
 import re
 import ssl
+import subprocess
+import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -215,6 +218,52 @@ class CertificateAuthority:
             _write_cert(cert_path, cert)
 
 
+_installed_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _is_installed(ca: CertificateAuthority) -> bool:
+    """Best-effort OS trust-store check, cached for 30 seconds."""
+
+    now = time.monotonic()
+    cached = _installed_cache.get(str(ca.cert_path))
+    if cached and now - cached[0] < 30:
+        return cached[1]
+    installed = False
+    try:
+        if sys.platform == "win32":
+            completed = subprocess.run(
+                ["certutil", "-user", "-store", "Root"],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=5,
+            )
+            installed = CA_COMMON_NAME.lower() in (completed.stdout or "").lower()
+        elif sys.platform == "darwin":
+            completed = subprocess.run(
+                ["security", "find-certificate", "-c", CA_COMMON_NAME],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=5,
+            )
+            installed = completed.returncode == 0
+        else:
+            installed = any(
+                path.exists()
+                for path in (
+                    Path("/usr/local/share/ca-certificates/chainsaw.crt"),
+                    Path("/etc/ssl/certs/chainsaw.pem"),
+                )
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        installed = False
+    _installed_cache[str(ca.cert_path)] = (now, installed)
+    return installed
+
+
 def ca_status(home_root: Path) -> dict[str, object]:
     ca = CertificateAuthority(home_root / "ca")
     available = ca.exists()
@@ -222,7 +271,7 @@ def ca_status(home_root: Path) -> dict[str, object]:
         "available": available,
         "path": str(ca.cert_path) if available else None,
         "keyPath": str(ca.key_path) if available else None,
-        "installed": False,
+        "installed": _is_installed(ca) if available else False,
         "instructions": _INSTRUCTIONS,
     }
 

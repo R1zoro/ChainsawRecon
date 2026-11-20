@@ -3,11 +3,11 @@ import { useNavigate } from 'react-router-dom';
 import { 
   ArrowLeft, Shield, ShieldAlert, Download, 
   Upload, Terminal, RotateCw, History, Layers, GitCompare,
-  Play, Check, Copy, ShieldCheck
+  Play, Check, Copy, ShieldCheck, Radio
 } from 'lucide-react';
 import { ProjectSummary, ProjectScopeResponse, CaStatusResponse, ProxyStatusResponse } from '../../../api/types';
 
-export type WorkbenchViewTab = 'history' | 'repeater' | 'compare';
+export type WorkbenchViewTab = 'history' | 'repeater' | 'compare' | 'oast';
 
 interface WorkbenchHeaderProps {
   project?: ProjectSummary | null;
@@ -22,6 +22,7 @@ interface WorkbenchHeaderProps {
   onChangeTab: (tab: WorkbenchViewTab) => void;
   historyCount: number;
   repeaterTabCount: number;
+  oastEventCount?: number;
   onOpenCaHelper: () => void;
   onOpenImportModal: () => void;
   onExportHar: () => void;
@@ -43,6 +44,7 @@ export const WorkbenchHeader: React.FC<WorkbenchHeaderProps> = ({
   onChangeTab,
   historyCount,
   repeaterTabCount,
+  oastEventCount,
   onOpenCaHelper,
   onOpenImportModal,
   onExportHar,
@@ -281,6 +283,23 @@ export const WorkbenchHeader: React.FC<WorkbenchHeaderProps> = ({
           >
             <GitCompare className="w-3.5 h-3.5" />
             <span>Compare</span>
+          </button>
+
+          <button
+            onClick={() => onChangeTab('oast')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+              activeTab === 'oast'
+                ? 'bg-surface text-accent shadow-sm border border-border font-semibold'
+                : 'text-text-muted hover:text-text hover:bg-surface/50'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            <span>OAST / Callbacks</span>
+            {typeof oastEventCount === 'number' && (
+              <span className="px-1.5 py-0.2 rounded-full bg-surface-2 text-[10px] font-mono text-text-muted">
+                {oastEventCount}
+              </span>
+            )}
           </button>
         </div>
       </div>

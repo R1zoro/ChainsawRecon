@@ -37,12 +37,12 @@ describe('SessionWorkspacePage (Milestone 1) Tests', () => {
 
     // Verify top bar details
     await waitFor(() => {
-      expect(screen.getByText('Acme API authz sweep')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { level: 1, name: 'Acme API authz sweep' })).toBeInTheDocument();
       expect(screen.getByText('RUNNING')).toBeInTheDocument();
       expect(screen.getAllByText(/attack/i).length).toBeGreaterThan(0);
       expect(screen.getAllByText('Scope Enforced').length).toBeGreaterThan(0);
       expect(screen.getByText(/1 Approval Pending/i)).toBeInTheDocument();
-    });
+    }, { timeout: 8000 });
 
     // Verify Left panel targets
     expect(screen.getByText('https://api.example.com')).toBeInTheDocument();

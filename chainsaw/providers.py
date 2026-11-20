@@ -51,6 +51,7 @@ class Completion:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     finish_reason: str = ""
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,18 +60,21 @@ class Completion:
             "promptTokens": self.prompt_tokens,
             "completionTokens": self.completion_tokens,
             "finishReason": self.finish_reason,
+            "toolCalls": self.tool_calls,
         }
 
 
 class ChatProvider(Protocol):
     def chat(
         self,
-        messages: list[ChatMessage] | list[dict[str, str]],
+        messages: list[ChatMessage] | list[dict[str, Any]],
         *,
         model: str = "",
         temperature: float = 0.1,
         max_tokens: int = 1024,
         response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> Completion: ...
 
     def health(self) -> dict[str, Any]: ...
@@ -211,12 +215,14 @@ class OpenAICompatibleProvider:
 
     def chat(
         self,
-        messages: list[ChatMessage] | list[dict[str, str]],
+        messages: list[ChatMessage] | list[dict[str, Any]],
         *,
         model: str = "",
         temperature: float = 0.1,
         max_tokens: int = 1024,
         response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> Completion:
         selected = model or self.config.model
         if not selected:
@@ -232,13 +238,39 @@ class OpenAICompatibleProvider:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if tools:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
         data = self._request("POST", "/chat/completions", payload)
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
             raise ProviderResponseError("provider returned no choices")
         message = choices[0].get("message") or {}
         content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
+        tool_calls: list[dict[str, Any]] = []
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            name = str(function.get("name") or "").strip()
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {"raw": arguments}
+            if name:
+                tool_calls.append(
+                    {
+                        "id": str(call.get("id") or ""),
+                        "name": name,
+                        "arguments": arguments or {},
+                    }
+                )
+        if not isinstance(content, str):
+            content = ""
+        if not content.strip() and not tool_calls:
             raise ProviderResponseError("provider returned an empty message")
         usage = data.get("usage") or {}
         return Completion(
@@ -247,6 +279,7 @@ class OpenAICompatibleProvider:
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
             finish_reason=str(choices[0].get("finish_reason") or ""),
+            tool_calls=tool_calls,
         )
 
 

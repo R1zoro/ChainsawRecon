@@ -11,6 +11,7 @@ from ..appmodel import AppModel
 from ..auth import AuthSessionStore
 from ..journal import JournalWriter, read_journal
 from ..projection import SessionProjection
+from ..secrets import SecretBox
 from ..workbench import FlowNotFound, ScopePolicy, WorkbenchStore
 from ..workspace import (
     ChainsawHome,
@@ -94,6 +95,7 @@ class ProjectRegistry:
         self.home = home.ensure()
         self.index_file = self.home.root / "projects.json"
         self.providers = ProviderStore(self.home)
+        self.secrets = SecretBox(self.home.root)
 
     def _load_index(self) -> list[dict[str, Any]]:
         if not self.index_file.exists():
@@ -192,7 +194,11 @@ class ProjectRegistry:
 
     def workbench(self, project_id: str) -> WorkbenchStore:
         project = self.get(project_id)
-        return WorkbenchStore(project.path / ".chainsaw" / "workbench.db", project.id)
+        return WorkbenchStore(
+            project.path / ".chainsaw" / "workbench.db",
+            project.id,
+            secret_box=self.secrets,
+        )
 
     def scope_policy(self, project_id: str) -> ScopePolicy:
         project = self.get(project_id)
@@ -207,7 +213,11 @@ class ProjectRegistry:
     def find_flow(self, flow_id: str) -> tuple[ProjectMeta, WorkbenchStore]:
         for summary in self.list_projects():
             project = self.get(str(summary["id"]))
-            store = WorkbenchStore(project.path / ".chainsaw" / "workbench.db", project.id)
+            store = WorkbenchStore(
+                project.path / ".chainsaw" / "workbench.db",
+                project.id,
+                secret_box=self.secrets,
+            )
             if store.get_flow(flow_id) is not None:
                 return project, store
             store.close()
@@ -569,6 +579,85 @@ class ProjectRegistry:
                     return project, meta, match
         raise ProjectNotFoundError(f"finding not found: {finding_id}")
 
+    def finding_evidence(self, session_id: str, finding_id: str) -> list[dict[str, Any]]:
+        projection = self.projection(session_id)
+        try:
+            return projection.finding_evidence(finding_id)
+        finally:
+            projection.close()
+
+    def bind_finding_evidence(
+        self,
+        session_id: str,
+        finding_id: str,
+        *,
+        evidence_id: str,
+        role: str = "supporting",
+        note: str = "",
+        position: int = 0,
+    ) -> list[dict[str, Any]]:
+        _, paths, _ = self.find_session(session_id)
+        projection = SessionProjection(paths.root / "state.db", session_id)
+        try:
+            projection.sync(paths.journal_file)
+            if not any(item["id"] == evidence_id for item in projection.evidence()):
+                raise ValueError(f"evidence not recorded: {evidence_id}")
+            if not any(item["id"] == finding_id for item in projection.findings()):
+                raise ValueError(f"finding not found: {finding_id}")
+            writer = JournalWriter(paths.journal_file, session_id)
+            writer.append(
+                "finding/evidence_bound",
+                {
+                    "findingId": finding_id,
+                    "evidenceId": evidence_id,
+                    "role": role,
+                    "note": note,
+                    "position": position,
+                },
+                actor="operator",
+                refs={"finding_id": finding_id, "evidence_id": evidence_id},
+            )
+            projection.sync(paths.journal_file)
+            return projection.finding_evidence(finding_id)
+        finally:
+            projection.close()
+
+    def unbind_finding_evidence(
+        self, session_id: str, finding_id: str, evidence_id: str
+    ) -> list[dict[str, Any]]:
+        _, paths, _ = self.find_session(session_id)
+        writer = JournalWriter(paths.journal_file, session_id)
+        writer.append(
+            "finding/evidence_unbound",
+            {"findingId": finding_id, "evidenceId": evidence_id},
+            actor="operator",
+            refs={"finding_id": finding_id, "evidence_id": evidence_id},
+        )
+        projection = SessionProjection(paths.root / "state.db", session_id)
+        try:
+            projection.sync(paths.journal_file)
+            return projection.finding_evidence(finding_id)
+        finally:
+            projection.close()
+
+    def reorder_finding_evidence(
+        self, session_id: str, finding_id: str, evidence_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        _, paths, _ = self.find_session(session_id)
+        writer = JournalWriter(paths.journal_file, session_id)
+        writer.append(
+            "finding/evidence_reordered",
+            {"findingId": finding_id, "evidenceIds": evidence_ids},
+            actor="operator",
+            refs={"finding_id": finding_id},
+        )
+        projection = SessionProjection(paths.root / "state.db", session_id)
+        try:
+            projection.sync(paths.journal_file)
+            return projection.finding_evidence(finding_id)
+        finally:
+            projection.close()
+
     def transition_finding(
         self,
         finding_id: str,
@@ -633,6 +722,65 @@ class ProjectRegistry:
             return projection.context()
         finally:
             projection.close()
+
+    def hypotheses(self, session_id: str) -> list[dict[str, Any]]:
+        projection = self.projection(session_id)
+        try:
+            return projection.hypotheses()
+        finally:
+            projection.close()
+
+    def create_hypothesis(self, session_id: str, payload: Any) -> dict[str, Any]:
+        _, paths, _ = self.find_session(session_id)
+        writer = JournalWriter(paths.journal_file, session_id)
+        hypothesis_id = str(payload.id or "hyp_" + uuid.uuid4().hex[:12])
+        writer.append(
+            "hypothesis/created",
+            {
+                "title": payload.title,
+                "securityQuestion": payload.security_question,
+                "surface": payload.surface,
+                "state": payload.state,
+                "confidence": payload.confidence,
+                "requiredEvidence": list(payload.required_evidence),
+            },
+            actor="agent",
+            refs={"hypothesis_id": hypothesis_id},
+        )
+        projection = SessionProjection(paths.root / "state.db", session_id)
+        try:
+            projection.sync(paths.journal_file)
+            item = next(
+                (row for row in projection.hypotheses() if row["id"] == hypothesis_id),
+                None,
+            )
+        finally:
+            projection.close()
+        return item or {"id": hypothesis_id}
+
+    def transition_hypothesis(
+        self, session_id: str, hypothesis_id: str, *, state: str, reason: str
+    ) -> dict[str, Any]:
+        _, paths, _ = self.find_session(session_id)
+        writer = JournalWriter(paths.journal_file, session_id)
+        writer.append(
+            "hypothesis/transition",
+            {"to": state, "state": state, "reason": reason},
+            actor="operator",
+            refs={"hypothesis_id": hypothesis_id},
+        )
+        projection = SessionProjection(paths.root / "state.db", session_id)
+        try:
+            projection.sync(paths.journal_file)
+            item = next(
+                (row for row in projection.hypotheses() if row["id"] == hypothesis_id),
+                None,
+            )
+        finally:
+            projection.close()
+        if item is None:
+            raise ProjectNotFoundError(f"hypothesis not found: {hypothesis_id}")
+        return item
 
     def append_user_message(self, session_id: str, content: str) -> int:
         _, paths, _ = self.find_session(session_id)

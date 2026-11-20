@@ -2,9 +2,10 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
   ArrowLeft, Copy, Check, Shield, ShieldAlert, 
-  Network, Table, Download, RotateCw, Play, AlertTriangle, Terminal, Layers 
+  Network, Table, Download, RotateCw, Play, AlertTriangle, Terminal, Layers, Key, FileText, Archive 
 } from 'lucide-react';
 import { ProjectSummary, ProjectScopeResponse, ActiveSessionSummary } from '../../../api/types';
+import { ProjectArchiveModal } from './ProjectArchiveModal';
 
 export type AppModelViewTab = 'graph' | 'sitemap' | 'table';
 
@@ -42,6 +43,7 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
   const navigate = useNavigate();
   const [copiedPath, setCopiedPath] = useState(false);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [isArchiveModalOpen, setIsArchiveModalOpen] = useState(false);
 
   const coverage = project?.coverage || {
     applications: 0,
@@ -127,6 +129,37 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
           >
             <ShieldAlert className="w-3.5 h-3.5 text-warning" />
             <span>Findings</span>
+          </button>
+
+          {/* Auth Profiles Quick Link */}
+          <button
+            onClick={() => navigate(`/projects/${project?.id || 'prj_demo'}/auth`)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-bg hover:bg-surface-2 border border-border text-xs text-text transition-colors"
+            title="Manage Authentication Profiles"
+          >
+            <Key className="w-3.5 h-3.5 text-accent" />
+            <span>Auth</span>
+          </button>
+
+          {/* Reports Quick Link */}
+          <button
+            onClick={() => navigate(`/projects/${project?.id || 'prj_demo'}/reports`)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-bg hover:bg-surface-2 border border-border text-xs text-text transition-colors"
+            title="Assessment Reports"
+          >
+            <FileText className="w-3.5 h-3.5 text-accent" />
+            <span>Reports</span>
+          </button>
+
+          {/* Project Archives Action */}
+          <button
+            onClick={() => setIsArchiveModalOpen(true)}
+            data-testid="open-archives-btn"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-bg hover:bg-surface-2 border border-border text-xs text-text transition-colors"
+            title="Create and manage project archives"
+          >
+            <Archive className="w-3.5 h-3.5 text-accent" />
+            <span>Archives</span>
           </button>
 
           {/* Active Session Quick Link */}
@@ -305,6 +338,13 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Project Archive Modal */}
+      <ProjectArchiveModal
+        isOpen={isArchiveModalOpen}
+        onClose={() => setIsArchiveModalOpen(false)}
+        projectId={project?.id || 'prj_demo'}
+      />
     </header>
   );
 };

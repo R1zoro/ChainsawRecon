@@ -15,21 +15,25 @@ import {
   Calendar,
   ExternalLink
 } from 'lucide-react';
-import { Finding, EvidenceItem, FindingSeverity, FindingState } from '../../../api/types';
+import { Finding, EvidenceItem, EvidenceBinding, FindingSeverity, FindingState } from '../../../api/types';
 import { EvidenceTray } from './EvidenceTray';
 
 interface FindingDetailViewProps {
   finding: Finding;
   evidence: EvidenceItem[];
+  evidenceBindings?: EvidenceBinding[];
   projectId: string;
   onOpenTransitionModal: () => void;
+  onEvidenceChange?: () => void;
 }
 
 export const FindingDetailView: React.FC<FindingDetailViewProps> = ({
   finding,
   evidence,
+  evidenceBindings,
   projectId,
   onOpenTransitionModal,
+  onEvidenceChange,
 }) => {
   const [copiedJson, setCopiedJson] = useState(false);
 
@@ -300,9 +304,12 @@ export const FindingDetailView: React.FC<FindingDetailViewProps> = ({
           {/* Evidence Tray */}
           <div className="p-4 bg-surface rounded-xl border border-border">
             <EvidenceTray
+              finding={finding}
               evidence={evidence}
+              evidenceBindings={evidenceBindings}
               evidenceIds={finding.evidenceIds || []}
               projectId={projectId}
+              onEvidenceChange={onEvidenceChange}
             />
           </div>
 

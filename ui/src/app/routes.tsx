@@ -1,11 +1,43 @@
+import React from 'react';
 import { createBrowserRouter, Navigate } from 'react-router-dom';
 import { ReadyStatePage } from '../features/ready-state/ReadyStatePage';
 import { EngagementWizardPage } from '../features/engagement-wizard/EngagementWizardPage';
-import { SessionWorkspacePage } from '../features/sessions/SessionWorkspacePage';
-import { ProjectOverviewPage } from '../features/app-model/ProjectOverviewPage';
-import { WorkbenchPage } from '../features/workbench/WorkbenchPage';
-import { FindingsPage } from '../features/findings/FindingsPage';
 import { RoutePlaceholder } from '../components/common/RoutePlaceholder';
+
+// Code-split routes: React Flow and heavyweight features are loaded on demand
+const ProjectOverviewPage = React.lazy(() =>
+  import('../features/app-model/ProjectOverviewPage').then((m) => ({ default: m.ProjectOverviewPage }))
+);
+const WorkbenchPage = React.lazy(() =>
+  import('../features/workbench/WorkbenchPage').then((m) => ({ default: m.WorkbenchPage }))
+);
+const FindingsPage = React.lazy(() =>
+  import('../features/findings/FindingsPage').then((m) => ({ default: m.FindingsPage }))
+);
+const ReportsPage = React.lazy(() =>
+  import('../features/reports/ReportsPage').then((m) => ({ default: m.ReportsPage }))
+);
+const AuthProfilesPage = React.lazy(() =>
+  import('../features/auth/AuthProfilesPage').then((m) => ({ default: m.AuthProfilesPage }))
+);
+const ModelsProvidersPage = React.lazy(() =>
+  import('../features/models/ModelsProvidersPage').then((m) => ({ default: m.ModelsProvidersPage }))
+);
+const SessionWorkspacePage = React.lazy(() =>
+  import('../features/sessions/SessionWorkspacePage').then((m) => ({ default: m.SessionWorkspacePage }))
+);
+
+const Suspended = ({ children }: { children: React.ReactNode }) => (
+  <React.Suspense
+    fallback={
+      <div className="h-screen bg-bg text-text-muted flex items-center justify-center font-mono text-xs select-none">
+        Loading module...
+      </div>
+    }
+  >
+    {children}
+  </React.Suspense>
+);
 
 export const router = createBrowserRouter([
   {
@@ -18,31 +50,99 @@ export const router = createBrowserRouter([
   },
   {
     path: '/projects/:projectId',
-    element: <ProjectOverviewPage />,
+    element: (
+      <Suspended>
+        <ProjectOverviewPage />
+      </Suspended>
+    ),
   },
   {
     path: '/projects/:projectId/findings',
-    element: <FindingsPage />,
+    element: (
+      <Suspended>
+        <FindingsPage />
+      </Suspended>
+    ),
   },
   {
     path: '/projects/:projectId/findings/:findingId',
-    element: <FindingsPage />,
+    element: (
+      <Suspended>
+        <FindingsPage />
+      </Suspended>
+    ),
   },
   {
     path: '/findings',
-    element: <FindingsPage />,
+    element: (
+      <Suspended>
+        <FindingsPage />
+      </Suspended>
+    ),
+  },
+  {
+    path: '/projects/:projectId/reports',
+    element: (
+      <Suspended>
+        <ReportsPage />
+      </Suspended>
+    ),
+  },
+  {
+    path: '/reports',
+    element: (
+      <Suspended>
+        <ReportsPage />
+      </Suspended>
+    ),
+  },
+  {
+    path: '/projects/:projectId/auth',
+    element: (
+      <Suspended>
+        <AuthProfilesPage />
+      </Suspended>
+    ),
   },
   {
     path: '/projects/:projectId/workbench',
-    element: <WorkbenchPage />,
+    element: (
+      <Suspended>
+        <WorkbenchPage />
+      </Suspended>
+    ),
   },
   {
     path: '/workbench',
-    element: <WorkbenchPage />,
+    element: (
+      <Suspended>
+        <WorkbenchPage />
+      </Suspended>
+    ),
+  },
+  {
+    path: '/projects/:projectId/oast',
+    element: (
+      <Suspended>
+        <WorkbenchPage />
+      </Suspended>
+    ),
+  },
+  {
+    path: '/oast',
+    element: (
+      <Suspended>
+        <WorkbenchPage />
+      </Suspended>
+    ),
   },
   {
     path: '/sessions/:sessionId',
-    element: <SessionWorkspacePage />,
+    element: (
+      <Suspended>
+        <SessionWorkspacePage />
+      </Suspended>
+    ),
   },
   {
     path: '/settings',
@@ -57,11 +157,9 @@ export const router = createBrowserRouter([
   {
     path: '/models',
     element: (
-      <RoutePlaceholder
-        title="Models & Inference Providers"
-        milestone="Milestone 5"
-        description="Configure Ollama endpoints, Groq API keys, OpenAI-compatible servers, and calibrate model parameters."
-      />
+      <Suspended>
+        <ModelsProvidersPage />
+      </Suspended>
     ),
   },
   {
@@ -77,11 +175,9 @@ export const router = createBrowserRouter([
   {
     path: '/auth-profiles',
     element: (
-      <RoutePlaceholder
-        title="Identities & Auth Vault"
-        milestone="Milestone 5"
-        description="Manage cookie sessions, token vault credentials, and launch embedded handover browsers."
-      />
+      <Suspended>
+        <AuthProfilesPage />
+      </Suspended>
     ),
   },
   {

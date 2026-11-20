@@ -136,8 +136,13 @@ export const FindingsPage: React.FC = () => {
           <FindingDetailView
             finding={activeFinding}
             evidence={activeEvidence}
+            evidenceBindings={findingDetailData?.evidenceBindings}
             projectId={projectId}
             onOpenTransitionModal={() => setIsTransitionModalOpen(true)}
+            onEvidenceChange={() => {
+              queryClient.invalidateQueries({ queryKey: ['findings'] });
+              queryClient.invalidateQueries({ queryKey: ['findingDetail', activeFindingId] });
+            }}
           />
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-surface select-none space-y-3">

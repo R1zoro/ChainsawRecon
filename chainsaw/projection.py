@@ -109,7 +109,13 @@ class SessionProjection:
                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT NOT NULL,
                 severity TEXT NOT NULL, state TEXT NOT NULL, asset TEXT NOT NULL,
                 hypothesis_id TEXT, evidence_ids TEXT NOT NULL,
+                evidence_version INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, meta TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS finding_evidence(
+                finding_id TEXT NOT NULL, evidence_id TEXT NOT NULL, role TEXT NOT NULL,
+                note TEXT NOT NULL, position INTEGER NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY(finding_id, evidence_id)
             );
             CREATE TABLE IF NOT EXISTS context_packets(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER NOT NULL,
@@ -131,6 +137,15 @@ class SessionProjection:
             """
         )
         self.conn.commit()
+        columns = {
+            str(row[1])
+            for row in self.conn.execute("PRAGMA table_info(findings)").fetchall()
+        }
+        if "evidence_version" not in columns:
+            self.conn.execute(
+                "ALTER TABLE findings ADD COLUMN evidence_version INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
 
     # ── sync / rebuild ────────────────────────────────────────────────
 
@@ -414,6 +429,7 @@ class SessionProjection:
         finding_id = str(_ref(event, "finding_id") or data.get("id") or data.get("findingId"))
         if not finding_id:
             return
+        evidence_ids = [str(item) for item in data.get("evidenceIds", [])]
         self.conn.execute(
             "INSERT INTO findings(id,session_id,title,severity,state,asset,hypothesis_id,evidence_ids,"
             "created_at,updated_at,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
@@ -426,12 +442,72 @@ class SessionProjection:
                 str(data.get("state", default_state)),
                 str(data.get("asset", "")),
                 _ref(event, "hypothesis_id") or data.get("hypothesisId"),
-                _json(data.get("evidenceIds", [])),
+                _json(evidence_ids),
                 event.ts,
                 event.ts,
                 _json(data),
             ),
         )
+        for position, evidence_id in enumerate(evidence_ids):
+            self.conn.execute(
+                "INSERT OR IGNORE INTO finding_evidence(finding_id,evidence_id,role,note,position,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (finding_id, evidence_id, "supporting", "", position, event.ts),
+            )
+        if evidence_ids:
+            self.conn.execute(
+                "UPDATE findings SET evidence_version=MAX(evidence_version,1), evidence_ids=? WHERE id=?",
+                (_json(evidence_ids), finding_id),
+            )
+
+    def _apply_finding_evidence_bound(self, event: JournalEvent, data: dict[str, Any]) -> None:
+        finding_id = str(_ref(event, "finding_id") or data.get("findingId"))
+        evidence_id = str(_ref(event, "evidence_id") or data.get("evidenceId"))
+        if not finding_id or not evidence_id:
+            return
+        role = str(data.get("role", "supporting"))
+        note = str(data.get("note", ""))
+        position = int(data.get("position", 0))
+        self.conn.execute(
+            "INSERT INTO finding_evidence(finding_id,evidence_id,role,note,position,created_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(finding_id,evidence_id) DO UPDATE SET "
+            "role=excluded.role,note=excluded.note,position=excluded.position",
+            (finding_id, evidence_id, role, note, position, event.ts),
+        )
+        self._refresh_finding_evidence(finding_id, event.ts)
+
+    def _apply_finding_evidence_unbound(self, event: JournalEvent, data: dict[str, Any]) -> None:
+        finding_id = str(_ref(event, "finding_id") or data.get("findingId"))
+        evidence_id = str(_ref(event, "evidence_id") or data.get("evidenceId"))
+        if not finding_id or not evidence_id:
+            return
+        self.conn.execute(
+            "DELETE FROM finding_evidence WHERE finding_id=? AND evidence_id=?",
+            (finding_id, evidence_id),
+        )
+        self._refresh_finding_evidence(finding_id, event.ts)
+
+    def _refresh_finding_evidence(self, finding_id: str, ts: str) -> None:
+        rows = self.conn.execute(
+            "SELECT evidence_id FROM finding_evidence WHERE finding_id=? ORDER BY position,created_at",
+            (finding_id,),
+        ).fetchall()
+        ids = [str(row[0]) for row in rows]
+        self.conn.execute(
+            "UPDATE findings SET evidence_ids=?, evidence_version=evidence_version+1, updated_at=? WHERE id=?",
+            (_json(ids), ts, finding_id),
+        )
+
+    def _apply_finding_evidence_reordered(self, event: JournalEvent, data: dict[str, Any]) -> None:
+        finding_id = str(_ref(event, "finding_id") or data.get("findingId"))
+        if not finding_id:
+            return
+        for position, evidence_id in enumerate(data.get("evidenceIds", [])):
+            self.conn.execute(
+                "UPDATE finding_evidence SET position=? WHERE finding_id=? AND evidence_id=?",
+                (position, finding_id, str(evidence_id)),
+            )
+        self._refresh_finding_evidence(finding_id, event.ts)
 
     def _apply_context_assembled(self, event: JournalEvent, data: dict[str, Any]) -> None:
         self.conn.execute(
@@ -516,9 +592,9 @@ class SessionProjection:
 
     def findings(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT id,title,severity,state,asset,hypothesis_id,evidence_ids,created_at,updated_at FROM findings ORDER BY created_at"
+            "SELECT id,title,severity,state,asset,hypothesis_id,evidence_ids,evidence_version,created_at,updated_at FROM findings ORDER BY created_at"
         ).fetchall()
-        keys = ("id", "title", "severity", "state", "asset", "hypothesisId", "evidenceIds", "createdAt", "updatedAt")
+        keys = ("id", "title", "severity", "state", "asset", "hypothesisId", "evidenceIds", "evidenceVersion", "createdAt", "updatedAt")
         return [
             {
                 **dict(zip(keys, row, strict=False)),
@@ -526,6 +602,15 @@ class SessionProjection:
             }
             for row in rows
         ]
+
+    def finding_evidence(self, finding_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT finding_id,evidence_id,role,note,position,created_at FROM finding_evidence "
+            "WHERE finding_id=? ORDER BY position,created_at",
+            (finding_id,),
+        ).fetchall()
+        keys = ("findingId", "evidenceId", "role", "note", "position", "createdAt")
+        return [dict(zip(keys, row, strict=False)) for row in rows]
 
     def hypotheses(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(

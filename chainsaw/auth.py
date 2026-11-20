@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+from base64 import urlsafe_b64decode
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,34 @@ CAPTCHA_MARKERS = ("g-recaptcha", "hcaptcha", "cf-turnstile", "recaptcha/api.js"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _expiry_from_timestamp(value: float | int | None) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
+def _jwt_expiry(headers: dict[str, str]) -> str:
+    value = next(
+        (item for key, item in headers.items() if key.lower() == "authorization"),
+        "",
+    )
+    if not value.lower().startswith("bearer "):
+        return ""
+    token = value[7:].strip()
+    parts = token.split(".")
+    if len(parts) != 3:
+        return ""
+    try:
+        payload = json.loads(urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+        exp = payload.get("exp")
+        return _expiry_from_timestamp(float(exp)) if exp else ""
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return ""
 
 
 class AuthError(RuntimeError):
@@ -298,14 +327,24 @@ class AuthSession:
     adapter: str = ""
     warning: str = ""
 
+    def is_expired(self) -> bool:
+        if not self.expires_at:
+            return False
+        try:
+            expires = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return expires <= datetime.now(timezone.utc)
+
     def public(self) -> dict[str, Any]:
         return {
             "profileId": self.profile_id,
             "projectId": self.project_id,
-            "status": self.status,
+            "status": "expired" if self.is_expired() and self.status == "active" else self.status,
             "adapter": self.adapter,
             "verifiedAt": self.verified_at,
             "expiresAt": self.expires_at,
+            "expired": self.is_expired(),
             "hasCookies": bool(self.cookies),
             "hasStorageState": bool(self.storage_state),
             "warning": self.warning,
@@ -344,17 +383,35 @@ class AuthSession:
 
 
 class AuthSessionStore:
-    def __init__(self, home_root: Path) -> None:
+    def __init__(self, home_root: Path, *, use_keyring: bool | None = None) -> None:
         self.root = home_root / "auth"
         self.root.mkdir(parents=True, exist_ok=True)
         self.key_path = self.root / "session.key"
-        if not self.key_path.exists():
-            self.key_path.write_bytes(Fernet.generate_key())
+        self.key_source = "file"
+        key: bytes | None = None
+        if use_keyring is None:
+            use_keyring = os.environ.get("CHAINSAW_DISABLE_KEYRING", "") not in {"1", "true", "yes"}
+        if use_keyring:
             try:
-                os.chmod(self.key_path, 0o600)
-            except OSError:
-                pass
-        self._fernet = Fernet(self.key_path.read_bytes())
+                import keyring  # type: ignore[import-not-found]
+
+                stored = keyring.get_password("chainsawrecon", "auth-session-key")
+                if not stored:
+                    stored = Fernet.generate_key().decode("ascii")
+                    keyring.set_password("chainsawrecon", "auth-session-key", stored)
+                key = stored.encode("ascii")
+                self.key_source = "keyring"
+            except Exception:
+                key = None
+        if key is None:
+            if not self.key_path.exists():
+                self.key_path.write_bytes(Fernet.generate_key())
+                try:
+                    os.chmod(self.key_path, 0o600)
+                except OSError:
+                    pass
+            key = self.key_path.read_bytes()
+        self._fernet = Fernet(key)
 
     def _path(self, project_id: str, profile_id: str) -> Path:
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", profile_id)
@@ -501,6 +558,14 @@ def http_login(
             cookie.name: str(cookie.value or "") for cookie in client.cookies.jar
         }
         headers: dict[str, str] = {}
+        cookie_expiry = max(
+            (
+                _expiry_from_timestamp(getattr(cookie, "expires", None))
+                for cookie in client.cookies.jar
+            ),
+            default="",
+        )
+        expires_at = max(cookie_expiry, _jwt_expiry(headers))
         status = "needs_verification"
         warning = ""
         if verify_url:
@@ -526,6 +591,7 @@ def http_login(
             if profile.get("persistence") == "credentials"
             else {},
             verified_at=_now() if status == "active" else "",
+            expires_at=expires_at,
             adapter="http_form",
             warning=warning,
         )
@@ -649,6 +715,14 @@ def browser_login(
             for item in cookies_list
             if item.get("name")
         }
+        cookie_expiry = max(
+            (
+                _expiry_from_timestamp(item.get("expires"))
+                for item in cookies_list
+                if item.get("expires")
+            ),
+            default="",
+        )
         storage_state = dict(context.storage_state())
         return AuthSession(
             profile_id=str(profile.get("id") or ""),
@@ -660,6 +734,7 @@ def browser_login(
             if profile.get("persistence") == "credentials"
             else {},
             verified_at=_now() if verified and indicator else "",
+            expires_at=cookie_expiry,
             adapter="browser",
             warning="" if indicator else "No verifyIndicator configured; login is unverified.",
         )

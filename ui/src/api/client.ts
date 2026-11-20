@@ -1,4 +1,4 @@
-import { ApiErrorEnvelope, ApiErrorDetails } from './types';
+import { ApiErrorEnvelope, ApiErrorDetails, ReportExportFormat } from './types';
 import * as mockService from './mockService';
 
 export class ApiError extends Error {
@@ -33,7 +33,9 @@ export function generateRequestId(): string {
   return 'req_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8765/api/v1';
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.DEV ? 'http://127.0.0.1:8765/api/v1' : '/api/v1');
 
 // Production and default dev MUST be false; mocks only activate when explicitly requested
 const USE_MOCKS = import.meta.env.DEV && import.meta.env.VITE_USE_MOCKS === 'true';
@@ -68,7 +70,7 @@ export async function fetchJson<T>(path: string, options: RequestInit = {}): Pro
       const body = JSON.parse((options.body as string) || '{}');
       return mockService.openProject(body.path) as unknown as T;
     }
-    if (urlPath.startsWith('/projects/') && method === 'DELETE') {
+    if (urlPath.startsWith('/projects/') && urlPath.split('/').length === 3 && method === 'DELETE') {
       const id = urlPath.split('/')[2];
       return mockService.removeProject(id) as unknown as T;
     }
@@ -103,7 +105,7 @@ export async function fetchJson<T>(path: string, options: RequestInit = {}): Pro
       const body = JSON.parse((options.body as string) || '{}');
       return mockService.denyApproval(sessionId, approvalId, body.reason || '') as unknown as T;
     }
-    if (urlPath.startsWith('/sessions/') && method === 'POST') {
+    if (urlPath.startsWith('/sessions/') && ['start', 'pause', 'resume', 'stop'].includes(urlPath.split('/')[3]) && method === 'POST') {
       const parts = urlPath.split('/');
       const sessionId = parts[2];
       const action = parts[3]; // start, pause, resume, stop
@@ -258,6 +260,34 @@ export async function fetchJson<T>(path: string, options: RequestInit = {}): Pro
       const offset = params.has('offset') ? parseInt(params.get('offset')!, 10) : undefined;
       return mockService.fetchFindings({ projectId, sessionId, state, severity, q, limit, offset }) as unknown as T;
     }
+    // /findings/:id/evidence/order (POST)
+    if (urlPath.startsWith('/findings/') && urlPath.endsWith('/evidence/order') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const findingId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      const evidenceIds = payload.evidenceIds || payload.evidence_ids || [];
+      return mockService.reorderFindingEvidence(findingId, evidenceIds) as unknown as T;
+    }
+    // /findings/:id/evidence/:evidenceId (DELETE)
+    if (urlPath.startsWith('/findings/') && urlPath.includes('/evidence/') && method === 'DELETE') {
+      const parts = urlPath.split('/');
+      const findingId = parts[2];
+      const evidenceId = parts[4];
+      return mockService.unbindFindingEvidence(findingId, evidenceId) as unknown as T;
+    }
+    // /findings/:id/evidence (POST)
+    if (urlPath.startsWith('/findings/') && urlPath.endsWith('/evidence') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const findingId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.bindFindingEvidence(findingId, payload) as unknown as T;
+    }
+    // /findings/:id/evidence (GET)
+    if (urlPath.startsWith('/findings/') && urlPath.endsWith('/evidence') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const findingId = parts[2];
+      return mockService.fetchFindingEvidence(findingId) as unknown as T;
+    }
     if (urlPath.startsWith('/findings/') && urlPath.endsWith('/transition') && method === 'POST') {
       const parts = urlPath.split('/');
       const findingId = parts[2];
@@ -269,6 +299,213 @@ export async function fetchJson<T>(path: string, options: RequestInit = {}): Pro
       const findingId = parts[2];
       return mockService.fetchFindingDetail(findingId) as unknown as T;
     }
+    // ── Milestone 5: Auth Profiles Routes ───────────────────────
+    if (urlPath.includes('/auth/detect') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.detectAuth(projectId) as unknown as T;
+    }
+    if (urlPath.endsWith('/auth/profiles') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.fetchAuthProfiles(projectId) as unknown as T;
+    }
+    if (urlPath.endsWith('/auth/profiles') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.createAuthProfile(projectId, payload) as unknown as T;
+    }
+    if (urlPath.includes('/auth/profiles/') && urlPath.endsWith('/login') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const profileId = parts[5];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.loginAuthProfile(projectId, profileId, payload) as unknown as T;
+    }
+    if (urlPath.includes('/auth/profiles/') && urlPath.endsWith('/session') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const profileId = parts[5];
+      return mockService.fetchAuthProfileSession(projectId, profileId) as unknown as T;
+    }
+    if (urlPath.includes('/auth/profiles/') && urlPath.endsWith('/verify') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const profileId = parts[5];
+      return mockService.verifyAuthProfile(projectId, profileId) as unknown as T;
+    }
+    if (urlPath.includes('/auth/profiles/') && urlPath.endsWith('/logout') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const profileId = parts[5];
+      return mockService.logoutAuthProfile(projectId, profileId) as unknown as T;
+    }
+    if (urlPath.includes('/auth/profiles/') && urlPath.endsWith('/renew') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const profileId = parts[5];
+      return mockService.renewAuthProfile(projectId, profileId) as unknown as T;
+    }
+    if (urlPath.includes('/auth/profiles/') && method === 'DELETE') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const profileId = parts[5];
+      return mockService.deleteAuthProfile(projectId, profileId) as unknown as T;
+    }
+
+    // ── Milestone 6: Sandbox Status Route ────────────────────────
+    if (urlPath.includes('/sandbox/status') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.fetchSandboxStatus(projectId) as unknown as T;
+    }
+
+    // ── Milestone 5: Tool Agent Run Route ────────────────────────
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/tool-run') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.toolRunSession(sessionId, payload) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/run') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.runSession(sessionId, payload) as unknown as T;
+    }
+
+    // ── Milestone 5: Providers & Web UI Routes ───────────────────
+    if (urlPath === '/providers' && method === 'POST') {
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.createProvider(payload) as unknown as T;
+    }
+    if (urlPath.startsWith('/providers/') && urlPath.endsWith('/health') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const providerId = parts[2];
+      return mockService.fetchProviderHealth(providerId) as unknown as T;
+    }
+    if (urlPath.startsWith('/providers/') && urlPath.endsWith('/calibrate') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const providerId = parts[2];
+      return mockService.calibrateProvider(providerId) as unknown as T;
+    }
+
+    // ── Milestone 6: Hypotheses & Reports Mock Endpoints ──────────
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/hypotheses') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      return mockService.fetchHypotheses(sessionId) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/hypotheses') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const body = JSON.parse((options.body as string) || '{}');
+      return mockService.createHypothesis(sessionId, body) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.includes('/hypotheses/') && urlPath.endsWith('/transition') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const hypothesisId = parts[4];
+      const body = JSON.parse((options.body as string) || '{}');
+      return mockService.transitionHypothesis(sessionId, hypothesisId, body) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/report/export') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
+      const params = new URLSearchParams(search);
+      const format = (params.get('format') || 'markdown') as ReportExportFormat;
+      const includeCandidates = params.get('includeCandidates') === 'true';
+      return mockService.exportSessionReport(sessionId, format, includeCandidates) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/report') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
+      const params = new URLSearchParams(search);
+      const includeCandidates = params.get('includeCandidates') === 'true';
+      return mockService.fetchSessionReport(sessionId, includeCandidates) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/reports') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
+      const params = new URLSearchParams(search);
+      const includeCandidates = params.get('includeCandidates') === 'true';
+      return mockService.saveSessionReport(sessionId, includeCandidates) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.includes('/reports/') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      const filename = parts[4];
+      return mockService.downloadSessionReport(sessionId, filename) as unknown as T;
+    }
+    if (urlPath.startsWith('/sessions/') && urlPath.endsWith('/reports') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const sessionId = parts[2];
+      return mockService.listSessionReports(sessionId) as unknown as T;
+    }
+    if (urlPath === '/reports' && method === 'GET') {
+      return mockService.listSessionReports() as unknown as T;
+    }
+
+    // ── Milestone 7: OAST Callback Routes ───────────────────────
+    if (urlPath.includes('/oast/status') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.fetchOastStatus(projectId) as unknown as T;
+    }
+    if (urlPath.includes('/oast/start') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.startOastServer(projectId, payload) as unknown as T;
+    }
+    if (urlPath.includes('/oast/stop') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.stopOastServer(projectId) as unknown as T;
+    }
+    if (urlPath.includes('/oast/tokens') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.createOastToken(projectId, payload) as unknown as T;
+    }
+    if (urlPath.includes('/oast/tokens') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.fetchOastTokens(projectId) as unknown as T;
+    }
+    if (urlPath.includes('/oast/events') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const search = path.includes('?') ? path.slice(path.indexOf('?')) : '';
+      const params = new URLSearchParams(search);
+      const token = params.get('token') || undefined;
+      return mockService.fetchOastEvents(projectId, token) as unknown as T;
+    }
+
+    // ── Milestone 8: Project Archive Routes ──────────────────────
+    if (urlPath.startsWith('/projects/') && urlPath.includes('/archives/') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const filename = parts[4];
+      return mockService.downloadProjectArchive(projectId, filename) as unknown as T;
+    }
+    if (urlPath.startsWith('/projects/') && urlPath.endsWith('/archives') && method === 'GET') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      return mockService.listProjectArchives(projectId) as unknown as T;
+    }
+    if (urlPath.startsWith('/projects/') && urlPath.endsWith('/archive') && method === 'POST') {
+      const parts = urlPath.split('/');
+      const projectId = parts[2];
+      const payload = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+      return mockService.createProjectArchive(projectId, payload) as unknown as T;
+    }
+
     if (urlPath.startsWith('/projects/') && method === 'GET') {
       const parts = urlPath.split('/');
       const projectId = parts[2];

@@ -261,6 +261,87 @@ class SessionRuntime:
             },
         )
 
+    def bind_finding_evidence(
+        self,
+        *,
+        finding_id: str,
+        evidence_id: str,
+        role: str = "supporting",
+        note: str = "",
+        position: int = 0,
+    ) -> JournalEvent:
+        return self._append(
+            "finding/evidence_bound",
+            {
+                "findingId": finding_id,
+                "evidenceId": evidence_id,
+                "role": role,
+                "note": note,
+                "position": position,
+            },
+            actor="operator",
+            refs={"finding_id": finding_id, "evidence_id": evidence_id},
+        )
+
+    def unbind_finding_evidence(
+        self, *, finding_id: str, evidence_id: str
+    ) -> JournalEvent:
+        return self._append(
+            "finding/evidence_unbound",
+            {"findingId": finding_id, "evidenceId": evidence_id},
+            actor="operator",
+            refs={"finding_id": finding_id, "evidence_id": evidence_id},
+        )
+
+    def reorder_finding_evidence(
+        self, *, finding_id: str, evidence_ids: Iterable[str]
+    ) -> JournalEvent:
+        return self._append(
+            "finding/evidence_reordered",
+            {
+                "findingId": finding_id,
+                "evidenceIds": [str(item) for item in evidence_ids],
+            },
+            actor="operator",
+            refs={"finding_id": finding_id},
+        )
+
+    def create_hypothesis(
+        self,
+        *,
+        hypothesis_id: str,
+        title: str,
+        security_question: str,
+        surface: str,
+        state: str = "suspected",
+        confidence: str = "candidate",
+        required_evidence: Iterable[str] = (),
+    ) -> JournalEvent:
+        return self._append(
+            "hypothesis/created",
+            {
+                "title": title,
+                "securityQuestion": security_question,
+                "surface": surface,
+                "state": state,
+                "confidence": confidence,
+                "requiredEvidence": [str(item) for item in required_evidence],
+            },
+            actor="agent",
+            refs={"hypothesis_id": hypothesis_id},
+        )
+
+    def transition_hypothesis(
+        self, hypothesis_id: str, state: str, *, reason: str = ""
+    ) -> JournalEvent:
+        return self._append(
+            "hypothesis/transition",
+            {"to": state, "state": state, "reason": reason},
+            actor="operator",
+            refs={"hypothesis_id": hypothesis_id},
+        )
+
+
     def record_context(
         self,
         *,

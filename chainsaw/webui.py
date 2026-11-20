@@ -540,14 +540,16 @@ class WebUIChatProvider:
 
     def chat(
         self,
-        messages: list[ChatMessage] | list[dict[str, str]],
+        messages: list[ChatMessage] | list[dict[str, Any]],
         *,
         model: str = "",
         temperature: float = 0.1,
         max_tokens: int = 1024,
         response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> Completion:
-        del temperature, max_tokens, response_format
+        del temperature, max_tokens, response_format, tools, tool_choice
         if not self.config.url:
             raise ProviderUnavailable("web UI provider has no URL")
         prompt = compose_prompt(messages)

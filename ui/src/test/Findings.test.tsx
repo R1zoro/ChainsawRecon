@@ -249,4 +249,190 @@ describe('FindingsPage (Milestone 4: Security Findings) Tests', () => {
       expect(screen.getByText(/Clear all filters/i)).toBeInTheDocument();
     });
   });
+
+  it('binds evidence with role and note, and increments evidenceVersion', async () => {
+    renderFindings();
+
+    await waitFor(() => {
+      expect(screen.getByText('evd_idor_payload')).toBeInTheDocument();
+      expect(screen.getByTestId('evidence-version')).toHaveTextContent('Rev: v1');
+    });
+
+    // Click "Bind Evidence" button in Evidence Tray
+    const bindBtn = screen.getByTestId('open-bind-modal-btn');
+    fireEvent.click(bindBtn);
+
+    // Modal opens
+    await waitFor(() => {
+      expect(screen.getByText('Bind Recorded Evidence')).toBeInTheDocument();
+      expect(screen.getByText('evd_control_baseline')).toBeInTheDocument();
+    });
+
+    // Pick evd_control_baseline
+    const baselineRadio = screen.getByText('evd_control_baseline');
+    fireEvent.click(baselineRadio);
+
+    // Select role: "baseline"
+    const roleSelect = screen.getByLabelText(/Evidence Role/i);
+    fireEvent.change(roleSelect, { target: { value: 'baseline' } });
+
+    // Enter note
+    const noteInput = screen.getByPlaceholderText(/Exact HTTP response body/i);
+    fireEvent.change(noteInput, { target: { value: 'Baseline unprivileged access request' } });
+
+    // Submit bind
+    const submitBtn = screen.getByTestId('submit-bind-btn');
+    expect(submitBtn).not.toBeDisabled();
+    fireEvent.click(submitBtn);
+
+    // Modal closes and new binding card appears
+    await waitFor(() => {
+      expect(screen.queryByText('Bind Recorded Evidence')).not.toBeInTheDocument();
+      expect(screen.getByText('evd_control_baseline')).toBeInTheDocument();
+      expect(screen.getByTestId('role-pill-evd_control_baseline')).toHaveTextContent('Baseline');
+      expect(screen.getByText(/Baseline unprivileged access request/i)).toBeInTheDocument();
+      expect(screen.getByTestId('evidence-version')).toHaveTextContent('Rev: v2');
+    });
+  });
+
+  it('unbounds evidence with confirmation dialog and increments evidenceVersion', async () => {
+    renderFindings();
+
+    await waitFor(() => {
+      expect(screen.getByText('evd_idor_payload')).toBeInTheDocument();
+      expect(screen.getByTestId('evidence-version')).toHaveTextContent('Rev: v1');
+    });
+
+    // Click Unbind button on evd_idor_payload
+    const unbindBtn = screen.getByTitle('Unbind evidence');
+    fireEvent.click(unbindBtn);
+
+    // Confirmation dialog opens
+    await waitFor(() => {
+      expect(screen.getByText('Unbind Evidence Artifact')).toBeInTheDocument();
+      expect(screen.getByText(/Are you sure you want to unbind evidence/i)).toBeInTheDocument();
+    });
+
+    // Cancel first
+    const cancelBtn = screen.getByRole('button', { name: 'Cancel' });
+    fireEvent.click(cancelBtn);
+
+    await waitFor(() => {
+      expect(screen.queryByText('Unbind Evidence Artifact')).not.toBeInTheDocument();
+      expect(screen.getByText('evd_idor_payload')).toBeInTheDocument();
+    });
+
+    // Click Unbind again and confirm
+    fireEvent.click(screen.getByTitle('Unbind evidence'));
+    await waitFor(() => {
+      expect(screen.getByText('Unbind Evidence Artifact')).toBeInTheDocument();
+    });
+
+    const confirmBtn = screen.getByRole('button', { name: 'Confirm Unbind' });
+    fireEvent.click(confirmBtn);
+
+    // Confirmation closes, evidence is removed, and version is incremented
+    await waitFor(() => {
+      expect(screen.queryByText('Unbind Evidence Artifact')).not.toBeInTheDocument();
+      expect(screen.queryByText('evd_idor_payload')).not.toBeInTheDocument();
+      expect(screen.getByText('Missing Recorded Evidence')).toBeInTheDocument();
+      expect(screen.getByTestId('evidence-version')).toHaveTextContent('Rev: v2');
+    });
+  });
+
+  it('reorders evidence up and down and persists order', async () => {
+    renderFindings();
+
+    await waitFor(() => {
+      expect(screen.getByText('evd_idor_payload')).toBeInTheDocument();
+    });
+
+    // First bind a second evidence item
+    fireEvent.click(screen.getByTestId('open-bind-modal-btn'));
+    await waitFor(() => {
+      expect(screen.getByText('evd_control_baseline')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText('evd_control_baseline'));
+    fireEvent.click(screen.getByTestId('submit-bind-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByText('evd_control_baseline')).toBeInTheDocument();
+      expect(screen.getByTestId('evidence-version')).toHaveTextContent('Rev: v2');
+    });
+
+    // Verify initial positions: evd_idor_payload is #1, evd_control_baseline is #2
+    const downButtons = screen.getAllByTitle('Move Down');
+    expect(downButtons[0]).not.toBeDisabled(); // first item can move down
+    expect(downButtons[1]).toBeDisabled(); // last item cannot move down
+
+    // Move first item down
+    fireEvent.click(downButtons[0]);
+
+    // Verify positions swapped and version incremented
+    await waitFor(() => {
+      expect(screen.getByTestId('evidence-version')).toHaveTextContent('Rev: v3');
+    });
+
+    const cards = screen.getAllByTestId(/^evidence-card-/);
+    expect(cards[0]).toHaveTextContent('evd_control_baseline');
+    expect(cards[1]).toHaveTextContent('evd_idor_payload');
+  });
+
+  it('evidence picker strictly lists recorded session evidence and prohibits free-text evidence IDs', async () => {
+    renderFindings();
+
+    await waitFor(() => {
+      expect(screen.getByText('evd_idor_payload')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId('open-bind-modal-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Bind Recorded Evidence')).toBeInTheDocument();
+      expect(screen.getByTestId('evidence-picker-list')).toBeInTheDocument();
+      expect(screen.getByText('evd_control_baseline')).toBeInTheDocument();
+      expect(screen.getByText('evd_verification_diff')).toBeInTheDocument();
+    });
+
+    // Verify no free-text input exists for evidence ID
+    expect(screen.queryByPlaceholderText(/evidence id/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/evidence id/i)).not.toBeInTheDocument();
+  });
+
+  it('does not allow validating a finding directly from the Evidence Tray', async () => {
+    renderFindings();
+
+    await waitFor(() => {
+      expect(screen.getByText('Recorded Evidence Tray (1)')).toBeInTheDocument();
+    });
+
+    // Finding detail has transition button in header/actions, but Evidence Tray itself does not contain validation controls
+    const trayHeader = screen.getByText(/Recorded Evidence Tray/i).closest('div');
+    expect(trayHeader).toBeInTheDocument();
+
+    // Inside the entire evidence tray container, ensure there is no "Validate" or "Mark as Validated" button
+    const evidenceCards = screen.getAllByTestId(/^evidence-card-/);
+    expect(evidenceCards.length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: /Validate Finding/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Mark as Validated/i })).not.toBeInTheDocument();
+  });
+
+  it('no secrets are exposed in the evidence picker', async () => {
+    renderFindings();
+
+    await waitFor(() => {
+      expect(screen.getByText('evd_idor_payload')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId('open-bind-modal-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('evidence-picker-list')).toBeInTheDocument();
+    });
+
+    const pickerText = screen.getByTestId('evidence-picker-list').textContent || '';
+    expect(pickerText).not.toMatch(/bearer\s+[a-zA-Z0-9_\-\.]+/i);
+    expect(pickerText).not.toMatch(/password/i);
+    expect(pickerText).not.toMatch(/secret_key/i);
+  });
 });

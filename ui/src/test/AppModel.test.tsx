@@ -71,7 +71,7 @@ describe('ProjectOverviewPage (Milestone 2: Application Model) Tests', () => {
       expect(screen.getByText('api.example.com')).toBeInTheDocument();
       // Route node
       expect(screen.getByText('GET /v1/users/me')).toBeInTheDocument();
-    });
+    }, { timeout: 8000 });
 
     // Check kind badges on nodes
     expect(screen.getAllByText('APPLICATION').length).toBeGreaterThan(0);
@@ -84,7 +84,7 @@ describe('ProjectOverviewPage (Milestone 2: Application Model) Tests', () => {
 
     await waitFor(() => {
       expect(screen.getByText('GET /v1/users/me')).toBeInTheDocument();
-    });
+    }, { timeout: 8000 });
 
     // Click the route node
     const routeNode = screen.getByText('GET /v1/users/me').closest('.cursor-pointer');
@@ -110,7 +110,7 @@ describe('ProjectOverviewPage (Milestone 2: Application Model) Tests', () => {
 
     await waitFor(() => {
       expect(screen.getByText('GET /v1/users/{id}')).toBeInTheDocument();
-    });
+    }, { timeout: 8000 });
 
     // Open detail drawer for route with IDOR
     const idorNode = screen.getByText('GET /v1/users/{id}').closest('.cursor-pointer');
@@ -162,7 +162,7 @@ describe('ProjectOverviewPage (Milestone 2: Application Model) Tests', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Acme Cloud Platform')).toBeInTheDocument();
-    });
+    }, { timeout: 8000 });
   });
 
   it('table view filters by kind and search query', async () => {
@@ -270,7 +270,7 @@ describe('ProjectOverviewPage (Milestone 2: Application Model) Tests', () => {
     // Verify cap change triggers query refetch with new maxNodes
     await waitFor(() => {
       expect(screen.getByText('Acme Cloud Platform')).toBeInTheDocument();
-    });
+    }, { timeout: 8000 });
   });
 
   // ── Milestone 2.5: Coverage-Aware Sitemap (Atlas) Tests ────────
@@ -433,5 +433,104 @@ describe('ProjectOverviewPage (Milestone 2: Application Model) Tests', () => {
       expect(screen.queryByText(/Record Security Coverage/i)).not.toBeInTheDocument();
       expect(screen.getByText(/TESTED \(\d+ checks\)/i)).toBeInTheDocument();
     });
+  });
+
+  // ── Milestone 8: Project Archive UI Tests ──────────────────
+  it('opens Project Archives modal from ProjectHeader and lists existing archives', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('open-archives-btn')).toBeInTheDocument();
+    });
+
+    // Open Archive modal
+    fireEvent.click(screen.getByTestId('open-archives-btn'));
+
+    // Verify modal header & contents
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { level: 2, name: 'Project Archives' })).toBeInTheDocument();
+      expect(screen.getByText(/archive-20261118T140000Z\.zip/i)).toBeInTheDocument();
+      expect(screen.getByText(/Saved Archives/i)).toBeInTheDocument();
+    });
+
+    // Verify download button exists
+    expect(screen.getByRole('button', { name: /Download/i })).toBeInTheDocument();
+  });
+
+  it('toggles "include workspace" and displays amber size warning', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('open-archives-btn')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('open-archives-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { level: 2, name: 'Project Archives' })).toBeInTheDocument();
+    });
+
+    // Initially warning is not visible
+    expect(screen.queryByTestId('workspace-size-warning')).not.toBeInTheDocument();
+
+    // Toggle include workspace
+    const workspaceCheckbox = screen.getByRole('checkbox', { name: /Include workspace directory/i });
+    fireEvent.click(workspaceCheckbox);
+
+    // Warning is now visible
+    expect(screen.getByTestId('workspace-size-warning')).toBeInTheDocument();
+    expect(
+      screen.getByText(/Including the workspace directory bundles raw scan outputs/i)
+    ).toBeInTheDocument();
+  });
+
+  it('creates an archive and displays SHA-256 hash, file count, and copy action', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('open-archives-btn')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('open-archives-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { level: 2, name: 'Project Archives' })).toBeInTheDocument();
+    });
+
+    // Click "Create Archive"
+    const createBtn = screen.getByRole('button', { name: /^Create Archive$/i });
+    fireEvent.click(createBtn);
+
+    // Verify creation result card appears with SHA-256 and file count
+    await waitFor(() => {
+      expect(screen.getByTestId('created-archive-result')).toBeInTheDocument();
+      expect(screen.getByTestId('archive-sha256')).toBeInTheDocument();
+      expect(screen.getByText(/Archive Generated Successfully/i)).toBeInTheDocument();
+    });
+
+    // Verify SHA-256 format and file count
+    const shaText = screen.getByTestId('archive-sha256').textContent;
+    expect(shaText).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(screen.getByText(/\d+ files/i)).toBeInTheDocument();
+
+    // Verify copy button works
+    const copyShaBtn = screen.getByTitle(/Copy SHA-256 checksum/i);
+    fireEvent.click(copyShaBtn);
+  });
+
+  it('strictly adheres to boundary guarantee: no restore button is present', async () => {
+    renderProjectOverview();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('open-archives-btn')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('open-archives-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { level: 2, name: 'Project Archives' })).toBeInTheDocument();
+    });
+
+    // Verify NO restore button exists anywhere in the modal or document
+    expect(screen.queryByRole('button', { name: /restore/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/restore archive/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Restore operations are intentionally not implemented yet/i)).toBeInTheDocument();
   });
 });

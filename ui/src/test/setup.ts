@@ -1,4 +1,11 @@
 import '@testing-library/jest-dom';
+import { afterEach } from 'vitest';
+import { resetMockData, setMockServiceMode } from '../api/mockService';
+
+afterEach(() => {
+  resetMockData();
+  setMockServiceMode('healthy');
+});
 
 // Polyfill ResizeObserver for React Flow in jsdom
 if (typeof global.ResizeObserver === 'undefined') {

@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, useLocation } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Terminal, AlertCircle, X } from 'lucide-react';
 import { fetchJson, isApiError } from '../../api/client';
@@ -11,7 +11,8 @@ import {
   Paginated, 
   CapturedRequest, 
   RequestDetailResponse,
-  ReplayResult 
+  ReplayResult,
+  OastStatusResponse
 } from '../../api/types';
 import { parseQueryParams } from './redaction';
 import { WorkbenchHeader, WorkbenchViewTab } from './components/WorkbenchHeader';
@@ -20,18 +21,21 @@ import { WorkbenchHistoryTable } from './components/WorkbenchHistoryTable';
 import { RequestResponseSplitViewer } from './components/RequestResponseSplitViewer';
 import { RepeaterWorkspace, RepeaterTab } from './components/RepeaterWorkspace';
 import { ResponseCompareView } from './components/ResponseCompareView';
+import { OastWorkspace } from './components/OastWorkspace';
 import { CaHelperModal } from './components/CaHelperModal';
 import { ImportHarModal } from './components/ImportHarModal';
 import { SaveEvidenceModal } from './components/SaveEvidenceModal';
 
 export const WorkbenchPage: React.FC = () => {
   const { projectId: routeProjectId } = useParams<{ projectId: string }>();
+  const location = useLocation();
   const queryClient = useQueryClient();
 
   const projectId = routeProjectId || '';
+  const isOastRoute = location.pathname.endsWith('/oast');
 
   // 1. Navigation & View State
-  const [activeTab, setActiveTab] = useState<WorkbenchViewTab>('history');
+  const [activeTab, setActiveTab] = useState<WorkbenchViewTab>(isOastRoute ? 'oast' : 'history');
   const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
 
   // 2. Filter & Pagination State
@@ -102,6 +106,14 @@ export const WorkbenchPage: React.FC = () => {
     queryFn: () => fetchJson<ProxyStatusResponse>(`/workbench/proxy/status?projectId=${projectId}`),
     enabled: Boolean(projectId),
     refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
+  });
+
+  // Query: OAST Runtime Status (Poll every 3s only while running)
+  const { data: oastStatus } = useQuery({
+    queryKey: ['oastStatus', projectId],
+    queryFn: () => fetchJson<OastStatusResponse>(`/projects/${projectId}/oast/status`),
+    enabled: Boolean(projectId),
+    refetchInterval: (query) => (query.state.data?.running ? 3000 : false),
   });
 
   // Query: Captured Traffic History
@@ -357,6 +369,7 @@ export const WorkbenchPage: React.FC = () => {
         onChangeTab={setActiveTab}
         historyCount={capturedRequests.length}
         repeaterTabCount={repeaterTabs.length}
+        oastEventCount={oastStatus?.eventCount}
         onOpenCaHelper={() => setIsCaModalOpen(true)}
         onOpenImportModal={() => setIsImportModalOpen(true)}
         onExportHar={handleExportHar}
@@ -514,6 +527,10 @@ export const WorkbenchPage: React.FC = () => {
             requests={capturedRequests}
             initialBaselineId={selectedRequest?.id}
           />
+        )}
+
+        {activeTab === 'oast' && (
+          <OastWorkspace projectId={projectId} />
         )}
       </div>
 

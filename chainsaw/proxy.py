@@ -4,10 +4,15 @@ HTTP requests are forwarded and captured directly. HTTPS requests are tunneled
 with CONNECT, terminated with a per-host certificate signed by the local CA,
 then forwarded and captured. One request/response per connection keeps the
 implementation small and predictable.
+
+WebSocket upgrades are relayed as raw bytes after the handshake so the session
+keeps working. The handshake itself is recorded as a flow tagged ``websocket``;
+individual frames are not parsed or stored.
 """
 
 from __future__ import annotations
 
+import select
 import socket
 import socketserver
 import ssl
@@ -17,11 +22,13 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from .ca import CertificateAuthority
 from .governor import RateLimitExceeded, RequestGovernor
+from .secrets import SecretBox
 from .workbench import MAX_STORED_BODY, Flow, ScopePolicy, WorkbenchStore
 
 HOP_BY_HOP = {
@@ -160,6 +167,31 @@ def _headers_dict(headers: list[tuple[str, str]]) -> dict[str, str]:
     return result
 
 
+def _is_websocket_upgrade(request: _Request) -> bool:
+    if "websocket" not in request.header("upgrade").lower():
+        return False
+    connection = request.header("connection").lower()
+    return any(token.strip() == "upgrade" for token in connection.split(","))
+
+
+def _origin(url: str) -> tuple[str, int]:
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host:
+        raise ProxyError("missing host")
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return host, port
+
+
+def _tls_context(verify: bool) -> ssl.SSLContext:
+    if verify:
+        return ssl.create_default_context()
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 def _write_response(sock: socket.socket, status: int, reason: str, headers: list[tuple[str, str]], body: bytes) -> None:
     filtered = [
         (key, value)
@@ -209,7 +241,9 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             if inner is None:
                 return
             inner.headers.append(("Host", f"{host}:{port}" if port != 443 else host))
-            self._forward(proxy, tls_socket, inner, scheme="https")
+            self._forward(
+                proxy, tls_socket, inner, scheme="https", pending=reader.buffer
+            )
         except (ProxyError, OSError, ssl.SSLError):
             return
         finally:
@@ -219,9 +253,17 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                 pass
 
     def _handle_http(self, proxy: CaptureProxy, sock: socket.socket, request: _Request) -> None:
-        self._forward(proxy, sock, request, scheme="http")
+        self._forward(proxy, sock, request, scheme="http", pending=b"")
 
-    def _forward(self, proxy: CaptureProxy, sock: socket.socket, request: _Request, *, scheme: str) -> None:
+    def _forward(
+        self,
+        proxy: CaptureProxy,
+        sock: socket.socket,
+        request: _Request,
+        *,
+        scheme: str,
+        pending: bytes = b"",
+    ) -> None:
         try:
             url = _target_url(request, scheme=scheme)
         except ProxyError as exc:
@@ -232,6 +274,10 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             body = f"Blocked by scope: {decision.reason}".encode()
             self._record(proxy, request, url, 403, {}, body, 0, in_scope=False, tags=["scope-blocked"])
             _write_response(sock, 403, "Forbidden", [("Content-Type", "text/plain")], body)
+            return
+
+        if _is_websocket_upgrade(request):
+            self._relay_websocket(proxy, sock, request, url=url, pending=pending)
             return
 
         headers = _headers_dict(request.headers)
@@ -292,6 +338,176 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             full_content,
         )
 
+    def _relay_websocket(
+        self,
+        proxy: CaptureProxy,
+        sock: socket.socket,
+        request: _Request,
+        *,
+        url: str,
+        pending: bytes,
+    ) -> None:
+        parts = urlsplit(url)
+        try:
+            host, port = _origin(url)
+        except ProxyError as exc:
+            _write_response(sock, 400, "Bad Request", [], str(exc).encode())
+            return
+        target = parts.path or "/"
+        if parts.query:
+            target = f"{target}?{parts.query}"
+        governor = proxy.governor
+        if governor is not None:
+            try:
+                governor.acquire(url, method=request.method)
+            except RateLimitExceeded as exc:
+                body = f"Rate limited by local governor: {exc}".encode()
+                self._record(
+                    proxy,
+                    request,
+                    url,
+                    429,
+                    {},
+                    body,
+                    0,
+                    in_scope=True,
+                    tags=["rate-limited"],
+                )
+                _write_response(
+                    sock, 429, "Too Many Requests", [("Content-Type", "text/plain")], body
+                )
+                return
+        held = governor is not None
+
+        def release() -> None:
+            nonlocal held
+            if held and governor is not None:
+                governor.release(url)
+                held = False
+
+        try:
+            upstream = socket.create_connection((host, port), timeout=proxy.timeout)
+        except OSError as exc:
+            release()
+            body = f"Upstream connection failed: {exc.__class__.__name__}".encode()
+            self._record(
+                proxy, request, url, 502, {}, body, 0, in_scope=True, tags=["proxy-error"]
+            )
+            _write_response(sock, 502, "Bad Gateway", [("Content-Type", "text/plain")], body)
+            return
+        started = time.perf_counter()
+        try:
+            if parts.scheme == "https":
+                upstream = _tls_context(proxy.verify_upstream).wrap_socket(
+                    upstream, server_hostname=host
+                )
+            lines = [f"{request.method} {target} HTTP/1.1"]
+            for key, value in request.headers:
+                lowered = key.lower()
+                if lowered in {"host", "proxy-connection", "proxy-authorization"}:
+                    continue
+                lines.append(f"{key}: {value}")
+            default_port = 443 if parts.scheme == "https" else 80
+            host_header = f"{host}:{port}" if port != default_port else host
+            lines.extend([f"Host: {host_header}", "", ""])
+            upstream.sendall("\r\n".join(lines).encode("latin-1"))
+            if request.body:
+                upstream.sendall(request.body)
+
+            reader = _BufferedSocket(upstream)
+            head = reader.read_until(b"\r\n\r\n")
+            if head is None:
+                raise ProxyError("upstream closed before upgrade response")
+            status_text = head.split(b"\r\n", 1)[0].decode("latin-1")
+            pieces = status_text.split(" ", 2)
+            if len(pieces) < 2 or not pieces[1].isdigit():
+                raise ProxyError("malformed upgrade response")
+            status = int(pieces[1])
+            response_headers: dict[str, str] = {}
+            for line in head.decode("latin-1").split("\r\n")[1:]:
+                key, sep, value = line.partition(":")
+                if sep:
+                    response_headers[key.strip()] = value.strip()
+        except (ProxyError, OSError, ssl.SSLError) as exc:
+            release()
+            body = f"Upgrade failed: {exc.__class__.__name__}".encode()
+            self._record(
+                proxy, request, url, 502, {}, body, 0, in_scope=True, tags=["proxy-error"]
+            )
+            _write_response(sock, 502, "Bad Gateway", [("Content-Type", "text/plain")], body)
+            try:
+                upstream.close()
+            except OSError:
+                pass
+            return
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        tags = ["websocket"] if status == 101 else ["websocket", "upgrade-failed"]
+        if governor is not None:
+            governor.observe(url, status)
+        release()
+        self._record(
+            proxy,
+            request,
+            url,
+            status,
+            response_headers,
+            b"",
+            duration_ms,
+            in_scope=True,
+            tags=tags,
+        )
+        try:
+            sock.sendall(head + b"\r\n\r\n" + reader.buffer)
+            if pending:
+                upstream.sendall(pending)
+            if status != 101:
+                while True:
+                    chunk = upstream.recv(65536)
+                    if not chunk:
+                        break
+                    sock.sendall(chunk)
+                return
+            self._pump(proxy, sock, upstream)
+        except (OSError, ssl.SSLError):
+            return
+        finally:
+            release()
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+    def _pump(self, proxy: CaptureProxy, client: socket.socket, upstream: socket.socket) -> None:
+        for peer in (client, upstream):
+            try:
+                peer.settimeout(None)
+            except OSError:
+                return
+        sources = {client, upstream}
+        while sources and proxy.running:
+            try:
+                readable, _, _ = select.select(list(sources), [], [], 5.0)
+            except (OSError, ValueError):
+                return
+            for source in readable:
+                try:
+                    data = source.recv(65536)
+                except OSError:
+                    return
+                target = upstream if source is client else client
+                if not data:
+                    sources.discard(source)
+                    try:
+                        target.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    target.sendall(data)
+                except OSError:
+                    return
+
     def _record(
         self,
         proxy: CaptureProxy,
@@ -325,7 +541,9 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             source="capture",
         )
         try:
-            with WorkbenchStore(proxy.db_path, proxy.project_id) as store:
+            with WorkbenchStore(
+                proxy.db_path, proxy.project_id, secret_box=proxy.secret_box
+            ) as store:
                 store.add_flow(flow)
         except Exception:
             return
@@ -351,6 +569,7 @@ class CaptureProxy:
         timeout: float = 30.0,
         verify_upstream: bool = True,
         governor: RequestGovernor | None = None,
+        secret_box: SecretBox | None = None,
     ) -> None:
         self.project_path = project_path
         self.project_id = project_id
@@ -361,6 +580,7 @@ class CaptureProxy:
         self.timeout = timeout
         self.verify_upstream = verify_upstream
         self.governor = governor
+        self.secret_box = secret_box
         self.db_path = project_path / ".chainsaw" / "workbench.db"
         self._server: _ProxyServer | None = None
         self._thread: threading.Thread | None = None
@@ -425,6 +645,7 @@ class CaptureProxy:
 class ProxyManager:
     def __init__(self, ca_root: Path) -> None:
         self.ca_root = ca_root
+        self.secrets = SecretBox(ca_root)
         self._proxies: dict[str, CaptureProxy] = {}
         self._lock = threading.Lock()
 
@@ -453,6 +674,7 @@ class ProxyManager:
                 port=port,
                 verify_upstream=verify_upstream,
                 governor=RequestGovernor.from_profile(noise_profile),
+                secret_box=self.secrets,
             )
             proxy.start()
             self._proxies[project_id] = proxy

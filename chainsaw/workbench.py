@@ -24,6 +24,7 @@ from xml.etree import ElementTree
 import httpx
 
 from .governor import RateLimitExceeded, RequestGovernor
+from .secrets import SecretBox
 
 REDACTED = "\u00abredacted\u00bb"
 SENSITIVE_HEADERS = {
@@ -341,9 +342,10 @@ FLOW_COLUMNS = (
 class WorkbenchStore:
     """SQLite-backed capture store for one project."""
 
-    def __init__(self, db_path: Path, project_id: str) -> None:
+    def __init__(self, db_path: Path, project_id: str, secret_box: SecretBox | None = None) -> None:
         self.db_path = db_path
         self.project_id = project_id
+        self.secret_box = secret_box
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(db_path), timeout=10)
         self.conn.row_factory = sqlite3.Row
@@ -377,6 +379,10 @@ class WorkbenchStore:
                 source TEXT NOT NULL DEFAULT 'capture'
             );
             CREATE INDEX IF NOT EXISTS idx_flows_project ON flows(project_id, captured_at);
+            CREATE TABLE IF NOT EXISTS meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS evidence(
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -393,6 +399,38 @@ class WorkbenchStore:
             """
         )
         self.conn.commit()
+        if self.secret_box is not None:
+            self._reseal_existing()
+
+    def _reseal_existing(self) -> None:
+        if self.secret_box is None:
+            return
+        marker = self.conn.execute(
+            "SELECT value FROM meta WHERE key='secrets_sealed_v1'"
+        ).fetchone()
+        if marker is not None:
+            return
+        rows = self.conn.execute(
+            "SELECT id, request_headers, response_headers FROM flows WHERE project_id=?",
+            (self.project_id,),
+        ).fetchall()
+        for row in rows:
+            request_headers = dict(_loads(row[1]))
+            response_headers = dict(_loads(row[2]))
+            self.conn.execute(
+                "UPDATE flows SET request_headers=?, response_headers=? WHERE id=?",
+                (
+                    _json(self.secret_box.seal_headers(request_headers)),
+                    _json(self.secret_box.seal_headers(response_headers)),
+                    row[0],
+                ),
+            )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('secrets_sealed_v1','1')"
+        )
+        self.conn.commit()
+        self.conn.execute("VACUUM")
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self) -> None:
         self.conn.close()
@@ -407,6 +445,16 @@ class WorkbenchStore:
 
     def add_flow(self, flow: Flow) -> dict[str, Any]:
         flow.project_id = flow.project_id or self.project_id
+        request_headers = (
+            self.secret_box.seal_headers(flow.request_headers)
+            if self.secret_box is not None
+            else flow.request_headers
+        )
+        response_headers = (
+            self.secret_box.seal_headers(flow.response_headers)
+            if self.secret_box is not None
+            else flow.response_headers
+        )
         self.conn.execute(
             "INSERT OR REPLACE INTO flows("
             + ",".join(FLOW_COLUMNS)
@@ -422,9 +470,9 @@ class WorkbenchStore:
                 flow.host,
                 flow.path,
                 int(flow.status),
-                _json(flow.request_headers),
+                _json(request_headers),
                 flow.request_body,
-                _json(flow.response_headers),
+                _json(response_headers),
                 flow.response_body,
                 int(flow.size_bytes),
                 int(flow.duration_ms),
@@ -461,6 +509,11 @@ class WorkbenchStore:
         return flow
 
     def _row_to_flow(self, row: sqlite3.Row) -> Flow:
+        request_headers = dict(_loads(row["request_headers"]))
+        response_headers = dict(_loads(row["response_headers"]))
+        if self.secret_box is not None:
+            request_headers = self.secret_box.unseal_headers(request_headers)
+            response_headers = self.secret_box.unseal_headers(response_headers)
         return Flow(
             id=row["id"],
             project_id=row["project_id"],
@@ -470,9 +523,9 @@ class WorkbenchStore:
             host=row["host"],
             path=row["path"],
             status=int(row["status"]),
-            request_headers=dict(_loads(row["request_headers"])),
+            request_headers=request_headers,
             request_body=row["request_body"],
-            response_headers=dict(_loads(row["response_headers"])),
+            response_headers=response_headers,
             response_body=row["response_body"],
             size_bytes=int(row["size_bytes"]),
             duration_ms=int(row["duration_ms"]),
@@ -546,6 +599,55 @@ class WorkbenchStore:
         return [self._row_to_flow(row).public() for row in rows], total
 
     # ── evidence ──────────────────────────────────────────────────────
+
+    def record_artifact_evidence(
+        self,
+        *,
+        evidence_id: str,
+        kind: str,
+        summary: str,
+        artifact_id: str,
+        content_hash: str,
+        session_id: str = "",
+        hypothesis_id: str = "",
+        task_id: str = "",
+        request_id: str = "",
+        response_id: str = "",
+        note: str = "",
+    ) -> dict[str, Any]:
+        created_at = _now()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO evidence(id,project_id,session_id,request_id,response_id,"
+            "hypothesis_id,task_id,note,artifact_id,hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                evidence_id,
+                self.project_id,
+                session_id,
+                request_id,
+                response_id,
+                hypothesis_id,
+                task_id,
+                note,
+                artifact_id,
+                content_hash,
+                created_at,
+            ),
+        )
+        self.conn.commit()
+        return {
+            "id": evidence_id,
+            "kind": kind,
+            "summary": summary,
+            "artifactId": artifact_id,
+            "hash": content_hash,
+            "requestId": request_id,
+            "responseId": response_id,
+            "hypothesisId": hypothesis_id,
+            "taskId": task_id,
+            "note": note,
+            "promoted": 0,
+            "createdAt": created_at,
+        }
 
     def record_evidence(
         self,

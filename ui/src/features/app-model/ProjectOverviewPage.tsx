@@ -16,10 +16,15 @@ import {
   RecordCoveragePayload
 } from '../../api/types';
 import { ProjectHeader, AppModelViewTab } from './components/ProjectHeader';
-import { AppModelGraphView } from './components/AppModelGraphView';
 import { AppModelTableView } from './components/AppModelTableView';
-import { AppModelSitemapView } from './components/AppModelSitemapView';
 import { EntityDetailDrawer } from './components/EntityDetailDrawer';
+
+const AppModelGraphView = React.lazy(() =>
+  import('./components/AppModelGraphView').then((m) => ({ default: m.AppModelGraphView }))
+);
+const AppModelSitemapView = React.lazy(() =>
+  import('./components/AppModelSitemapView').then((m) => ({ default: m.AppModelSitemapView }))
+);
 
 export const ProjectOverviewPage: React.FC = () => {
   const { projectId } = useParams<{ projectId: string }>();
@@ -396,40 +401,56 @@ export const ProjectOverviewPage: React.FC = () => {
         ) : (
           <>
             {activeTab === 'graph' ? (
-              <AppModelGraphView
-                entities={entities}
-                edges={edges}
-                truncated={Boolean(graphData?.truncated)}
-                totalEntities={graphData?.totalEntities || entities.length}
-                selectedEntity={selectedEntity}
-                onSelectEntity={(entity) => setSelectedEntityId(entity.id)}
-                onFocusNeighbors={handleFocusNeighbors}
-                searchQuery={searchQuery}
-                onSearchChange={setSearchQuery}
-                selectedKind={selectedKind}
-                onSelectKind={setSelectedKind}
-                selectedConfidence={selectedConfidence}
-                onSelectConfidence={setSelectedConfidence}
-                isStaleOnly={isStaleOnly}
-                onToggleStaleOnly={() => setIsStaleOnly(!isStaleOnly)}
-                isAuthBoundaryOnly={isAuthBoundaryOnly}
-                onToggleAuthBoundaryOnly={() => setIsAuthBoundaryOnly(!isAuthBoundaryOnly)}
-                maxNodes={maxNodes}
-                onChangeMaxNodes={setMaxNodes}
-              />
+              <React.Suspense
+                fallback={
+                  <div className="flex-1 flex items-center justify-center font-mono text-xs text-text-muted">
+                    Loading topology graph...
+                  </div>
+                }
+              >
+                <AppModelGraphView
+                  entities={entities}
+                  edges={edges}
+                  truncated={Boolean(graphData?.truncated)}
+                  totalEntities={graphData?.totalEntities || entities.length}
+                  selectedEntity={selectedEntity}
+                  onSelectEntity={(entity) => setSelectedEntityId(entity.id)}
+                  onFocusNeighbors={handleFocusNeighbors}
+                  searchQuery={searchQuery}
+                  onSearchChange={setSearchQuery}
+                  selectedKind={selectedKind}
+                  onSelectKind={setSelectedKind}
+                  selectedConfidence={selectedConfidence}
+                  onSelectConfidence={setSelectedConfidence}
+                  isStaleOnly={isStaleOnly}
+                  onToggleStaleOnly={() => setIsStaleOnly(!isStaleOnly)}
+                  isAuthBoundaryOnly={isAuthBoundaryOnly}
+                  onToggleAuthBoundaryOnly={() => setIsAuthBoundaryOnly(!isAuthBoundaryOnly)}
+                  maxNodes={maxNodes}
+                  onChangeMaxNodes={setMaxNodes}
+                />
+              </React.Suspense>
             ) : activeTab === 'sitemap' ? (
-              <AppModelSitemapView
-                sitemapData={sitemapData}
-                edges={edges}
-                notes={entityDetailData?.notes || []}
-                allEntities={entities}
-                selectedEntity={selectedEntity}
-                onSelectEntity={(entity) => setSelectedEntityId(entity?.id || null)}
-                onAddNote={handleAddNote}
-                onRecordCoverage={handleRecordCoverage}
-                onRefresh={handleRefresh}
-                isRefreshing={isProjectFetching || isSitemapFetching}
-              />
+              <React.Suspense
+                fallback={
+                  <div className="flex-1 flex items-center justify-center font-mono text-xs text-text-muted">
+                    Loading sitemap tree...
+                  </div>
+                }
+              >
+                <AppModelSitemapView
+                  sitemapData={sitemapData}
+                  edges={edges}
+                  notes={entityDetailData?.notes || []}
+                  allEntities={entities}
+                  selectedEntity={selectedEntity}
+                  onSelectEntity={(entity) => setSelectedEntityId(entity?.id || null)}
+                  onAddNote={handleAddNote}
+                  onRecordCoverage={handleRecordCoverage}
+                  onRefresh={handleRefresh}
+                  isRefreshing={isProjectFetching || isSitemapFetching}
+                />
+              </React.Suspense>
             ) : (
               <AppModelTableView
                 entities={entities}

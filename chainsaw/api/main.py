@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
@@ -12,8 +13,10 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
+from ..archive import create_archive, list_archives
 from ..auth import (
     AuthError,
     AuthNeedsOperator,
@@ -23,15 +26,22 @@ from ..auth import (
     verify_session,
 )
 from ..ca import ensure_ca
+from ..governor import RequestGovernor
 from ..journal import read_journal, verify_journal
+from ..oast import OASTManager, OASTStore
 from ..providers import (
     ProviderError,
     build_provider,
     config_from_entry,
 )
 from ..proxy import ProxyError, ProxyManager
+from ..reports import generate_report, render_html, save_report
+from ..role_runtime import build_role_providers
+from ..roles import RoleRoutingError
 from ..runner import RunConfig, Runner
 from ..runtime import SessionRuntime
+from ..sandbox import build_sandbox
+from ..tools import ToolAgent, ToolRegistry
 from ..workbench import (
     ApprovalRequired,
     FlowNotFound,
@@ -48,15 +58,23 @@ from ..workspace import (
 )
 from .models import (
     ApprovalDecision,
+    ArchiveCreate,
     AuthLoginRequest,
     AuthProfileInput,
     CompareCreate,
     CoverageCreate,
     EvidenceCreate,
+    FindingEvidenceBind,
+    FindingEvidenceOrder,
     FindingTransition,
+    HypothesisCreate,
+    HypothesisTransition,
     ImportCreate,
     MessageCreate,
     NoteCreate,
+    OASTPromote,
+    OASTStart,
+    OASTTokenCreate,
     ProjectCreate,
     ProjectOpen,
     ProviderCreate,
@@ -65,10 +83,12 @@ from .models import (
     ReplayCreate,
     SessionCreate,
     SessionRunCreate,
+    SessionToolRunCreate,
 )
 from .registry import ProjectNotFoundError, ProjectRegistry
 
 API_VERSION = "1"
+UI_DIST = Path(__file__).resolve().parents[2] / "ui" / "dist"
 
 
 def _request_id(request: Request | None = None) -> str:
@@ -133,6 +153,7 @@ def _page(items: list[Any], *, limit: int, offset: int) -> dict[str, Any]:
 def create_app(home: ChainsawHome | None = None) -> FastAPI:
     registry = ProjectRegistry(home or ChainsawHome.default())
     proxies = ProxyManager(registry.home.root)
+    oast = OASTManager()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -140,6 +161,7 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
             yield
         finally:
             proxies.stop_all()
+            oast.stop_all()
 
     app = FastAPI(
         title="ChainsawRecon API",
@@ -226,6 +248,35 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
     async def get_project(project_id: str) -> dict[str, Any]:
         return registry.project_summary(registry.get(project_id))
 
+    @app.post("/api/v1/projects/{project_id}/archive", status_code=201)
+    async def archive_project(
+        project_id: str, payload: ArchiveCreate
+    ) -> dict[str, Any]:
+        project = registry.get(project_id)
+        return create_archive(
+            project,
+            include_workspace=payload.include_workspace,
+        )
+
+    @app.get("/api/v1/projects/{project_id}/archives")
+    async def project_archives(project_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        return _page(list_archives(project), limit=100, offset=0)
+
+    @app.get("/api/v1/projects/{project_id}/archives/{filename}")
+    async def download_project_archive(
+        project_id: str, filename: str
+    ) -> FileResponse:
+        project = registry.get(project_id)
+        archives = project.path / ".chainsaw" / "archives"
+        if not filename.startswith("archive-") or not filename.endswith(".zip"):
+            raise HTTPException(404, "NOT_FOUND: archive not found")
+        path = (archives / filename).resolve()
+        root = archives.resolve()
+        if root not in path.parents or not path.is_file():
+            raise HTTPException(404, "NOT_FOUND: archive not found")
+        return FileResponse(path, media_type="application/zip", filename=filename)
+
     @app.get("/api/v1/projects/{project_id}/sessions")
     async def project_sessions(project_id: str) -> dict[str, Any]:
         project = registry.get(project_id)
@@ -241,6 +292,12 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
     @app.post("/api/v1/projects/{project_id}/sessions", status_code=201)
     async def create_session(project_id: str, payload: SessionCreate) -> dict[str, Any]:
         return registry.create_session(project_id, payload)
+
+    @app.get("/api/v1/projects/{project_id}/sandbox/status")
+    async def sandbox_status(project_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        sandbox = build_sandbox(project.path / ".chainsaw" / "workspace")
+        return sandbox.describe()
 
     @app.get("/api/v1/projects/{project_id}/auth-profiles")
     async def auth_profiles(project_id: str) -> dict[str, Any]:
@@ -342,6 +399,11 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         session = store.load(project.id, profile_id)
         if session is None:
             raise HTTPException(404, f"NOT_FOUND: no session for auth profile {profile_id}")
+        if session.is_expired():
+            session.status = "expired"
+            session.warning = "Session expired; renew or log in again."
+            store.save(session)
+            return {**session.public(), "reason": session.warning}
         verified, reason = await asyncio.to_thread(
             verify_session,
             session,
@@ -355,6 +417,49 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         session.warning = reason
         store.save(session)
         return {**session.public(), "reason": reason}
+
+    @app.post("/api/v1/projects/{project_id}/auth/profiles/{profile_id}/renew")
+    async def auth_profile_renew(project_id: str, profile_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        _, profile = registry.find_auth_profile(profile_id)
+        store = registry.auth_session_store()
+        session = store.load(project.id, profile_id)
+        if session is None:
+            raise HTTPException(404, f"NOT_FOUND: no session for auth profile {profile_id}")
+        username = session.credentials.get("username", "")
+        password = session.credentials.get("password", "")
+        if not username or not password:
+            raise HTTPException(
+                409,
+                "CONFLICT: renew requires a profile with persistence=credentials and stored credentials",
+            )
+        adapter = (session.adapter or str(profile.get("adapter") or "http_form")).lower()
+        try:
+            if adapter == "browser":
+                renewed = await asyncio.to_thread(
+                    browser_login,
+                    profile=profile,
+                    project_id=project.id,
+                    home_root=registry.home.root,
+                    username=username,
+                    password=password,
+                    policy=registry.scope_policy(project.id),
+                )
+            else:
+                renewed = await asyncio.to_thread(
+                    http_login,
+                    profile=profile,
+                    project_id=project.id,
+                    username=username,
+                    password=password,
+                    policy=registry.scope_policy(project.id),
+                )
+        except AuthNeedsOperator as exc:
+            raise HTTPException(409, f"CONFLICT: {exc}") from exc
+        except AuthError as exc:
+            raise HTTPException(400, f"BAD_REQUEST: {exc}") from exc
+        store.save(renewed)
+        return renewed.public()
 
     @app.post("/api/v1/projects/{project_id}/auth/profiles/{profile_id}/logout")
     async def auth_profile_logout(project_id: str, profile_id: str) -> dict[str, Any]:
@@ -548,30 +653,38 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
                 400,
                 "BAD_REQUEST: no provider configured; add one before running a session",
             )
-        model = payload.model or meta.model
-        kind = str(entry.get("type") or entry.get("engine") or "").strip().lower()
-        selected_model = model
-        if kind in {"webui", "browser", "chatgpt-web", "deepseek-web", "web"}:
-            provider = build_provider(entry, model=model)
-            selected_model = model or str(entry.get("model") or entry.get("engine") or "webui")
-        else:
-            try:
-                provider_config = config_from_entry(entry, model=model)
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(400, f"BAD_REQUEST: invalid provider config: {exc}") from exc
-            if not provider_config.base_url:
-                raise HTTPException(400, "BAD_REQUEST: provider has no base URL")
-            provider = build_provider(entry, model=model)
-            selected_model = model or provider_config.model
+        default_provider_id = str(entry.get("id") or entry.get("name") or "")
+        selected_model = payload.model or meta.model
+        if not selected_model:
+            models = entry.get("models") or []
+            if isinstance(models, list) and models:
+                first = models[0]
+                selected_model = (
+                    str(first.get("id", "")) if isinstance(first, dict) else str(first)
+                )
+        roles = payload.roles or (project.settings or {}).get("roles") or {}
+        role_set = None
         runtime = SessionRuntime(project.path, session_id)
         store = registry.workbench(project.id)
         try:
+            try:
+                role_set = build_role_providers(
+                    entries=registry.providers.list(),
+                    roles=roles,
+                    default_provider_id=default_provider_id,
+                    default_model=selected_model,
+                    store=store,
+                )
+            except RoleRoutingError as exc:
+                raise HTTPException(400, f"BAD_REQUEST: {exc}") from exc
             runner = Runner(
                 runtime,
                 store=store,
                 policy=registry.scope_policy(project.id),
-                provider=provider,
+                provider=None,
                 model=selected_model,
+                decision_provider=role_set.decision_provider,
+                action_provider=role_set.action_provider,
                 config=RunConfig(
                     max_steps=payload.max_steps,
                     context_window=payload.context_window,
@@ -588,12 +701,101 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         finally:
             store.close()
             runtime.close()
+            if role_set is not None:
+                role_set.close()
+        registry.update_session_status(
+            session_id,
+            "completed" if result.finished else "paused",
+        )
+        return {
+            **result.to_dict(),
+            "sessionId": session_id,
+            "model": selected_model,
+            "roles": role_set.model_summary() if role_set is not None else {},
+        }
+
+    @app.post("/api/v1/sessions/{session_id}/tool-run")
+    async def tool_run_session(
+        session_id: str, payload: SessionToolRunCreate
+    ) -> dict[str, Any]:
+        project, paths, meta = registry.find_session(session_id)
+        entry = registry.provider_entry(payload.provider_id or meta.provider)
+        if entry is None:
+            raise HTTPException(
+                400,
+                "BAD_REQUEST: no provider configured; add one before running a tool session",
+            )
+        model = payload.model or meta.model
+        kind = str(entry.get("type") or entry.get("engine") or "").strip().lower()
+        selected_model = model
+        if kind in {"webui", "browser", "chatgpt-web", "deepseek-web", "web"}:
+            provider = build_provider(entry, model=model)
+            selected_model = model or str(entry.get("model") or entry.get("engine") or "webui")
+        else:
+            try:
+                provider_config = config_from_entry(entry, model=model)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, f"BAD_REQUEST: invalid provider config: {exc}") from exc
+            if not provider_config.base_url:
+                raise HTTPException(400, "BAD_REQUEST: provider has no base URL")
+            provider = build_provider(entry, model=model)
+            selected_model = model or provider_config.model
+
+        runtime = SessionRuntime(project.path, session_id)
+        store = registry.workbench(project.id)
+        try:
+            auth_headers: dict[str, str] = {}
+            auth_cookies: dict[str, str] = {}
+            if payload.auth_profile_id:
+                session = registry.auth_session_store().load(
+                    project.id, payload.auth_profile_id
+                )
+                if session is None:
+                    raise HTTPException(
+                        400,
+                        f"BAD_REQUEST: no active session for auth profile {payload.auth_profile_id}",
+                    )
+                auth_headers = session.headers
+                auth_cookies = session.cookies
+            sandbox = (
+                build_sandbox(paths.workspace_dir, allow_network=True)
+                if payload.allow_shell
+                else None
+            )
+            tools = ToolRegistry(
+                project_path=project.path,
+                project_id=project.id,
+                runtime=runtime,
+                store=store,
+                policy=registry.scope_policy(project.id),
+                governor=RequestGovernor.from_profile(payload.noise_profile),
+                auth_headers=auth_headers,
+                auth_cookies=auth_cookies,
+                sandbox=sandbox,
+                allow_shell=payload.allow_shell,
+            )
+            agent = ToolAgent(
+                runtime=runtime,
+                registry=tools,
+                provider=provider,
+                model=selected_model,
+                max_steps=payload.max_steps,
+            )
+            registry.update_session_status(session_id, "running")
+            try:
+                result = await asyncio.to_thread(agent.run, payload.prompt)
+            except Exception:
+                registry.update_session_status(session_id, "paused")
+                raise
+        finally:
+            store.close()
+            runtime.close()
             close = getattr(provider, "close", None)
             if callable(close):
                 close()
         registry.update_session_status(
             session_id,
-            "completed" if result.finished else "paused",
+            "completed" if result.status == "completed" else "paused",
         )
         return {
             **result.to_dict(),
@@ -680,6 +882,137 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
     @app.get("/api/v1/sessions/{session_id}/evidence")
     async def evidence(session_id: str) -> dict[str, Any]:
         return _page(registry.evidence(session_id), limit=200, offset=0)
+
+    @app.get("/api/v1/sessions/{session_id}/hypotheses")
+    async def hypotheses(session_id: str) -> dict[str, Any]:
+        return _page(registry.hypotheses(session_id), limit=200, offset=0)
+
+    @app.post("/api/v1/sessions/{session_id}/hypotheses", status_code=201)
+    async def create_hypothesis(
+        session_id: str, payload: HypothesisCreate
+    ) -> dict[str, Any]:
+        return registry.create_hypothesis(session_id, payload)
+
+    @app.post("/api/v1/sessions/{session_id}/hypotheses/{hypothesis_id}/transition")
+    async def transition_hypothesis(
+        session_id: str, hypothesis_id: str, payload: HypothesisTransition
+    ) -> dict[str, Any]:
+        return registry.transition_hypothesis(
+            session_id,
+            hypothesis_id,
+            state=payload.state,
+            reason=payload.reason,
+        )
+
+    @app.get("/api/v1/sessions/{session_id}/report")
+    async def session_report(
+        session_id: str,
+        includeCandidates: bool = False,
+    ) -> dict[str, Any]:
+        project, _, meta = registry.find_session(session_id)
+        projection = registry.projection(session_id)
+        try:
+            return generate_report(
+                project,
+                meta,
+                projection,
+                include_candidates=includeCandidates,
+            )
+        finally:
+            projection.close()
+
+    @app.get("/api/v1/sessions/{session_id}/report/export")
+    async def export_session_report(
+        session_id: str,
+        format: str = Query("markdown"),
+        includeCandidates: bool = False,
+    ) -> dict[str, Any]:
+        project, _, meta = registry.find_session(session_id)
+        projection = registry.projection(session_id)
+        try:
+            payload = generate_report(
+                project,
+                meta,
+                projection,
+                include_candidates=includeCandidates,
+            )
+        finally:
+            projection.close()
+        if format == "json":
+            return {
+                "format": "json",
+                "contentType": "application/json",
+                "content": json.dumps(payload, ensure_ascii=False, indent=2),
+            }
+        if format == "html":
+            return {
+                "format": "html",
+                "contentType": "text/html",
+                "content": render_html(payload),
+            }
+        if format not in {"markdown", "md"}:
+            raise HTTPException(400, "BAD_REQUEST: format must be markdown, html, or json")
+        return {
+            "format": "markdown",
+            "contentType": "text/markdown",
+            "content": payload["markdown"],
+        }
+
+    @app.post("/api/v1/sessions/{session_id}/reports", status_code=201)
+    async def save_session_report(
+        session_id: str,
+        includeCandidates: bool = False,
+    ) -> dict[str, Any]:
+        project, paths, meta = registry.find_session(session_id)
+        projection = registry.projection(session_id)
+        try:
+            payload = generate_report(
+                project,
+                meta,
+                projection,
+                include_candidates=includeCandidates,
+            )
+        finally:
+            projection.close()
+        path = save_report(payload, paths.artifacts_dir)
+        return {
+            "sessionId": session_id,
+            "artifactId": str(path),
+            "generatedAt": payload["generatedAt"],
+            "findingCount": len(payload["findings"]),
+        }
+
+    @app.get("/api/v1/sessions/{session_id}/reports")
+    async def list_session_reports(session_id: str) -> dict[str, Any]:
+        _, paths, _ = registry.find_session(session_id)
+        items = []
+        if paths.artifacts_dir.exists():
+            for path in sorted(
+                paths.artifacts_dir.glob("report-*.md"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            ):
+                items.append(
+                    {
+                        "artifactId": str(path),
+                        "name": path.name,
+                        "createdAt": datetime.fromtimestamp(
+                            path.stat().st_mtime, timezone.utc
+                        ).isoformat(),
+                    }
+                )
+        return _page(items, limit=100, offset=0)
+
+    @app.get("/api/v1/sessions/{session_id}/reports/{filename}")
+    async def download_session_report(session_id: str, filename: str) -> FileResponse:
+        _, paths, _ = registry.find_session(session_id)
+        if not filename.startswith("report-") or not filename.endswith(".md"):
+            raise HTTPException(404, "NOT_FOUND: report not found")
+        path = (paths.artifacts_dir / filename).resolve()
+        root = paths.artifacts_dir.resolve()
+        if root not in path.parents or not path.is_file():
+            raise HTTPException(404, "NOT_FOUND: report not found")
+        return FileResponse(path, media_type="text/markdown", filename=filename)
 
     @app.get("/api/v1/sessions/{session_id}/lanes")
     async def lanes(session_id: str) -> dict[str, Any]:
@@ -974,6 +1307,128 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
         registry.get(projectId)
         return proxies.status(projectId)
 
+    @app.get("/api/v1/projects/{project_id}/oast/status")
+    async def oast_status(project_id: str) -> dict[str, Any]:
+        registry.get(project_id)
+        server = oast.get(project_id)
+        if server is not None:
+            return server.status()
+        return {"running": False, "projectId": project_id}
+
+    @app.post("/api/v1/projects/{project_id}/oast/start")
+    async def oast_start(project_id: str, payload: OASTStart) -> dict[str, Any]:
+        project = registry.get(project_id)
+        try:
+            return oast.start(
+                project_path=project.path,
+                project_id=project.id,
+                host=payload.host,
+                port=payload.port,
+                dns_port=payload.dns_port,
+                dns_domain=payload.dns_domain,
+                answer_ip=payload.answer_ip,
+            )
+        except OSError as exc:
+            raise HTTPException(400, f"BAD_REQUEST: cannot start OAST: {exc}") from exc
+
+    @app.post("/api/v1/projects/{project_id}/oast/stop")
+    async def oast_stop(project_id: str) -> dict[str, Any]:
+        registry.get(project_id)
+        return oast.stop(project_id)
+
+    @app.post("/api/v1/projects/{project_id}/oast/tokens", status_code=201)
+    async def oast_token(project_id: str, payload: OASTTokenCreate) -> dict[str, Any]:
+        registry.get(project_id)
+        server = oast.get(project_id)
+        if server is None:
+            raise HTTPException(409, "CONFLICT: start OAST before creating tokens")
+        return server.create_token(payload.note)
+
+    @app.get("/api/v1/projects/{project_id}/oast/tokens")
+    async def oast_tokens(project_id: str) -> dict[str, Any]:
+        project = registry.get(project_id)
+        server = oast.get(project_id)
+        if server is not None:
+            return _page(server.store.tokens(), limit=200, offset=0)
+        from ..oast import OASTStore
+
+        store = OASTStore(project.path / ".chainsaw" / "oast.db", project.id)
+        try:
+            return _page(store.tokens(), limit=200, offset=0)
+        finally:
+            store.close()
+
+    @app.get("/api/v1/projects/{project_id}/oast/events")
+    async def oast_events(project_id: str, token: str = "") -> dict[str, Any]:
+        project = registry.get(project_id)
+        server = oast.get(project_id)
+        if server is not None:
+            return _page(server.store.events(token), limit=500, offset=0)
+        from ..oast import OASTStore
+
+        store = OASTStore(project.path / ".chainsaw" / "oast.db", project.id)
+        try:
+            return _page(store.events(token), limit=500, offset=0)
+        finally:
+            store.close()
+
+    @app.post("/api/v1/projects/{project_id}/oast/events/{event_id}/evidence", status_code=201)
+    async def oast_promote_event(
+        project_id: str,
+        event_id: int,
+        payload: OASTPromote,
+    ) -> dict[str, Any]:
+        project = registry.get(project_id)
+        server = oast.get(project_id)
+        if server is not None:
+            event = server.store.event(event_id)
+        else:
+            event_store = OASTStore(project.path / ".chainsaw" / "oast.db", project.id)
+            try:
+                event = event_store.event(event_id)
+            finally:
+                event_store.close()
+        if event is None:
+            raise HTTPException(404, f"NOT_FOUND: OAST event not found: {event_id}")
+        if payload.session_id:
+            session_project, _, _ = registry.find_session(payload.session_id)
+            if session_project.id != project.id:
+                raise HTTPException(
+                    400,
+                    "BAD_REQUEST: sessionId does not belong to the event's project",
+                )
+        evidence_id = "evd_" + uuid4().hex[:16]
+        artifact_dir = project.path / ".chainsaw" / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_dir / f"{evidence_id}-oast.json"
+        body = json.dumps(
+            {"kind": "oast", "eventId": event_id, "note": payload.note, "event": event},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        artifact_path.write_text(body, encoding="utf-8")
+        digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+        workbench = registry.workbench(project.id)
+        try:
+            evidence = workbench.record_artifact_evidence(
+                evidence_id=evidence_id,
+                kind="oast",
+                summary=f"OAST {event['method']} {event['path']}",
+                artifact_id=str(artifact_path),
+                content_hash=digest,
+                session_id=payload.session_id,
+                hypothesis_id=payload.hypothesis_id,
+                task_id=payload.task_id,
+                request_id=f"oast:{event_id}",
+                note=payload.note,
+            )
+        finally:
+            workbench.close()
+        if payload.session_id:
+            registry.record_evidence_event(payload.session_id, evidence)
+        return evidence
+
     @app.get("/api/v1/findings")
     async def findings(
         projectId: str = Query(""),
@@ -1010,7 +1465,67 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
             "evidence": [
                 item for item in registry.evidence(meta.id) if item["id"] in evidence_ids
             ],
+            "evidenceBindings": registry.finding_evidence(meta.id, finding_id),
         }
+
+    @app.get("/api/v1/findings/{finding_id}/evidence")
+    async def finding_evidence(finding_id: str) -> dict[str, Any]:
+        try:
+            _, meta, _ = registry.find_finding(finding_id)
+        except ProjectNotFoundError as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        return _page(registry.finding_evidence(meta.id, finding_id), limit=200, offset=0)
+
+    @app.post("/api/v1/findings/{finding_id}/evidence", status_code=201)
+    async def bind_finding_evidence(
+        finding_id: str, payload: FindingEvidenceBind
+    ) -> dict[str, Any]:
+        try:
+            _, meta, _ = registry.find_finding(finding_id)
+            return _page(
+                registry.bind_finding_evidence(
+                    meta.id,
+                    finding_id,
+                    evidence_id=payload.evidence_id,
+                    role=payload.role,
+                    note=payload.note,
+                    position=payload.position,
+                ),
+                limit=200,
+                offset=0,
+            )
+        except ProjectNotFoundError as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(400, f"BAD_REQUEST: {exc}") from exc
+
+    @app.delete("/api/v1/findings/{finding_id}/evidence/{evidence_id}")
+    async def unbind_finding_evidence(finding_id: str, evidence_id: str) -> dict[str, Any]:
+        try:
+            _, meta, _ = registry.find_finding(finding_id)
+            return _page(
+                registry.unbind_finding_evidence(meta.id, finding_id, evidence_id),
+                limit=200,
+                offset=0,
+            )
+        except ProjectNotFoundError as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
+
+    @app.post("/api/v1/findings/{finding_id}/evidence/order")
+    async def reorder_finding_evidence(
+        finding_id: str, payload: FindingEvidenceOrder
+    ) -> dict[str, Any]:
+        try:
+            _, meta, _ = registry.find_finding(finding_id)
+            return _page(
+                registry.reorder_finding_evidence(
+                    meta.id, finding_id, payload.evidence_ids
+                ),
+                limit=200,
+                offset=0,
+            )
+        except ProjectNotFoundError as exc:
+            raise HTTPException(404, f"NOT_FOUND: {exc}") from exc
 
     @app.post("/api/v1/findings/{finding_id}/transition")
     async def finding_transition(
@@ -1083,6 +1598,32 @@ def create_app(home: ChainsawHome | None = None) -> FastAPI:
     @app.websocket("/api/v1/stream")
     async def stream(websocket: WebSocket) -> None:
         await _stream(websocket)
+
+    if (UI_DIST / "index.html").exists():
+        assets = UI_DIST / "assets"
+        if assets.exists():
+            app.mount("/assets", StaticFiles(directory=str(assets)), name="ui-assets")
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def ui_spa(full_path: str) -> FileResponse:
+            if full_path.startswith("api/"):
+                raise HTTPException(404, "NOT_FOUND: API route not found")
+            candidate = (UI_DIST / full_path).resolve()
+            root = UI_DIST.resolve()
+            if (candidate == root or root in candidate.parents) and candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(root / "index.html")
+    else:
+
+        @app.get("/", include_in_schema=False)
+        async def ui_missing() -> JSONResponse:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "UI build not found",
+                    "hint": "Run: npm --prefix ui install && npm --prefix ui run build",
+                },
+            )
 
     return app
 

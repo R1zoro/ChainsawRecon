@@ -1,5 +1,5 @@
 import React, { useRef, useEffect } from 'react';
-import { Search, Settings, Star, AlertCircle, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { Search, Settings, AlertCircle, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { EnvironmentHealth, MockServiceMode } from '../api/types';
 import { getMockServiceMode, setMockServiceMode } from '../api/client';
 
@@ -22,7 +22,7 @@ export const TopBar: React.FC<TopBarProps> = ({
 }) => {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const showDevStateSwitcher = import.meta.env.DEV && import.meta.env.VITE_UI_STATE_SWITCHER !== 'false';
-  const isMockMode = import.meta.env.VITE_USE_MOCKS !== 'false';
+  const isMockMode = import.meta.env.DEV && import.meta.env.VITE_USE_MOCKS === 'true';
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -130,18 +130,6 @@ export const TopBar: React.FC<TopBarProps> = ({
           >
             <Settings className="w-4 h-4" />
           </button>
-
-          <a
-            href="https://github.com/R1zoro/ChainsawRecon"
-            target="_blank"
-            rel="noopener noreferrer"
-            title="Star ChainsawRecon on GitHub"
-            aria-label="Star ChainsawRecon on GitHub"
-            className="flex items-center gap-1 text-xs text-text-muted hover:text-text px-2 py-1 rounded border border-border hover:bg-surface-2 transition-colors"
-          >
-            <Star className="w-3.5 h-3.5 text-warning fill-warning/20" />
-            <span className="font-mono text-[11px]">Star</span>
-          </a>
         </div>
       </div>
     </header>

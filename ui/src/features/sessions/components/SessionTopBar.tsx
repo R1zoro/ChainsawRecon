@@ -2,7 +2,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
   ArrowLeft, Play, Pause, Square, 
-  RotateCw, Shield, ShieldAlert, PanelRightClose, PanelRightOpen 
+  RotateCw, Shield, ShieldAlert, PanelRightClose, PanelRightOpen, Sliders 
 } from 'lucide-react';
 import { ActiveSessionSummary, SessionStatus } from '../../../api/types';
 
@@ -17,6 +17,7 @@ interface SessionTopBarProps {
   onPause: () => void;
   onResume: () => void;
   onStop: () => void;
+  onOpenRunConfig?: () => void;
   isActionLoading?: boolean;
 }
 
@@ -31,6 +32,7 @@ export const SessionTopBar: React.FC<SessionTopBarProps> = ({
   onPause,
   onResume,
   onStop,
+  onOpenRunConfig,
   isActionLoading = false,
 }) => {
   const navigate = useNavigate();
@@ -194,6 +196,19 @@ export const SessionTopBar: React.FC<SessionTopBarProps> = ({
             >
               <RotateCw className="w-3.5 h-3.5" />
               <span>Rerun</span>
+            </button>
+          )}
+
+          {onOpenRunConfig && (
+            <button
+              type="button"
+              onClick={onOpenRunConfig}
+              data-testid="open-run-config-btn"
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-surface-2 hover:bg-surface-2/80 text-text border border-border text-xs transition-colors"
+              title="Configure Role Routing & Model Matrix"
+            >
+              <Sliders className="w-3.5 h-3.5 text-accent" />
+              <span>Role Matrix</span>
             </button>
           )}
         </div>

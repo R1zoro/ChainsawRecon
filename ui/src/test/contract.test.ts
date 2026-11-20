@@ -22,11 +22,28 @@ import {
   ReplayResult,
   ResponseCompareResponse,
   CaStatusResponse,
+  AuthProfile,
+  AuthDetection,
+  AuthSessionStatus,
+  ToolRunResponse,
+  ProviderItem,
+  ProviderHealthResponse,
+  ProviderCalibrateResponse,
+  OastStatusResponse,
+  OastToken,
+  OastEvent,
+  SessionReport,
+  SaveSessionReportResponse,
+  ReportExportResponse,
+  SavedReportItem,
+  ProjectArchiveItem,
+  CreateArchiveResponse,
 } from '../api/types';
 
 describe('Frontend API Contract & Fixture Conformance', () => {
   beforeEach(() => {
     resetMockData();
+    setMockServiceMode('healthy');
   });
 
   it('GET /home mock fixture conforms strictly to HomeDataResponse schema', async () => {
@@ -551,6 +568,117 @@ describe('Frontend API Contract & Fixture Conformance', () => {
       expect(res).toBeDefined();
       expect(res.state).toBe('rejected');
     });
+
+    it('GET /findings/{id} returns evidenceBindings and evidenceVersion', async () => {
+      const res = await fetchJson<{ finding: any; evidence: any[]; evidenceBindings: any[] }>('/findings/fnd_demo_01');
+      expect(res.finding).toBeDefined();
+      expect(typeof res.finding.evidenceVersion).toBe('number');
+      expect(Array.isArray(res.evidenceBindings)).toBe(true);
+      expect(res.evidenceBindings.length).toBeGreaterThan(0);
+      expect(res.evidenceBindings[0].role).toBe('proof');
+    });
+
+    it('POST /findings/{id}/evidence binds evidence with role and note, incrementing evidenceVersion', async () => {
+      const initial = await fetchJson<{ finding: any }>('/findings/fnd_demo_01');
+      const prevVersion = initial.finding.evidenceVersion ?? 0;
+
+      const bindRes = await fetchJson<{ items: any[]; total: number }>('/findings/fnd_demo_01/evidence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          evidenceId: 'evd_control_baseline',
+          role: 'baseline',
+          note: 'Baseline comparison payload',
+          position: 1,
+        }),
+      });
+
+      expect(bindRes.items).toBeDefined();
+      const boundItem = bindRes.items.find((item: any) => item.evidenceId === 'evd_control_baseline');
+      expect(boundItem).toBeDefined();
+      expect(boundItem.role).toBe('baseline');
+      expect(boundItem.note).toBe('Baseline comparison payload');
+
+      const updated = await fetchJson<{ finding: any }>('/findings/fnd_demo_01');
+      expect(updated.finding.evidenceVersion).toBe(prevVersion + 1);
+    });
+
+    it('POST /findings/{id}/evidence rejects unrecorded evidenceId with BAD_REQUEST', async () => {
+      try {
+        await fetchJson('/findings/fnd_demo_01/evidence', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            evidenceId: 'unrecorded_fake_id_999',
+            role: 'supporting',
+          }),
+        });
+        expect.fail('Should have rejected unrecorded evidence');
+      } catch (err: unknown) {
+        expect(isApiError(err)).toBe(true);
+        if (isApiError(err)) {
+          expect(err.message).toContain('evidence not recorded');
+        }
+      }
+    });
+
+    it('POST /findings/{id}/evidence/order reorders evidence and updates positions', async () => {
+      // First bind a second evidence item so we have 2 items to reorder
+      await fetchJson('/findings/fnd_demo_01/evidence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          evidenceId: 'evd_control_baseline',
+          role: 'baseline',
+          position: 1,
+        }),
+      });
+
+      const initial = await fetchJson<{ finding: any }>('/findings/fnd_demo_01');
+      const prevVersion = initial.finding.evidenceVersion ?? 0;
+
+      const reorderRes = await fetchJson<{ items: any[] }>('/findings/fnd_demo_01/evidence/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          evidenceIds: ['evd_control_baseline', 'evd_idor_payload'],
+        }),
+      });
+
+      expect(reorderRes.items[0].evidenceId).toBe('evd_control_baseline');
+      expect(reorderRes.items[0].position).toBe(0);
+      expect(reorderRes.items[1].evidenceId).toBe('evd_idor_payload');
+      expect(reorderRes.items[1].position).toBe(1);
+
+      const updated = await fetchJson<{ finding: any }>('/findings/fnd_demo_01');
+      expect(updated.finding.evidenceVersion).toBe(prevVersion + 1);
+    });
+
+    it('DELETE /findings/{id}/evidence/{evidenceId} unbinds evidence and updates finding', async () => {
+      // First bind evd_control_baseline so we can unbind it
+      await fetchJson('/findings/fnd_demo_01/evidence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          evidenceId: 'evd_control_baseline',
+          role: 'baseline',
+          position: 1,
+        }),
+      });
+
+      const initial = await fetchJson<{ finding: any }>('/findings/fnd_demo_01');
+      const prevVersion = initial.finding.evidenceVersion ?? 0;
+
+      const deleteRes = await fetchJson<{ items: any[] }>('/findings/fnd_demo_01/evidence/evd_control_baseline', {
+        method: 'DELETE',
+      });
+
+      expect(deleteRes.items.some((item: any) => item.evidenceId === 'evd_control_baseline')).toBe(false);
+
+      const updated = await fetchJson<{ finding: any }>('/findings/fnd_demo_01');
+      expect(updated.finding.evidenceVersion).toBe(prevVersion + 1);
+      expect(updated.finding.evidenceIds).not.toContain('evd_control_baseline');
+    });
   });
 
   // ── Milestone 2.5: Coverage-Aware Sitemap (Atlas) Contract ──────
@@ -671,6 +799,331 @@ describe('Frontend API Contract & Fixture Conformance', () => {
           expect(err.message).toContain('riskArea is required');
         }
       }
+    });
+  });
+
+  describe('Milestone 5: Auth Profiles, Tool Agent & Web UI Provider Contract Tests', () => {
+    const projectId = 'prj_demo';
+    const sessionId = 'ses_active_01';
+
+    it('POST /projects/:id/auth/detect returns AuthDetection contract', async () => {
+      const res = await fetchJson<AuthDetection>(`/projects/${projectId}/auth/detect`, {
+        method: 'POST',
+      });
+      expect(res).toBeDefined();
+      expect(Array.isArray(res.mechanisms)).toBe(true);
+      expect(res.botProtection).toBeDefined();
+      expect(typeof res.botProtection.detected).toBe('boolean');
+      expect(Array.isArray(res.loginCandidates)).toBe(true);
+      expect(['auto', 'http_form', 'http_json', 'browser', 'headers', 'operator']).toContain(
+        res.recommendedAdapter
+      );
+    });
+
+    it('GET & POST /projects/:id/auth/profiles conform to AuthProfile schema', async () => {
+      const listRes = await fetchJson<Paginated<AuthProfile>>(`/projects/${projectId}/auth/profiles`);
+      expect(listRes).toBeDefined();
+      expect(Array.isArray(listRes.items)).toBe(true);
+
+      const created = await fetchJson<AuthProfile>(`/projects/${projectId}/auth/profiles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          label: 'Contract Test Profile',
+          identity: 'test@example.com',
+          role: 'analyst',
+          tenant: 't_contract',
+          adapter: 'http_form',
+          persistence: 'session_only',
+        }),
+      });
+
+      expect(created.id).toBeDefined();
+      expect(created.label).toBe('Contract Test Profile');
+      expect(created.adapter).toBe('http_form');
+      expect(created.session).toBeDefined();
+      expect(created.session.status).toBe('none');
+    });
+
+    it('POST login, GET session, POST verify, and POST logout cycle correctly', async () => {
+      // 1. Login
+      const loginRes = await fetchJson<AuthSessionStatus>(
+        `/projects/${projectId}/auth/profiles/auth_admin_01/login`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'admin',
+            password: 'secretpassword',
+            adapter: 'http_form',
+          }),
+        }
+      );
+      expect(loginRes.status).toBe('active');
+      expect(loginRes.profileId).toBe('auth_admin_01');
+
+      // 2. Fetch session
+      const sessionRes = await fetchJson<AuthSessionStatus>(
+        `/projects/${projectId}/auth/profiles/auth_admin_01/session`
+      );
+      expect(sessionRes.status).toBe('active');
+
+      // 3. Verify session
+      const verifyRes = await fetchJson<AuthSessionStatus & { reason?: string }>(
+        `/projects/${projectId}/auth/profiles/auth_admin_01/verify`,
+        { method: 'POST' }
+      );
+      expect(verifyRes.status).toBe('active');
+      expect(verifyRes.reason).toBeDefined();
+
+      // 4. Logout
+      const logoutRes = await fetchJson<{ profileId: string; status: string }>(
+        `/projects/${projectId}/auth/profiles/auth_admin_01/logout`,
+        { method: 'POST' }
+      );
+      expect(logoutRes.status).toBe('none');
+    });
+
+    it('DELETE /projects/:id/auth/profiles/:profileId removes the profile', async () => {
+      const created = await fetchJson<AuthProfile>(`/projects/${projectId}/auth/profiles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: 'To Delete Profile' }),
+      });
+
+      await fetchJson(`/projects/${projectId}/auth/profiles/${created.id}`, {
+        method: 'DELETE',
+      });
+
+      const listAfter = await fetchJson<Paginated<AuthProfile>>(`/projects/${projectId}/auth/profiles`);
+      expect(listAfter.items.some((p) => p.id === created.id)).toBe(false);
+    });
+
+    it('POST /sessions/:id/tool-run executes tool agent and returns ToolRunResponse', async () => {
+      const res = await fetchJson<ToolRunResponse>(`/sessions/${sessionId}/tool-run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: 'Replay target and verify boundaries',
+          maxSteps: 8,
+          noiseProfile: 'balanced',
+        }),
+      });
+
+      expect(res.sessionId).toBe(sessionId);
+      expect(res.status).toBe('completed');
+      expect(typeof res.finalText).toBe('string');
+      expect(res.steps).toBeGreaterThan(0);
+      expect(Array.isArray(res.toolCalls)).toBe(true);
+      expect(res.toolCalls[0].name).toBeDefined();
+    });
+
+    it('POST /providers creates a Web UI provider and tests health and calibration', async () => {
+      const newProvider = await fetchJson<ProviderItem>('/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'ChatGPT Contract Web',
+          type: 'webui',
+          engine: 'ChatGPT',
+          baseUrl: 'https://chatgpt.com',
+          profileDir: '~/.chainsaw/webui/profiles/contract',
+          headless: false,
+        }),
+      });
+
+      expect(newProvider.id).toBeDefined();
+      expect(newProvider.name).toBe('ChatGPT Contract Web');
+      expect(newProvider.type).toBe('webui');
+
+      // Health check
+      const health = await fetchJson<ProviderHealthResponse>(`/providers/${newProvider.id}/health`);
+      expect(health.ok).toBe(true);
+      expect(health.loggedIn).toBe(true);
+
+      // Calibrate check
+      const calibrate = await fetchJson<ProviderCalibrateResponse>(
+        `/providers/${newProvider.id}/calibrate`,
+        { method: 'POST' }
+      );
+      expect(calibrate.counts).toBeDefined();
+      expect(typeof calibrate.hasPassword).toBe('boolean');
+    });
+
+    it('OAST endpoints conform to schema: status, start, tokens, events, stop', async () => {
+      // 1. GET /projects/:id/oast/status
+      const status = await fetchJson<OastStatusResponse>(`/projects/${projectId}/oast/status`);
+      expect(status.projectId).toBe(projectId);
+      expect(typeof status.running).toBe('boolean');
+
+      // 2. POST /projects/:id/oast/start
+      const startRes = await fetchJson<OastStatusResponse>(`/projects/${projectId}/oast/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: '127.0.0.1', port: 0, dnsPort: 0, dnsDomain: 'oast.local' }),
+      });
+      expect(startRes.running).toBe(true);
+      expect(startRes.url).toBeDefined();
+      expect(startRes.dnsDomain).toBe('oast.local');
+      expect(typeof startRes.dnsPort).toBe('number');
+
+      // 3. POST /projects/:id/oast/tokens
+      const token = await fetchJson<OastToken>(`/projects/${projectId}/oast/tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note: 'SSRF Verification Token' }),
+      });
+      expect(token.token).toBeDefined();
+      expect(token.url).toContain(token.token);
+      expect(token.dnsName).toBeDefined();
+      expect(token.dnsName).toContain(token.token);
+      expect(token.dnsName).toContain('oast.local');
+      expect(token.note).toBe('SSRF Verification Token');
+      expect(typeof token.hits).toBe('number');
+
+      // 4. GET /projects/:id/oast/tokens
+      const tokensList = await fetchJson<Paginated<OastToken>>(`/projects/${projectId}/oast/tokens`);
+      expect(Array.isArray(tokensList.items)).toBe(true);
+      expect(tokensList.items.some((t) => t.token === token.token)).toBe(true);
+
+      // 5. GET /projects/:id/oast/events
+      const eventsList = await fetchJson<Paginated<OastEvent>>(`/projects/${projectId}/oast/events`);
+      expect(Array.isArray(eventsList.items)).toBe(true);
+
+      // 6. POST /projects/:id/oast/stop
+      const stopRes = await fetchJson<OastStatusResponse>(`/projects/${projectId}/oast/stop`, {
+        method: 'POST',
+      });
+      expect(stopRes.running).toBe(false);
+
+      // 7. Verify creating token while stopped returns CONFLICT (409)
+      try {
+        await fetchJson<OastToken>(`/projects/${projectId}/oast/tokens`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note: 'Should fail' }),
+        });
+        expect.unreachable('Should have thrown CONFLICT');
+      } catch (err) {
+        expect(isApiError(err)).toBe(true);
+        if (isApiError(err)) {
+          expect(err.code).toBe('CONFLICT');
+        }
+      }
+    });
+  });
+
+  // ── Milestone 6: Reports & Export Endpoints Contract ─────────────
+  describe('Milestone 6: Reports & Export Endpoints Contract', () => {
+    const sessionId = 'ses_demo_01';
+
+    it('GET /sessions/:id/report returns structured session assessment report', async () => {
+      const report = await fetchJson<SessionReport>(`/sessions/${sessionId}/report`);
+      expect(report).toBeDefined();
+      expect(report.projectId).toBeDefined();
+      expect(report.sessionId).toBe(sessionId);
+      expect(report.markdown).toBeDefined();
+      expect(Array.isArray(report.findings)).toBe(true);
+      expect(report.coverage).toBeDefined();
+      expect(Array.isArray(report.coverage.gaps)).toBe(true);
+    });
+
+    it('GET /sessions/:id/report/export exports report in markdown, html, and json formats', async () => {
+      // 1. Markdown
+      const mdRes = await fetchJson<ReportExportResponse>(`/sessions/${sessionId}/report/export?format=markdown`);
+      expect(mdRes.format).toBe('markdown');
+      expect(mdRes.contentType).toContain('text/markdown');
+      expect(mdRes.content).toContain('Security Assessment');
+
+      // 2. HTML
+      const htmlRes = await fetchJson<ReportExportResponse>(`/sessions/${sessionId}/report/export?format=html`);
+      expect(htmlRes.format).toBe('html');
+      expect(htmlRes.contentType).toContain('text/html');
+      expect(htmlRes.content).toContain('<!doctype html>');
+      expect(htmlRes.content).toContain('Security Assessment');
+
+      // 3. JSON
+      const jsonRes = await fetchJson<ReportExportResponse>(`/sessions/${sessionId}/report/export?format=json`);
+      expect(jsonRes.format).toBe('json');
+      expect(jsonRes.contentType).toContain('application/json');
+      const parsed = JSON.parse(jsonRes.content);
+      expect(parsed.sessionId).toBe(sessionId);
+      expect(Array.isArray(parsed.findings)).toBe(true);
+    });
+
+    it('GET /sessions/:id/report/export rejects unsupported format (e.g. pdf)', async () => {
+      try {
+        await fetchJson(`/sessions/${sessionId}/report/export?format=pdf`);
+        expect.unreachable('Should have rejected format=pdf');
+      } catch (err) {
+        expect(isApiError(err)).toBe(true);
+        if (isApiError(err)) {
+          expect(err.message).toContain('format must be markdown, html, or json');
+        }
+      }
+    });
+
+    it('POST /sessions/:id/reports saves report and GET downloads the saved file', async () => {
+      const saved = await fetchJson<SaveSessionReportResponse>(`/sessions/${sessionId}/reports`, {
+        method: 'POST',
+      });
+      expect(saved.artifactId).toBeDefined();
+      expect(saved.artifactId).toContain('.chainsaw/artifacts/report-');
+
+      const reportsList = await fetchJson<Paginated<SavedReportItem>>(`/sessions/${sessionId}/reports`);
+      expect(reportsList.items.length).toBeGreaterThan(0);
+      const latest = reportsList.items[0];
+
+      const downloaded = await fetchJson<{ filename: string; content: string; contentType: string }>(
+        `/sessions/${sessionId}/reports/${latest.name}`
+      );
+      expect(downloaded.filename).toBe(latest.name);
+      expect(downloaded.contentType).toContain('text/markdown');
+      expect(downloaded.content).toBeDefined();
+    });
+  });
+
+  // ── Milestone 8: Project Archives Contract ──────────────────
+  describe('Milestone 8: Project Archives Contract', () => {
+    const projectId = 'prj_demo';
+
+    it('GET /projects/:id/archives conforms to paginated ProjectArchiveItem schema', async () => {
+      const data = await fetchJson<Paginated<ProjectArchiveItem>>(`/projects/${projectId}/archives`);
+      expect(data).toHaveProperty('items');
+      expect(data).toHaveProperty('total');
+      expect(Array.isArray(data.items)).toBe(true);
+      expect(data.items.length).toBeGreaterThan(0);
+
+      const archive = data.items[0];
+      expect(archive.name).toMatch(/^archive-.*\.zip$/);
+      expect(typeof archive.path).toBe('string');
+      expect(typeof archive.sizeBytes).toBe('number');
+      expect(typeof archive.createdAt).toBe('string');
+    });
+
+    it('POST /projects/:id/archive creates archive and returns sha256 and fileCount', async () => {
+      const created = await fetchJson<CreateArchiveResponse>(`/projects/${projectId}/archive`, {
+        method: 'POST',
+        body: JSON.stringify({ includeWorkspace: true }),
+      });
+      expect(created.projectId).toBe(projectId);
+      expect(created.name).toMatch(/^archive-.*\.zip$/);
+      expect(created.includeWorkspace).toBe(true);
+      expect(created.fileCount).toBeGreaterThan(0);
+      expect(created.sha256).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(typeof created.sizeBytes).toBe('number');
+      expect(typeof created.createdAt).toBe('string');
+
+      // Verify it appears in the archives list
+      const list = await fetchJson<Paginated<ProjectArchiveItem>>(`/projects/${projectId}/archives`);
+      expect(list.items.some((a) => a.name === created.name)).toBe(true);
+    });
+
+    it('GET /projects/:id/archives/:filename downloads archive artifact', async () => {
+      const list = await fetchJson<Paginated<ProjectArchiveItem>>(`/projects/${projectId}/archives`);
+      const target = list.items[0];
+      const blob = await fetchJson<Blob>(`/projects/${projectId}/archives/${target.name}`);
+      expect(blob).toBeDefined();
     });
   });
 });
